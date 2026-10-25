@@ -1,5 +1,5 @@
 .PHONY: help install lint test audit ci demo honeypot smoke status once dry-run scanners bot dashboard \
-        docker-build docker-up docker-down docker-logs clean
+        probe docker-build docker-up docker-down docker-logs clean
 
 PY ?= python3
 VENV := .venv
@@ -46,8 +46,11 @@ once: ## One real cycle, then exit
 dry-run: ## One cycle with no writes and no alerts
 	$(BIN)/python -m bot.main --once --dry-run --no-alerts
 
-scanners: ## Probe one token through every scanner layer
+scanners: ## Probe one crypto token through every scanner layer
 	$(BIN)/python -m scanners --token 0x0000000000000000000000000000000000000001
+
+probe: ## Probe one listed instrument (equity) through the applicable layers
+	DEMO_MODE=true $(BIN)/python -m scanners --symbol AAPL --asset-class equity
 
 bot: ## Start the async scanner loop
 	$(BIN)/python -m bot.main

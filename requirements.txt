@@ -19,7 +19,7 @@ numpy==1.26.4                # pandas-ta-free: indicators are implemented in sca
 pandas==2.2.3
 pyarrow==17.0.0              # Parquet engine (zstd + predicate pushdown)
 
-# --- AI engine (DeepSeek is OpenAI-API compatible) ---------------------------
+# --- AI engine (any OpenAI-compatible endpoint: DeepSeek/OpenAI/Claude/...) --
 openai==1.54.3
 httpx==0.27.2
 pydantic==2.9.2

@@ -1,11 +1,14 @@
 # AlphaSentinel
 
-A two-agent crypto token screener. It collects on-chain, derivatives, social, DEX,
-airdrop, macro and technical signals for a watchlist, then asks two DeepSeek agents
-to judge it — **Agent 1 argues the bull case, Agent 2 tries to kill the trade** — and
-funnels both through a deterministic scorer that has final say. Verdicts are written
-to SQLite (hot) and Parquet (cold), alerts go to Telegram, and a Streamlit dashboard
-reads both stores.
+A cross-asset screener with a veto. It collects on-chain, derivatives, social,
+DEX/venue microstructure, airdrop, issuer fundamentals, macro and technical
+signals for a watchlist — **crypto tokens, equities, ETFs, indices, FX pairs,
+commodity futures and rates** — then asks two LLM agents
+(DeepSeek, GPT, Claude — any OpenAI-compatible endpoint) to judge it:
+**Agent 1 argues the bull case, Agent 2 tries to kill the trade**, and both are
+funnelled through a deterministic scorer that has final say. Verdicts are written
+to SQLite (hot) and Parquet (cold), alerts go to Telegram, and a Streamlit
+dashboard reads both stores.
 
 The design constraint is simple: **the LLM is a judge of narrative, never the sole
 source of truth.** Every number that decides a trade is computed in `core/scoring.py`
@@ -16,12 +19,12 @@ with pure arithmetic, so a verdict is reproducible and testable without an API k
 ## Architecture
 
 ```
-config/watchlists.yaml
+config/watchlists.yaml   (crypto contracts + listed symbols)
         │
         ▼
-┌───────────────────┐   7 layers, each isolated + timeout-bounded
-│ scanners.pipeline │──▶ onchain · derivatives · social · dex
-│                   │    airdrop · macro · technicals
+┌───────────────────┐   9 layers, asset-class aware, each isolated + timeout-bounded
+│ scanners.pipeline │──▶ onchain · derivatives · social · dex · market
+│                   │    fundamentals · airdrop · macro · technicals
 └─────────┬─────────┘
           │ TokenSnapshot + confidence-weighted prior
           ▼
@@ -33,7 +36,7 @@ config/watchlists.yaml
           │ AlphaAssessment + RiskAudit
           ▼
 ┌───────────────────┐   veto precedence (absolute):
-│ core.scoring      │   1. hard GoPlus flag (honeypot, mintable, >10% tax)
+│ core.scoring      │   1. hard contract-security flag (crypto only)
 │  reconcile()      │   2. Agent 2 veto / CRITICAL
 └─────────┬─────────┘   3. risk_score >= MAX_RISK_SCORE
           │             4. wash-trading suspicion >= 85
@@ -45,8 +48,9 @@ config/watchlists.yaml
 ```
 
 Failure isolation is a hard rule: one dead provider degrades a layer, not the cycle;
-one dead token does not abort the run; a Parquet or Telegram hiccup is logged and the
-loop keeps going. `--dry-run` collects and audits but persists and sends nothing.
+one dead instrument does not abort the run; a Parquet or Telegram hiccup is logged
+and the loop keeps going. `--dry-run` collects and audits but persists and sends
+nothing.
 
 ---
 
@@ -60,8 +64,8 @@ make honeypot                # scripted agents: VETO with hard security flags
 make test                    # hermetic suite, no network
 ```
 
-Then, with real keys in `.env` (`DEEPSEEK_API_KEY`, optionally `GOPLUS_APP_KEY`,
-`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`):
+Then, with real keys in `.env` (`LLM_API_KEY` — plus `LLM_PROVIDER` if you are not on
+DeepSeek — optionally `GOPLUS_APP_KEY`, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`):
 
 ```bash
 make status                  # what the hot store knows right now
@@ -70,6 +74,127 @@ make once                    # one real cycle
 make bot                     # the daemon loop (SCAN_INTERVAL_SECONDS)
 make dashboard               # Streamlit on :8501
 ```
+
+### Markets
+
+One pipeline, seven asset classes: `crypto`, `equity`, `etf`, `index`, `fx`,
+`commodity`, `rate`. Scoring, veto hierarchy, storage and dashboard are identical
+— only the layer mix changes.
+
+| Layer | Crypto | Equity | ETF / index / FX / commodity / rate |
+| --- | --- | --- | --- |
+| `onchain` | holder distribution (Blockscout) | — | — |
+| `dex` | pool depth, turnover, order flow | — | — |
+| `market` | — | dollar volume, 3m trend, 52w position | the same venue read |
+| `fundamentals` | — | SEC 10-K facts (needs `SEC_USER_AGENT`) | — |
+| `macro` | CoinGecko + Fear & Greed | VIX, DXY, US10Y, S&P, gold | the same cross-asset tape |
+| `technicals` | hourly GeckoTerminal candles | daily exchange bars | daily exchange bars |
+| `derivatives` | funding / OI / basis | — | — |
+| `social` | LunarCrush | — | — |
+| `airdrop` | token unlocks | — | — |
+| `security` | GoPlus contract screen | — | — |
+
+A layer that does not apply returns `SKIPPED` with **zero weight**, so it neither
+helps nor hurts the prior. Missing contract-security data for an equity is not the
+same as "safe", and it is not treated as a defect either.
+
+**Identity.** A crypto entry is a *contract address*; every other market is a
+*symbol*. The watchlist derives the data-provider symbol, so operators never type
+provider syntax:
+
+| `asset_class` | stored identity | derived provider symbol | default venue |
+| --- | --- | --- | --- |
+| `crypto` | `0x…` / Solana pubkey | *(address is used)* | chain slug |
+| `equity` | `AAPL` | `AAPL` (`BRK.B` → `BRK-B`) | `us_equity` |
+| `etf` | `SPY` | `SPY` | `us_equity` |
+| `index` | `SPX` | `^GSPC` (`VIX` → `^VIX`) | `index` |
+| `fx` | `EURUSD` | `EURUSD=X` | `fx` |
+| `commodity` | `GC` | `GC=F` | `futures` |
+| `rate` | `US10Y` | `^TNX` | `rates` |
+
+```yaml
+watchlists:
+  equities:
+    asset_class: equity          # section-level default
+    venue: us_equity
+    instruments:                 # "instruments" and "tokens" are interchangeable
+      - AAPL                     # bare strings are tickers, addresses are contracts
+      - symbol: BRK.B
+        provider_symbol: BRK-B   # optional override for anything exotic
+  fx:
+    asset_class: fx
+    instruments: [EURUSD, USDJPY]
+  commodities:
+    asset_class: commodity
+    instruments: [GC, CL, HG]
+```
+
+Listed-instrument data comes from the keyless Yahoo Finance chart endpoint
+(`scanners/market_data.py`); crypto keeps DexScreener + GeckoTerminal. One fetch
+feeds both the `market` layer and `technicals` within a collection.
+
+**Fundamentals are opt-in.** Set `SEC_USER_AGENT="AlphaSentinel you@example.com"`
+to enable SEC EDGAR lookups — the SEC's fair-access policy requires a contact.
+Without it the layer reports `SKIPPED` and makes no outbound call.
+
+Probe any market from the CLI:
+
+```bash
+python -m scanners --symbol AAPL --asset-class equity
+python -m scanners --symbol EURUSD --asset-class fx
+python -m scanners --symbol US10Y --asset-class rate --json
+```
+
+Three honesty notes about the cross-asset reads:
+
+* **No volume, no liquidity score.** FX pairs and yield indices report zero traded
+  volume, so the `market` layer keeps liquidity neutral instead of flagging the
+  instrument as illiquid.
+* **A rate chart is the yield itself.** For `rate`, technicals measure momentum in
+  the yield — a rising 10y is *not* bullish for a bond position; the risk agent is
+  told the asset class and should read it accordingly.
+* **Annual fundamentals only.** SEC 10-K figures need at least two fiscal years; a
+  recent IPO or a non-US listing gets `SKIPPED`, never an invented ratio.
+
+### Model providers
+
+The agents only need an OpenAI-compatible `/chat/completions` endpoint, so the model
+vendor is configuration, not code. `LLM_PROVIDER` picks a preset; any `LLM_BASE_URL`,
+`ALPHA_MODEL`, `RISK_MODEL` or price you set wins over it:
+
+| `LLM_PROVIDER` | Base URL | Default Agent 1 / Agent 2 |
+| --- | --- | --- |
+| `deepseek` (default) | `https://api.deepseek.com` | `deepseek-chat` / `deepseek-reasoner` |
+| `openai` | `https://api.openai.com/v1` | `gpt-4o-mini` / `gpt-4o` |
+| `anthropic` | `https://api.anthropic.com/v1` | `claude-sonnet-4-5` / `claude-sonnet-4-5` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `deepseek/deepseek-chat` / `deepseek/deepseek-r1` |
+| `custom` | your `LLM_BASE_URL` | you must set both models (vLLM, Ollama, Together, Groq, LiteLLM, a gateway) |
+
+```bash
+# GPT models (override the preset defaults if you want a different pair)
+LLM_PROVIDER=openai LLM_API_KEY=sk-... make dry-run
+
+# Mixed vendors behind one gateway: cheap analyst, strong auditor
+LLM_PROVIDER=openrouter LLM_API_KEY=sk-or-... \
+  ALPHA_MODEL=deepseek/deepseek-chat RISK_MODEL=anthropic/claude-sonnet-4.5 make dry-run
+
+# Local models through Ollama
+LLM_PROVIDER=custom LLM_BASE_URL=http://localhost:11434/v1 \
+  ALPHA_MODEL=qwen2.5:32b RISK_MODEL=qwen2.5:32b make dry-run
+```
+
+Two things make this portable without per-vendor branches in the code:
+
+* **Wire-format adaptation.** If a model rejects `response_format`, `max_tokens`
+  (OpenAI's o-series wants `max_completion_tokens`) or a custom `temperature`, the
+  client rewrites the payload once and retries; JSON is then recovered from prose by
+  `ai_engine/parsing.py`.
+* **Cost ledger is an estimate.** `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK`
+  default to the preset's price for the *risk* model; set them to your contract rates.
+
+Legacy `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` and `DEEPSEEK_*` tuning variables are
+still read whenever the matching `LLM_*` name is absent, so old `.env` files boot
+unchanged.
 
 ---
 
@@ -86,8 +211,8 @@ make dashboard               # Streamlit on :8501
 | `--dry-run` | collect + audit, persist nothing, send nothing |
 | `--no-alerts` | run normally but suppress Telegram |
 | `--watchlist NAME` | restrict to one or more named lists (repeatable) |
-| `--token ADDR` | scan explicit addresses instead of the watchlist (repeatable) |
-| `--chain SLUG` | chain hint for `--token` |
+| `--token ADDR` | scan explicit instruments instead of the watchlist (repeatable; accepts a contract address or a ticker) |
+| `--chain SLUG` | chain/venue hint for `--token` |
 | `--limit N` | override `max_tokens_per_cycle` |
 | `--force` | ignore the per-token cooldown |
 | `--max-cycles N` | stop after N cycles (daemon mode) |
@@ -100,6 +225,7 @@ Exit codes: `0` ok, `1` cycle produced nothing, `2` usage/config error.
 
 ```bash
 python -m scanners --token 0x... --chain ethereum [--symbol WETH] [--json]
+python -m scanners --symbol AAPL --asset-class equity [--json]
 python -m ai_engine.dual_audit_flow --demo [--honeypot]
 python -m ai_engine.dual_audit_flow --address 0x... --chain ethereum   # live, needs key
 streamlit run dashboard/app.py
@@ -142,10 +268,11 @@ the groups that change behaviour:
 | Group | Keys | Notes |
 | --- | --- | --- |
 | Runtime | `APP_ENV`, `LOG_LEVEL`, `LOG_JSON`, `DEMO_MODE`, `DEFAULT_CHAIN` | `DEMO_MODE=true` swaps in scripted agents; no outbound LLM traffic |
-| Agents | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `ALPHA_MODEL`, `RISK_MODEL`, timeouts, retries, concurrency, per-MTok prices | risk model is the reasoner with veto power |
+| Agents | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_BASE_URL`, `ALPHA_MODEL`, `RISK_MODEL`, timeouts, retries, concurrency, per-MTok prices | any OpenAI-compatible endpoint; `RISK_MODEL` is the reasoner with veto power |
 | Storage | `DATA_DIR`, `HOT_DB_PATH`, `PARQUET_ROOT`, `PARQUET_COMPRESSION`, retention windows | one SQLite file + one Parquet lake |
 | R2 | `R2_ENABLED`, `R2_ENDPOINT_URL`, `R2_BUCKET`, keys, prefix | optional mirror of the cold lake |
-| Scanners | `GOPLUS_APP_KEY/SECRET`, `ETHERSCAN_API_KEY`, `LUNARCRUSH_API_KEY`, `X_BEARER_TOKEN`, timeouts | a missing key degrades that layer to `SKIPPED`, it does not fail the cycle |
+| Scanners | `GOPLUS_APP_KEY/SECRET`, `ETHERSCAN_API_KEY`, `LUNARCRUSH_API_KEY`, `X_BEARER_TOKEN`, `SEC_USER_AGENT`, timeouts | a missing key degrades that layer to `SKIPPED`, it does not fail the cycle |
+| Layers | `ENABLED_LAYERS` (default: all nine) | remove a layer globally; per-market applicability is decided per instrument |
 | Alerting | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ALERT_MIN_SCORE`, `ALERT_ON_VETO` | empty credentials = alerts silently disabled |
 | Loop | `SCAN_INTERVAL_SECONDS`, `TOKEN_CONCURRENCY`, `MAINTENANCE_INTERVAL_SECONDS` | |
 
@@ -170,8 +297,8 @@ and the bot prints them instead of burning API credits on a half-configured stac
 
 | Dataset | Written when |
 | --- | --- |
-| `verdicts` | every persisted verdict (dedupe: token, chain, decided_at) |
-| `layer_signals` | every collected signal (dedupe: token, chain, layer, observed_at) |
+| `verdicts` | every persisted verdict (dedupe: token, chain, asset class, decided_at) |
+| `layer_signals` | every collected signal (dedupe: token, chain, asset class, layer, observed_at) |
 | `runs` | one row per finished cycle |
 
 Writes are atomic (`os.replace`), idempotent under the dedupe keys, and optionally
@@ -183,7 +310,7 @@ mirrored to R2. `engine.maintenance()` prunes both stores on
 ## Tests
 
 ```bash
-make test                                   # 167 tests, ~1s
+make test                                   # 384 tests, <2s
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
@@ -195,12 +322,23 @@ writes to the repo — which is why CI can run it on every push.
 
 | File | Covers |
 | --- | --- |
+| `test_settings.py` | provider presets, `LLM_*` parsing, legacy `DEEPSEEK_*` aliases, fail-fast validation |
+| `test_llm_client.py` | request shaping per provider, JSON-mode/`max_tokens`/`temperature` adaptation, cost ledger, error paths |
+| `test_instruments.py` | asset classes, symbol normalisation, provider-symbol mapping, identity/venue rules |
+| `test_market_data.py` | Yahoo chart parsing (null bars, halted sessions), quote metrics, series intervals, caching |
+| `test_macro.py` | cross-asset tape summary, risk-on scoring, partial-data confidence, no-data refusal |
+| `test_fundamentals.py` | SEC company facts (annual-only, restatements), quality scoring, gating |
+| `test_pipeline.py` | layer registry, per-market gating, snapshot enrichment, CLI target resolution |
 | `test_scoring.py` | weighted prior, blending, risk drag, veto precedence, position tiers |
-| `test_parsing.py` | JSON scavenging, score/confidence coercion, CRITICAL→veto inference, malformed payloads |
-| `test_watchlist.py` | YAML parsing, defaults, caps, named-list selection, validation errors |
-| `test_hot_store.py` | schema, verdict roundtrip, cooldown, alert dedupe, run lifecycle, pruning |
-| `test_alerts.py` | message formatting, escaping, dedupe, disabled-credential paths |
-| `test_engine.py` | full cycle, dry-run persists nothing, per-token failure isolation, cold-store failure swallowed, veto end-to-end |
+| `test_parsing.py` | JSON scavenging, score/confidence coercion, non-finite rejection, CRITICAL→veto inference, missing risk score |
+| `test_dual_audit_flow.py` | repair-then-fail-closed risk parsing, retry-sized watchdog, per-snapshot isolation |
+| `test_watchlist.py` | YAML parsing, defaults, caps, crypto contracts + listed symbols, section-level `market:`, validation errors |
+| `test_hot_store.py` | schema (+ in-place migration of verdicts/alerts/seen), asset-class filter, cooldown, alert dedupe by venue+status, pruning |
+| `test_alerts.py` | message formatting, escaping, market lines, approval-vs-veto dedupe, secret-free failure reasons |
+| `test_engine.py` | full cycle, dry-run persists nothing, per-instrument failure isolation, alert/selection guards, veto end-to-end |
+| `test_parquet_store.py` | idempotent compaction, `overwrite=False` uploads, compacted-file-then-cleanup, scoped remote retention |
+| `test_scanners.py` | base-token pair filtering, supply-based concentration, ISO-8601 wash timestamps |
+| `test_logging.py` | secret redaction across `msg`, `extra` and tracebacks |
 | `test_dashboard.py` | Streamlit `AppTest` render against empty stores (no server, no browser) |
 
 ---
@@ -242,7 +380,8 @@ docker compose down
   the engine counts it as an error so a run with degraded audits reports `partial`.
 * Telegram failures never fail a cycle; the alert ledger records only successful sends,
   so a failed send is retried on the next scan of that token.
-* Cooldowns are per `(token_address, chain)` and configurable per watchlist entry.
+* Cooldowns are per `(identity, venue)` — contract+chain for crypto, symbol+venue
+  for listed instruments — and configurable per watchlist entry.
 * Logs are JSON by default (`LOG_JSON=true`) with stable `msg` keys — grep `cycle_finished`,
   `verdict_persist_failed`, `cold_store_write_failed`, `alert_failed`.
 
@@ -251,11 +390,11 @@ docker compose down
 ## Layout
 
 ```
-ai_engine/    DeepSeek client, prompts, parsers, dual-agent flow, demo client
-bot/          watchlist loader, scan engine, Telegram alerter, CLI
+ai_engine/    LLM client (any OpenAI-compatible API), prompts, parsers, dual-agent flow, demo client
+bot/          watchlist loader (crypto + listed markets), scan engine, Telegram alerter, CLI
 config/       settings (env-driven dataclasses), watchlists.yaml
-core/         models, deterministic scoring, HTTP + logging helpers
-scanners/     seven layer scanners, aggregating pipeline
+core/         instrument identity, models, deterministic scoring, HTTP + logging helpers
+scanners/     nine layer scanners (incl. market + fundamentals), market data, pipeline
 storage/      SQLite hot store, Parquet lake (+ optional R2)
 dashboard/    Streamlit read-only UI
 tests/        hermetic pytest suite
