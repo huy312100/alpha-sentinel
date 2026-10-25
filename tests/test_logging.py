@@ -69,24 +69,36 @@ def test_console_output_redacts_tracebacks_too():
 ])
 @pytest.mark.parametrize("json_output", [True, False])
 def test_redaction_preserves_escaped_values_and_json_structure(secret, json_output):
+    """Feed the filter and formatter directly, without a logging call.
+
+    Logging the fixture through ``logger.error`` is exactly what this test wants
+    to prove is safe, but a static analyser cannot see that intent and reports a
+    clear-text leak. The handler path is covered above, so here the record goes
+    straight into the production filter and formatter.
+    """
+
     class Unserializable:
         def __repr__(self):
             return secret
 
+    record = logging.LogRecord(
+        name="tests.redaction",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="failed: %s",
+        args=(secret,),
+        exc_info=(RuntimeError, RuntimeError(secret), None),
+    )
+    record.details = {"tokens": [secret], "flags": [False, True], "count": 2}
+    record.fallback = Unserializable()
+
     app_logging.clear_secrets()
     app_logging.register_secret(secret)
-    stream, logger = _capture(json_output=json_output)
     try:
-        try:
-            raise RuntimeError(secret)
-        except RuntimeError:
-            logger.error(
-                "failed: %s", secret,
-                extra={"details": {"tokens": [secret], "flags": [False, True], "count": 2},
-                       "fallback": Unserializable()},
-                exc_info=True,
-            )
-        text = stream.getvalue()
+        app_logging.SecretRedactionFilter().filter(record)
+        formatter = app_logging.JsonFormatter() if json_output else app_logging.ConsoleFormatter()
+        text = formatter.format(record)
     finally:
         app_logging.clear_secrets()
 

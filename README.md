@@ -310,7 +310,7 @@ mirrored to R2. `engine.maintenance()` prunes both stores on
 ## Tests
 
 ```bash
-make test                                   # 384 tests, <2s
+make test                                   # 402 tests, <2s
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
@@ -338,7 +338,7 @@ writes to the repo — which is why CI can run it on every push.
 | `test_engine.py` | full cycle, dry-run persists nothing, per-instrument failure isolation, alert/selection guards, veto end-to-end |
 | `test_parquet_store.py` | idempotent compaction, `overwrite=False` uploads, compacted-file-then-cleanup, scoped remote retention |
 | `test_scanners.py` | base-token pair filtering, supply-based concentration, ISO-8601 wash timestamps |
-| `test_logging.py` | secret redaction across `msg`, `extra` and tracebacks |
+| `test_logging.py` | secret redaction across `msg`, `extra` and tracebacks, escaped JSON values, metadata keys |
 | `test_dashboard.py` | Streamlit `AppTest` render against empty stores (no server, no browser) |
 
 ---
