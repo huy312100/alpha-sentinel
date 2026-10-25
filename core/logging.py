@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from typing import Any, Dict, Iterator, Set
 
 REDACTED = "***REDACTED***"
 _SECRETS: Set[str] = set()
+_JSON_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 _STANDARD_ATTRS = frozenset(
     {
         "args", "asctime", "created", "exc_info", "exc_text", "filename", "funcName",
@@ -45,6 +47,16 @@ def redact(text: str) -> str:
         if secret in text:
             text = text.replace(secret, REDACTED)
     return text
+
+
+def _redact_json_strings(text: str) -> str:
+    """Scrub decoded JSON strings without replacing syntax or scalar values."""
+    if not _SECRETS:
+        return text
+    return _JSON_STRING_RE.sub(
+        lambda match: json.dumps(redact(json.loads(match.group())), ensure_ascii=False),
+        text,
+    )
 
 
 def clear_secrets() -> None:
@@ -78,15 +90,15 @@ class JsonFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key not in _STANDARD_ATTRS and not key.startswith("_"):
                 try:
-                    json.dumps(value)
-                    payload[key] = value
+                    encoded = json.dumps(value, ensure_ascii=False)
+                    payload[key] = json.loads(_redact_json_strings(encoded))
                 except (TypeError, ValueError):
-                    payload[key] = repr(value)
+                    payload[key] = redact(repr(value))
         if record.exc_info:
-            payload["exc"] = self.formatException(record.exc_info)
-        # Redact the *final* line: ``extra={...}`` values and tracebacks can carry a
-        # URL with an embedded token just as easily as the message can.
-        return redact(json.dumps(payload, ensure_ascii=False, default=str))
+            payload["exc"] = redact(self.formatException(record.exc_info))
+        # Also scrub metadata and keys in the final line, decoding escaped strings
+        # so secrets containing quotes, backslashes or newlines cannot leak.
+        return _redact_json_strings(json.dumps(payload, ensure_ascii=False, default=str))
 
 
 class ConsoleFormatter(logging.Formatter):

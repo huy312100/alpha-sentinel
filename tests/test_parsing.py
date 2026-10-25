@@ -53,9 +53,10 @@ class TestCoercion:
 
     @pytest.mark.parametrize(
         ("raw", "expected"),
-        [(0.9, 90.0), (0.0, 0.0), (1.0, 1.0), (7, 7.0), (100, 100.0), (150, 100.0), (-5, 0.0)],
+        [(0.9, 0.9), ("0.82", 0.82), (0.0, 0.0), (1.0, 1.0), (7, 7.0), (10, 10.0),
+         (100, 100.0), (150, 100.0), (-5, 0.0), (12.345, 12.35)],
     )
-    def test_normalise_score_scales(self, raw, expected):
+    def test_normalise_score_preserves_prompt_scale(self, raw, expected):
         assert normalise_score(raw) == expected
 
     def test_normalise_score_default_on_garbage(self):

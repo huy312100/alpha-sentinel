@@ -702,9 +702,17 @@ class ParquetStore:
         removed = 0
         for item in self.remote_listing():
             key = str(item.get("key") or "")
-            if not key.endswith(".parquet") or f"/{PARTITION_COLUMN}=" not in key:
-                continue
             if not key.startswith(f"{prefix}/"):
+                continue
+            layout = re.fullmatch(
+                rf"([^/]+)/{PARTITION_COLUMN}=(\d{{4}}-\d{{2}}-\d{{2}})/[^/]+\.parquet",
+                key[len(prefix) + 1:],
+            )
+            if layout is None or not _DATASET_RE.fullmatch(layout[1]):
+                continue
+            try:
+                date.fromisoformat(layout[2])
+            except ValueError:
                 continue
             modified = item.get("last_modified")
             if modified is None or modified >= cutoff:

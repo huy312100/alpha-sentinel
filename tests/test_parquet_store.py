@@ -154,6 +154,11 @@ def test_remote_retention_only_deletes_own_parquet_partitions(remote):
         {"Key": "alpha-sentinel/events/dt=2020-01-01/notes.txt", "LastModified": old},
         {"Key": "alpha-sentinel-staging/events/dt=2020-01-01/old.parquet", "LastModified": old},
         {"Key": "alpha-sentinel/events/loose.parquet", "LastModified": old},
+        {"Key": "alpha-sentinel/events/dt=not-a-date/old.parquet", "LastModified": old},
+        {"Key": "alpha-sentinel/events/dt=2020-02-30/old.parquet", "LastModified": old},
+        {"Key": "alpha-sentinel/events/dt=2020-01-01/nested/old.parquet", "LastModified": old},
+        {"Key": "alpha-sentinel/backups/events/dt=2020-01-01/old.parquet", "LastModified": old},
+        {"Key": "alpha-sentinel/INVALID/dt=2020-01-01/old.parquet", "LastModified": old},
         {"Key": "alpha-sentinel/events/dt=2026-01-01/new.parquet", "LastModified": utcnow()},
     ]
 
@@ -161,8 +166,9 @@ def test_remote_retention_only_deletes_own_parquet_partitions(remote):
     assert fake.deleted == ["alpha-sentinel/events/dt=2020-01-01/old.parquet"]
 
 
-def test_remote_retention_refuses_an_empty_prefix(tmp_path):
-    store = ParquetStore(tmp_path / "lake", r2=r2(""), remote_retention_days=365)
+@pytest.mark.parametrize("prefix", ["", "/", "///"])
+def test_remote_retention_refuses_an_empty_prefix(tmp_path, prefix):
+    store = ParquetStore(tmp_path / "lake", r2=r2(prefix), remote_retention_days=365)
     fake = FakeS3()
     store._s3 = fake
     fake.listing = [{"Key": "someone-else/objects/dt=2020-01-01/x.parquet", "LastModified": utcnow() - timedelta(days=400)}]

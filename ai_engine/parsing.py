@@ -101,15 +101,8 @@ def to_float(value: Any, default: float = 0.0) -> float:
 
 
 def normalise_score(value: Any, default: float = 50.0) -> float:
-    """Coerce a score on the prompt contract's 0-100 scale.
-
-    A fractional value in ``(0, 1)`` is read as a percentage (0.82 -> 82), because
-    several models drift there. Small integers are *not* rescaled: the contract is
-    0-100, so ``8`` is a broken setup, not a top score.
-    """
+    """Coerce, clamp and round a score on the prompt contract's 0-100 scale."""
     score = to_float(value, default)
-    if 0.0 < score < 1.0:
-        score *= 100.0
     return round(clamp(score), 2)
 
 
