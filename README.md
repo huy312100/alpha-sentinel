@@ -22,10 +22,12 @@ with pure arithmetic, so a verdict is reproducible and testable without an API k
 config/watchlists.yaml   (crypto contracts + listed symbols)
         │
         ▼
-┌───────────────────┐   9 layers, asset-class aware, each isolated + timeout-bounded
-│ scanners.pipeline │──▶ onchain · derivatives · social · dex · market
-│                   │    fundamentals · airdrop · macro · technicals
-└─────────┬─────────┘
+┌───────────────────┐   one manifest per asset class, every layer isolated
+│ scanners.pipeline │──▶ crypto: onchain · derivatives · social · dex ·
+│ scanners.registry │           ecosystem · tokenomics · technicals · security
+└─────────┬─────────┘   listed: market · fundamentals · macro · technicals
+          │                     (+ a routed stub per market: etf_flows,
+          │                      index_breadth, fx_carry, …)
           │ TokenSnapshot + confidence-weighted prior
           ▼
 ┌───────────────────────────┐
@@ -51,6 +53,21 @@ Failure isolation is a hard rule: one dead provider degrades a layer, not the cy
 one dead instrument does not abort the run; a Parquet or Telegram hiccup is logged
 and the loop keeps going. `--dry-run` collects and audits but persists and sends
 nothing.
+
+`scanners.registry` owns the routing table (`ASSET_LAYER_MAP`). A layer never runs
+because the pipeline knows its name — it runs because the instrument's `asset_class`
+has a manifest entry for it. Three consequences worth knowing:
+
+* **Crypto is eight dedicated layers** under `scanners/crypto/`, one module each.
+  Nothing is shared between them except the HTTP client and the indicator maths.
+* **Every other market is routed today**, even where its dedicated data is not
+  built yet: `etf_flows`, `index_breadth`, `fx_carry`, `commodity_inventory`,
+  `equity_ownership` and `rates_curve` are stubs that return `SKIPPED` with zero
+  weight, so a real collector can land without touching the pipeline.
+* **A failing layer is skipped, never neutral.** An exception, a timeout or an
+  `UNAVAILABLE` provider becomes `SKIPPED` with weight 0, so a dead API cannot drag
+  a score toward 50. Layer 8 (security) is `always_on` and a critical flag there
+  vetoes the verdict regardless of every other score.
 
 ---
 
@@ -272,7 +289,7 @@ the groups that change behaviour:
 | Storage | `DATA_DIR`, `HOT_DB_PATH`, `PARQUET_ROOT`, `PARQUET_COMPRESSION`, retention windows | one SQLite file + one Parquet lake |
 | R2 | `R2_ENABLED`, `R2_ENDPOINT_URL`, `R2_BUCKET`, keys, prefix | optional mirror of the cold lake |
 | Scanners | `GOPLUS_APP_KEY/SECRET`, `ETHERSCAN_API_KEY`, `LUNARCRUSH_API_KEY`, `X_BEARER_TOKEN`, `SEC_USER_AGENT`, timeouts | a missing key degrades that layer to `SKIPPED`, it does not fail the cycle |
-| Layers | `ENABLED_LAYERS` (default: all nine) | remove a layer globally; per-market applicability is decided per instrument |
+| Layers | `ENABLED_LAYERS` (default: every layer routed for the instrument's asset class) | narrow globally; crypto and listed markets each keep their own manifest, and `security` cannot be switched off |
 | Alerting | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ALERT_MIN_SCORE`, `ALERT_ON_VETO` | empty credentials = alerts silently disabled |
 | Loop | `SCAN_INTERVAL_SECONDS`, `TOKEN_CONCURRENCY`, `MAINTENANCE_INTERVAL_SECONDS` | |
 
@@ -394,7 +411,9 @@ ai_engine/    LLM client (any OpenAI-compatible API), prompts, parsers, dual-age
 bot/          watchlist loader (crypto + listed markets), scan engine, Telegram alerter, CLI
 config/       settings (env-driven dataclasses), watchlists.yaml
 core/         instrument identity, models, deterministic scoring, HTTP + logging helpers
-scanners/     nine layer scanners (incl. market + fundamentals), market data, pipeline
+scanners/     pipeline + registry; per-asset-class packages: crypto/ (8 layers),
+              equities/ etfs/ indices/ forex/ commodities/ rates/ (routed market
+              layers), shared/ (HTTP client + indicator maths), market data
 storage/      SQLite hot store, Parquet lake (+ optional R2)
 dashboard/    Streamlit read-only UI
 tests/        hermetic pytest suite

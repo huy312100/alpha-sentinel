@@ -148,12 +148,24 @@ DEFAULT_ENABLED_LAYERS: tuple[str, ...] = (
     "derivatives",
     "social",
     "dex",
+    "ecosystem",
+    "tokenomics",
     "market",
     "fundamentals",
-    "airdrop",
     "macro",
     "technicals",
+    "security",
 )
+
+#: Layer slugs that older ``.env`` files may still use. ``scanners.registry``
+#: resolves them onto the module that owns the data now:
+#:   * ``airdrop``  -> ``ecosystem`` (DeFiLlama / GrowThePie ecosystem metrics)
+#:   * ``macro``    -> both the listed-market macro backdrop and, for crypto,
+#:                     the tokenomics/event layer that replaced it
+LEGACY_LAYER_ALIASES: dict[str, str] = {
+    "airdrop": "ecosystem",
+    "macro": "tokenomics",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +313,45 @@ class SocialSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderSettings:
+    """Optional data-vendor credentials for the crypto layer stack.
+
+    Every field is optional: a layer whose providers are unconfigured returns
+    ``SKIPPED`` (zero weight) instead of inventing a neutral reading. Keys are
+    ``SecretStr`` so they can never be printed by an accidental ``repr``/log.
+    """
+
+    arkham_api_key: SecretStr = SecretStr()
+    nansen_api_key: SecretStr = SecretStr()
+    dune_api_key: SecretStr = SecretStr()
+    #: A saved Dune query id returning one row with ``net_flow_usd`` per token.
+    #: ``0`` disables the provider (Dune has no generic "token netflow" endpoint).
+    dune_smart_money_query_id: int = 0
+    coinglass_api_key: SecretStr = SecretStr()
+    cryptopanic_token: SecretStr = SecretStr()
+    #: Optional JSON calendar for unlock/vesting/mainnet-upgrade events. Teams can
+    #: point this at TokenUnlocks, an internal sheet export or their own service.
+    tokenomics_calendar_url: str = ""
+    hyperliquid_base_url: str = "https://api.hyperliquid.xyz"
+    honeypot_base_url: str = "https://api.honeypot.is"
+
+    def configured_sources(self) -> tuple[str, ...]:
+        """Names only - never values - for boot logs and ``/status``."""
+        sources: list[str] = []
+        if self.arkham_api_key.is_configured():
+            sources.append("arkham")
+        if self.nansen_api_key.is_configured():
+            sources.append("nansen")
+        if self.dune_api_key.is_configured() and self.dune_smart_money_query_id > 0:
+            sources.append("dune")
+        if self.coinglass_api_key.is_configured():
+            sources.append("coinglass")
+        if self.cryptopanic_token.is_configured():
+            sources.append("cryptopanic")
+        return tuple(sources)
+
+
+@dataclass(frozen=True, slots=True)
 class TelegramSettings:
     bot_token: SecretStr = SecretStr()
     chat_id: str = ""
@@ -350,6 +401,7 @@ class Settings:
     storage: StorageSettings = StorageSettings()
     goplus: GoPlusSettings = GoPlusSettings()
     social: SocialSettings = SocialSettings()
+    providers: ProviderSettings = ProviderSettings()
     telegram: TelegramSettings = TelegramSettings()
     scanners: ScannerSettings = ScannerSettings()
     thresholds: ThresholdSettings = ThresholdSettings()
@@ -372,7 +424,11 @@ class Settings:
             problems.append(f"unsupported PARQUET_COMPRESSION: {self.storage.compression}")
         if self.telegram.bot_token.is_configured() and not self.telegram.chat_id:
             problems.append("TELEGRAM_BOT_TOKEN is set but TELEGRAM_CHAT_ID is empty")
-        unknown_layers = [name for name in self.scanners.enabled_layers if name not in DEFAULT_ENABLED_LAYERS]
+        unknown_layers = [
+            name
+            for name in self.scanners.enabled_layers
+            if name not in DEFAULT_ENABLED_LAYERS and name not in LEGACY_LAYER_ALIASES
+        ]
         if unknown_layers:
             problems.append(
                 "unknown ENABLED_LAYERS slug(s): "
@@ -402,6 +458,7 @@ class Settings:
             "r2_enabled": self.storage.r2.enabled,
             "r2_configured": self.storage.r2.is_configured(),
             "goplus_configured": self.goplus.app_key.is_configured(),
+            "provider_sources": list(self.providers.configured_sources()),
             "telegram_configured": self.telegram.is_configured(),
             "scan_interval_seconds": self.scanners.scan_interval_seconds,
             "layers": list(self.scanners.enabled_layers),
@@ -481,6 +538,20 @@ class Settings:
             x_bearer_token=_env_secret(env, "X_BEARER_TOKEN"),
         )
 
+        providers = ProviderSettings(
+            arkham_api_key=_env_secret(env, "ARKHAM_API_KEY"),
+            nansen_api_key=_env_secret(env, "NANSEN_API_KEY"),
+            dune_api_key=_env_secret(env, "DUNE_API_KEY"),
+            dune_smart_money_query_id=_env_int(env, "DUNE_SMART_MONEY_QUERY_ID", 0, minimum=0),
+            coinglass_api_key=_env_secret(env, "COINGLASS_API_KEY"),
+            cryptopanic_token=_env_secret(env, "CRYPTOPANIC_TOKEN"),
+            tokenomics_calendar_url=_env_str(env, "TOKENOMICS_CALENDAR_URL", ""),
+            hyperliquid_base_url=_env_str(
+                env, "HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz"
+            ).rstrip("/"),
+            honeypot_base_url=_env_str(env, "HONEYPOT_BASE_URL", "https://api.honeypot.is").rstrip("/"),
+        )
+
         telegram = TelegramSettings(
             bot_token=_env_secret(env, "TELEGRAM_BOT_TOKEN"),
             chat_id=_env_str(env, "TELEGRAM_CHAT_ID", ""),
@@ -511,6 +582,7 @@ class Settings:
             storage=storage,
             goplus=goplus,
             social=social,
+            providers=providers,
             telegram=telegram,
             scanners=scanners,
             thresholds=thresholds,
@@ -531,6 +603,11 @@ class Settings:
             self.goplus.app_secret,
             self.social.lunarcrush_api_key,
             self.social.x_bearer_token,
+            self.providers.arkham_api_key,
+            self.providers.nansen_api_key,
+            self.providers.dune_api_key,
+            self.providers.coinglass_api_key,
+            self.providers.cryptopanic_token,
             self.telegram.bot_token,
         ):
             register_secret(secret.get_secret_value())
@@ -627,6 +704,11 @@ def iter_secret_values(settings: Settings) -> Iterable[str]:
         settings.goplus.app_secret,
         settings.social.lunarcrush_api_key,
         settings.social.x_bearer_token,
+        settings.providers.arkham_api_key,
+        settings.providers.nansen_api_key,
+        settings.providers.dune_api_key,
+        settings.providers.coinglass_api_key,
+        settings.providers.cryptopanic_token,
         settings.telegram.bot_token,
     ):
         if secret.is_configured():
@@ -637,10 +719,12 @@ __all__ = [
     "ConfigError",
     "DEFAULT_LLM_PROVIDER",
     "GoPlusSettings",
+    "LEGACY_LAYER_ALIASES",
     "LLM_PROVIDER_PRESETS",
     "LLMSettings",
     "PROJECT_ROOT",
     "ProviderPreset",
+    "ProviderSettings",
     "R2Settings",
     "RuntimeSettings",
     "ScannerSettings",

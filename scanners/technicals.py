@@ -1,154 +1,30 @@
 """Technicals layer: indicators computed from a provider-neutral price series.
 
-No ``pandas-ta``/``TA-Lib`` dependency: the handful of indicators we actually trade
-on are implemented here in pure Python and unit-tested. That keeps the container
-small and the maths auditable - an indicator we cannot reason about is a liability
-in a system that can veto on its output.
+The maths lives in :mod:`scanners.shared.technicals` so crypto, listed markets and
+any future asset class score momentum identically. This module owns the *layer*:
+sourcing candles through :mod:`scanners.series`, composing the component scores and
+turning them into a :class:`LayerSignal`.
 
 The layer is asset-class agnostic: candles come from :mod:`scanners.series`, which
-uses GeckoTerminal for crypto and daily exchange bars for everything else. The
-indicator maths and the score composition are identical across markets, so a
-crypto momentum read and an equity momentum read mean the same thing.
+uses GeckoTerminal for crypto and daily exchange bars for everything else.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Sequence
-
-from core.models import Layer, SignalStatus, LayerSignal, TokenSnapshot
+from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, clamp, linear, log_scale, safe_div
 from scanners.series import GECKO_OHLCV_URL, SeriesUnavailable, load_price_series, parse_ohlcv
-
-
-# ---------------------------------------------------------------------------
-# Indicators (pure functions, no external deps)
-# ---------------------------------------------------------------------------
-def sma(values: Sequence[float], period: int) -> float | None:
-    if period <= 0 or len(values) < period:
-        return None
-    window = values[-period:]
-    return sum(window) / period
-
-
-def ema_series(values: Sequence[float], period: int) -> list[float]:
-    """Classic EMA seeded with an SMA; returns one value per input after the seed."""
-    if period <= 0 or len(values) < period:
-        return []
-    multiplier = 2.0 / (period + 1.0)
-    seed = sum(values[:period]) / period
-    series = [seed]
-    for value in values[period:]:
-        series.append(value * multiplier + series[-1] * (1.0 - multiplier))
-    return series
-
-
-def ema(values: Sequence[float], period: int) -> float | None:
-    series = ema_series(values, period)
-    return series[-1] if series else None
-
-
-def rsi(values: Sequence[float], period: int = 14) -> float | None:
-    """Wilder's RSI. Returns ``None`` when there is not enough history."""
-    if len(values) <= period:
-        return None
-    gains = 0.0
-    losses = 0.0
-    for index in range(1, period + 1):
-        delta = values[index] - values[index - 1]
-        gains += max(delta, 0.0)
-        losses += max(-delta, 0.0)
-    avg_gain = gains / period
-    avg_loss = losses / period
-    for index in range(period + 1, len(values)):
-        delta = values[index] - values[index - 1]
-        avg_gain = (avg_gain * (period - 1) + max(delta, 0.0)) / period
-        avg_loss = (avg_loss * (period - 1) + max(-delta, 0.0)) / period
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def macd(
-    values: Sequence[float],
-    fast: int = 12,
-    slow: int = 26,
-    signal_period: int = 9,
-) -> dict[str, float] | None:
-    """Return ``{'macd', 'signal', 'histogram'}`` or ``None`` without enough data."""
-    fast_series = ema_series(values, fast)
-    slow_series = ema_series(values, slow)
-    if not fast_series or not slow_series:
-        return None
-    offset = len(fast_series) - len(slow_series)
-    if offset < 0:
-        return None
-    macd_line = [fast_series[index + offset] - slow_series[index] for index in range(len(slow_series))]
-    signal_series = ema_series(macd_line, signal_period)
-    if not signal_series:
-        return None
-    signal_value = signal_series[-1]
-    macd_value = macd_line[-1]
-    previous_hist = (macd_line[-2] - signal_series[-2]) if len(signal_series) >= 2 else 0.0
-    return {
-        "macd": macd_value,
-        "signal": signal_value,
-        "histogram": macd_value - signal_value,
-        "histogram_delta": (macd_value - signal_value) - previous_hist,
-    }
-
-
-def atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], period: int = 14) -> float | None:
-    """Wilder's Average True Range."""
-    count = min(len(highs), len(lows), len(closes))
-    if count <= period:
-        return None
-    true_ranges: list[float] = []
-    for index in range(1, count):
-        high, low, previous_close = highs[index], lows[index], closes[index - 1]
-        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
-    if len(true_ranges) < period:
-        return None
-    value = sum(true_ranges[:period]) / period
-    for tr in true_ranges[period:]:
-        value = (value * (period - 1) + tr) / period
-    return value
-
-
-def bollinger(values: Sequence[float], period: int = 20, mult: float = 2.0) -> dict[str, float] | None:
-    if len(values) < period:
-        return None
-    window = list(values[-period:])
-    middle = sum(window) / period
-    variance = sum((value - middle) ** 2 for value in window) / period
-    deviation = math.sqrt(variance)
-    return {
-        "middle": middle,
-        "upper": middle + mult * deviation,
-        "lower": middle - mult * deviation,
-        "bandwidth_pct": (2.0 * mult * deviation / middle * 100.0) if middle else 0.0,
-    }
-
-
-def obv(closes: Sequence[float], volumes: Sequence[float]) -> list[float]:
-    """On-balance volume - sign of the move times traded volume."""
-    count = min(len(closes), len(volumes))
-    series = [0.0]
-    for index in range(1, count):
-        if closes[index] > closes[index - 1]:
-            series.append(series[-1] + volumes[index])
-        elif closes[index] < closes[index - 1]:
-            series.append(series[-1] - volumes[index])
-        else:
-            series.append(series[-1])
-    return series
-
-
-def percent_change(current: float | None, previous: float | None) -> float | None:
-    if current is None or previous in (None, 0):
-        return None
-    return (current - previous) / previous * 100.0
+from scanners.shared.technicals import (
+    atr,
+    bollinger,
+    ema,
+    ema_series,
+    macd,
+    obv,
+    percent_change,
+    rsi,
+    sma,
+)
 
 
 class TechnicalsScanner(BaseScanner):

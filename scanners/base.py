@@ -170,9 +170,31 @@ def mean_of(values: list[float]) -> float:
     return sum(values) / len(values) if values else 50.0
 
 
+class StubScanner(BaseScanner):
+    """Placeholder for a class-specific layer that is routed but not implemented.
+
+    A stub is *not* an error: it returns ``SKIPPED`` with zero weight, so routing
+    for a market can be wired today and the module can grow into a real scanner
+    without touching the registry, the pipeline or the scoring engine. Subclasses
+    declare the ``asset_classes`` they will eventually describe.
+    """
+
+    layer = Layer.FUNDAMENTALS
+    capability = "class-specific data"
+
+    async def collect(self, token: TokenSnapshot, ctx: ScanContext) -> LayerSignal:
+        return self.skipped(token, f"{self.capability} is not implemented for {token.asset_class} yet")
+
+
+#: Historic name kept so older imports keep working.
+ListedStubScanner = StubScanner
+
+
 __all__ = [
     "BaseScanner",
+    "ListedStubScanner",
     "ScanContext",
+    "StubScanner",
     "linear",
     "log_scale",
     "mean_of",

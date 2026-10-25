@@ -58,9 +58,13 @@ class Layer(str, Enum):
     DERIVATIVES = "derivatives"
     SOCIAL = "social"
     DEX = "dex"
+    #: Legacy slot kept so historical rows stay readable; new crypto scans use
+    #: :attr:`ECOSYSTEM` (DeFiLlama / GrowThePie) instead.
+    AIRDROP = "airdrop"
+    ECOSYSTEM = "ecosystem"
+    TOKENOMICS = "tokenomics"
     MARKET = "market"
     FUNDAMENTALS = "fundamentals"
-    AIRDROP = "airdrop"
     MACRO = "macro"
     TECHNICALS = "technicals"
     SECURITY = "security"
@@ -72,9 +76,10 @@ class Layer(str, Enum):
             cls.DERIVATIVES,
             cls.SOCIAL,
             cls.DEX,
+            cls.ECOSYSTEM,
+            cls.TOKENOMICS,
             cls.MARKET,
             cls.FUNDAMENTALS,
-            cls.AIRDROP,
             cls.MACRO,
             cls.TECHNICALS,
         )
