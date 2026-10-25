@@ -1,22 +1,36 @@
 # =============================================================================
 # AlphaSentinel watchlists
 #
-# Every token listed here is scanned once per cycle (subject to cooldown and the
-# per-cycle cap). Addresses are the *contract* address, never a ticker: tickers
-# collide, contracts do not.
+# Every instrument listed here is scanned once per cycle (subject to cooldown and
+# the per-cycle cap). One file drives every market: crypto contracts, equities,
+# ETFs, indices, FX pairs, commodity futures and rates.
 #
-# Fields per entry (only ``address`` is required):
-#   address        contract address (EVM: 0x + 40 hex, Solana: base58)
-#   chain          chain slug - defaults to ``defaults.chain``
-#   symbol         display hint; also used for perp-symbol lookups
+# Two identity rules, enforced at load time:
+#   * crypto       -> ``address`` (contract) + ``chain``. Tickers collide,
+#                     contracts do not.
+#   * other markets-> ``symbol``. A provider symbol (``EURUSD=X``, ``GC=F``,
+#                     ``^GSPC``) is derived from the asset class and can be
+#                     overridden with ``provider_symbol``.
+#
+# Fields per entry (identity is the only requirement):
+#   address        contract address (EVM: 0x + 40 hex, Solana: base58) - crypto
+#   symbol         ticker (required for non-crypto; display hint for crypto)
+#   asset_class    crypto|equity|etf|index|fx|commodity|rate (default: defaults.asset_class)
+#   chain          chain slug for crypto - defaults to ``defaults.chain``
+#   venue          exchange/bucket slug for non-crypto (us_equity, fx, futures...)
+#   provider_symbol override the derived data-provider symbol
 #   tags           free-form labels for filtering in the dashboard
 #   priority       lower number = scanned first when the cap is hit
-#   cooldown_hours minimum hours between two scans of the same token
+#   cooldown_hours minimum hours between two scans of the same instrument
+#
+# A watchlist section may set ``asset_class``/``venue`` once for all its entries,
+# and may use ``instruments:`` instead of ``tokens:``.
 # =============================================================================
 
 version: 1
 
 defaults:
+  asset_class: crypto
   chain: ethereum
   cooldown_hours: 6.0
   priority: 100
@@ -90,3 +104,79 @@ watchlists:
         address: "0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0"
         tags: [l2, legacy]
         priority: 80
+
+  # ---------------------------------------------------------------------------
+  # Listed markets. Same pipeline, same veto hierarchy; the crypto-only layers
+  # (onchain, dex, airdrop, social, derivatives, security) self-skip and the
+  # market + fundamentals layers take over.
+  # ---------------------------------------------------------------------------
+  equities:
+    description: US large caps - venue microstructure plus issuer fundamentals.
+    asset_class: equity
+    venue: us_equity
+    instruments:
+      - symbol: AAPL
+        tags: [mega-cap, technology]
+        priority: 60
+      - symbol: MSFT
+        tags: [mega-cap, software]
+        priority: 62
+      - symbol: JPM
+        tags: [banks, value]
+        priority: 70
+
+  etfs:
+    description: Broad-market and sector ETFs - the cheapest read on risk appetite.
+    asset_class: etf
+    venue: us_equity
+    instruments:
+      - symbol: SPY
+        tags: [index, sp500]
+        priority: 55
+      - symbol: QQQ
+        tags: [index, nasdaq100]
+        priority: 58
+
+  indices:
+    description: Headline indices and the volatility gauge itself.
+    asset_class: index
+    instruments:
+      - symbol: SPX
+        tags: [sp500, benchmark]
+        priority: 52
+      - symbol: VIX
+        tags: [volatility]
+        priority: 53
+
+  fx:
+    description: Majors - rate differentials and the dollar bid.
+    asset_class: fx
+    instruments:
+      - symbol: EURUSD
+        tags: [major, eur]
+        priority: 65
+      - symbol: USDJPY
+        tags: [major, jpy]
+        priority: 66
+
+  commodities:
+    description: Front-month futures - the inflation and growth read.
+    asset_class: commodity
+    instruments:
+      - symbol: GC
+        tags: [gold, metals]
+        priority: 68
+      - symbol: CL
+        tags: [crude, energy]
+        priority: 69
+      - symbol: HG
+        tags: [copper, growth]
+        priority: 72
+
+  rates:
+    description: US Treasury yields - the discount rate every asset prices against.
+    asset_class: rate
+    instruments:
+      - symbol: US10Y
+        tags: [treasury, duration]
+        priority: 74
