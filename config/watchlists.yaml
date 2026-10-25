@@ -1,0 +1,92 @@
+# =============================================================================
+# AlphaSentinel watchlists
+#
+# Every token listed here is scanned once per cycle (subject to cooldown and the
+# per-cycle cap). Addresses are the *contract* address, never a ticker: tickers
+# collide, contracts do not.
+#
+# Fields per entry (only ``address`` is required):
+#   address        contract address (EVM: 0x + 40 hex, Solana: base58)
+#   chain          chain slug - defaults to ``defaults.chain``
+#   symbol         display hint; also used for perp-symbol lookups
+#   tags           free-form labels for filtering in the dashboard
+#   priority       lower number = scanned first when the cap is hit
+#   cooldown_hours minimum hours between two scans of the same token
+# =============================================================================
+
+version: 1
+
+defaults:
+  chain: ethereum
+  cooldown_hours: 6.0
+  priority: 100
+
+settings:
+  # Hard cap per cycle. The engine truncates by priority, then symbol.
+  max_tokens_per_cycle: 60
+
+watchlists:
+  core:
+    description: Deep-liquidity majors used as the canary set for every cycle.
+    tokens:
+      - symbol: WETH
+        address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+        tags: [major, collateral]
+        priority: 10
+      - symbol: PEPE
+        address: "0x6982508145454Ce325dDbE47a25d4ec3d2311933"
+        tags: [meme, high-volume]
+        priority: 20
+      - symbol: UNI
+        address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"
+        tags: [defi]
+        priority: 40
+      - symbol: LINK
+        address: "0x514910771AF9Ca656af840dff83E8264EcF986CA"
+        tags: [oracle, defi]
+        priority: 40
+
+  l2:
+    description: Base / Arbitrum names where retail flow rotates first.
+    tokens:
+      - symbol: AERO
+        address: "0x940181a94A35A4569E4529A3CDfB74e38FD98631"
+        chain: base
+        tags: [dex, base]
+        priority: 30
+      - symbol: DEGEN
+        address: "0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed"
+        chain: base
+        tags: [meme, base]
+        priority: 50
+      - symbol: ARB
+        address: "0x912CE59144191C1204E64559FE8253a0e49E6548"
+        chain: arbitrum
+        tags: [l2, governance]
+        priority: 40
+
+  solana:
+    description: Solana majors - only the DEX/technical/wash layers apply.
+    tokens:
+      - symbol: JUP
+        address: "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+        chain: solana
+        tags: [dex, solana]
+        priority: 30
+      - symbol: BONK
+        address: "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+        chain: solana
+        tags: [meme, solana]
+        priority: 50
+
+  research:
+    description: Lower-priority names; only scanned when the cycle cap allows.
+    tokens:
+      - symbol: SHIB
+        address: "0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE"
+        tags: [meme]
+        priority: 80
+      - symbol: MATIC
+        address: "0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0"
+        tags: [l2, legacy]
+        priority: 80

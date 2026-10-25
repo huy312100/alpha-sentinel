@@ -1,0 +1,54 @@
+# =============================================================================
+# AlphaSentinel - local/prod stack: scanner bot + read-only dashboard.
+#   cp .env.example .env   # fill in keys (DEMO_MODE=true needs none)
+#   docker compose up -d --build
+# =============================================================================
+name: alpha-sentinel
+
+x-service: &service
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: alpha-sentinel:local
+  env_file:
+    - path: .env
+      required: false
+  restart: unless-stopped
+  volumes:
+    - ./data:/app/data
+    - ./config/watchlists.yaml:/app/config/watchlists.yaml:ro
+  environment:
+    DATA_DIR: /app/data
+    HOT_DB_PATH: /app/data/hot/alpha_sentinel.db
+    PARQUET_ROOT: /app/data/cold
+    LOG_JSON: "true"
+
+services:
+  bot:
+    <<: *service
+    container_name: alpha-sentinel-bot
+    command: ["python", "-m", "bot.main", "--daemon"]
+    stop_grace_period: 30s
+
+  dashboard:
+    <<: *service
+    container_name: alpha-sentinel-dashboard
+    command:
+      - streamlit
+      - run
+      - dashboard/app.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+      - --server.headless=true
+      - --browser.gatherUsageStats=false
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    depends_on:
+      bot:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3

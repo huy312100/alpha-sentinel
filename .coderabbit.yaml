@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+
+tone_instructions: >-
+  Be terse and technical. This repo trades real money against third-party APIs,
+  so prioritise correctness, failure isolation, and secret handling over style.
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+  path_filters:
+    - "!data/**"
+    - "!**/*.parquet"
+    - "!**/*.db"
+    - "!.venv/**"
+    - "!**/__pycache__/**"
+  path_instructions:
+    - path: "ai_engine/**"
+      instructions: >-
+        Prompts and parsers are a security boundary: LLM output is untrusted.
+        Flag any path where a malformed JSON payload, a missing field, or a
+        prompt-injection string could raise, silently change a verdict, or leak
+        the API key. Watchdog timeouts and degraded-mode accounting must stay
+        intact.
+    - path: "core/scoring.py"
+      instructions: >-
+        Veto precedence is contractual: any hard risk flag or risk_score above
+        the ceiling must veto, regardless of alpha. Position sizing must be
+        monotonic in the blended score.
+    - path: "bot/**"
+      instructions: >-
+        A single token failure must never abort a cycle, and no storage error may
+        escape into the loop. Dry runs must persist nothing and send nothing.
+        Telegram sends are best-effort and must be deduplicated.
+    - path: "storage/**"
+      instructions: >-
+        Schema changes need a migration path and a version bump. SQL must be
+        parameterised; Parquet writes must stay idempotent under dedupe keys.
+    - path: "tests/**"
+      instructions: >-
+        Tests must be hermetic: no network, no real credentials, no writes
+        outside tmp_path. Reject tests that only assert truthiness of a mock.
+    - path: ".github/**"
+      instructions: "Flag secrets in workflow files and over-broad permissions."
+  tools:
+    ruff:
+      enabled: false
+    flake8:
+      enabled: true
+    gitleaks:
+      enabled: true
+    checkov:
+      enabled: true
+
+chat:
+  auto_reply: true

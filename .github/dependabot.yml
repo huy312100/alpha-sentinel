@@ -1,0 +1,44 @@
+# Dependabot - pinned dependencies stay pinned, but never rot.
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    versioning-strategy: increase-if-necessary
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+    groups:
+      patch-updates:
+        applies-to: version-updates
+        update-types:
+          - patch
+      minor-updates:
+        applies-to: version-updates
+        update-types:
+          - minor
+    ignore:
+      # Major bumps of the data stack need a migration + full suite run by hand.
+      - dependency-name: numpy
+        update-types: ["version-update:semver-major"]
+      - dependency-name: pandas
+        update-types: ["version-update:semver-major"]
+      - dependency-name: pyarrow
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+      - ci

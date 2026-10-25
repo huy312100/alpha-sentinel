@@ -1,0 +1,82 @@
+# =============================================================================
+# CircleCI - lint, hermetic tests, and a container build for every push.
+# The test suite needs no network and no credentials: it is the release gate.
+# =============================================================================
+version: 2.1
+
+executors:
+  py311:
+    docker:
+      - image: cimg/python:3.11
+    resource_class: medium
+
+commands:
+  install-deps:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-deps-{{ arch }}-{{ checksum "requirements.txt" }}
+            - v1-deps-{{ arch }}-
+      - run:
+          name: Install pinned dependencies
+          command: |
+            python -m venv .venv
+            .venv/bin/python -m pip install --upgrade pip
+            .venv/bin/python -m pip install -r requirements.txt
+      - save_cache:
+          key: v1-deps-{{ arch }}-{{ checksum "requirements.txt" }}
+          paths:
+            - .venv
+
+jobs:
+  lint:
+    executor: py311
+    steps:
+      - checkout
+      - install-deps
+      - run:
+          name: flake8 (must be zero findings)
+          command: .venv/bin/python -m flake8 . --count --statistics
+      - run:
+          name: Byte-compile every module
+          command: .venv/bin/python -m compileall -q bot core config scanners storage ai_engine dashboard tests
+
+  test:
+    executor: py311
+    steps:
+      - checkout
+      - install-deps
+      - run:
+          name: pytest (hermetic, DEMO_MODE)
+          command: |
+            mkdir -p test-results
+            .venv/bin/python -m pytest tests/ -q --junitxml=test-results/junit.xml
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: test-results
+
+  docker-build:
+    executor: py311
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name: Build the runtime image
+          command: docker build --tag alpha-sentinel:${CIRCLE_SHA1:0:7} .
+      - run:
+          name: Smoke the image (status command, no credentials)
+          command: |
+            docker run --rm \
+              -e DEMO_MODE=true \
+              -e TELEGRAM_BOT_TOKEN= \
+              -e TELEGRAM_CHAT_ID= \
+              alpha-sentinel:${CIRCLE_SHA1:0:7} python -m bot.main --status
+
+workflows:
+  ci:
+    jobs:
+      - lint
+      - test
+      - docker-build
