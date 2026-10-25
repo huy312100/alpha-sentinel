@@ -1,9 +1,8 @@
 """Shared clients and libraries used by every scanner package.
 
-Nothing in here knows about a specific market. A layer module imports from this
-package instead of talking to ``aiohttp`` or re-implementing indicator maths, so
-one retry policy, one rate limiter and one RSI implementation serve crypto,
-equities, FX and everything added later.
+A layer module imports from this package instead of talking to ``aiohttp`` or
+re-implementing indicator maths, so one retry policy, one rate limiter and one
+RSI implementation serve crypto, equities, FX and everything added later.
 
 Contents
 --------
@@ -14,6 +13,17 @@ Contents
 ``technicals``
     Pure indicator functions (SMA/EMA/RSI/MACD/ATR/OBV/Bollinger/z-score) and
     order-flow imbalance - auditable maths with no ``pandas``/``TA-Lib`` runtime.
+``market_data``
+    Keyless venue quotes and daily candles (Yahoo chart API) for every listed
+    instrument, with the parsing quirks normalised at the edge.
+``series``
+    :class:`PriceSeries` and :func:`load_price_series`: one candle shape for
+    crypto (GeckoTerminal) and listed venues (Yahoo), so indicators never branch
+    on asset class. The crypto leg is imported lazily to keep the dependency
+    arrow pointing ``crypto -> shared``.
+``listed``
+    The generic non-crypto layers (market, macro, fundamentals, technicals) that
+    the placeholder market packages compose until each market ships its own.
 """
 
 from __future__ import annotations

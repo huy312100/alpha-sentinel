@@ -5,14 +5,14 @@ from __future__ import annotations
 import pytest
 
 from core.models import TokenSnapshot
-from scanners import market_data
-from scanners.market_data import (
+from scanners.shared import market_data
+from scanners.shared.market_data import (
     MarketQuote,
     fetch_yahoo_chart,
     load_market_series,
     parse_yahoo_chart,
 )
-from scanners.series import PriceSeries
+from scanners.shared.series import PriceSeries
 
 
 def chart_payload(

@@ -18,7 +18,6 @@ from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, linear, log_scale, safe_div
-
 from scanners.shared.http_client import ProviderResult, fetch_provider, first_float, first_row, request_json, to_float
 
 log = get_logger(__name__)

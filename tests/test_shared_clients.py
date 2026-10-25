@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-from scanners import technicals as technicals_layer
 from scanners.shared import http_client
 from scanners.shared.http_client import (
     ProviderResult,
@@ -19,6 +18,7 @@ from scanners.shared.http_client import (
     first_row,
     limiter_for,
 )
+from scanners.shared.listed import technicals as technicals_layer
 from scanners.shared.technicals import (
     atr,
     bollinger,

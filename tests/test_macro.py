@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from scanners.macro import cross_asset_score, series_momentum, summarise_cross_asset
+from scanners.shared.listed.macro import cross_asset_score, series_momentum, summarise_cross_asset
 from tests.test_market_data import chart_payload
 
 

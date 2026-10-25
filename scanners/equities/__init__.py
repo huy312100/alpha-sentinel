@@ -1,6 +1,6 @@
 """Equity layers: venue, SEC fundamentals, ownership, macro and technicals.
 
-``scanners.fundamentals`` already reads SEC EDGAR company facts, so equities have a
+``scanners.shared.listed.fundamentals`` already reads SEC EDGAR company facts, so equities have a
 real fundamentals layer today. Insider/institutional ownership (Form 4, 13F) is a
 routed stub - ``SKIPPED`` with zero weight - until that collector lands.
 """

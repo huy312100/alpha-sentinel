@@ -147,8 +147,8 @@ watchlists:
 ```
 
 Listed-instrument data comes from the keyless Yahoo Finance chart endpoint
-(`scanners/market_data.py`); crypto keeps DexScreener + GeckoTerminal. One fetch
-feeds both the `market` layer and `technicals` within a collection.
+(`scanners/shared/market_data.py`); crypto keeps DexScreener + GeckoTerminal.
+One fetch feeds both the `market` layer and `technicals` within a collection.
 
 **Fundamentals are opt-in.** Set `SEC_USER_AGENT="AlphaSentinel you@example.com"`
 to enable SEC EDGAR lookups — the SEC's fair-access policy requires a contact.
@@ -411,9 +411,14 @@ ai_engine/    LLM client (any OpenAI-compatible API), prompts, parsers, dual-age
 bot/          watchlist loader (crypto + listed markets), scan engine, Telegram alerter, CLI
 config/       settings (env-driven dataclasses), watchlists.yaml
 core/         instrument identity, models, deterministic scoring, HTTP + logging helpers
-scanners/     pipeline + registry; per-asset-class packages: crypto/ (8 layers),
-              equities/ etfs/ indices/ forex/ commodities/ rates/ (routed market
-              layers), shared/ (HTTP client + indicator maths), market data
+scanners/     framework only at the root: __init__, base (layer contract),
+              registry (asset_class -> layer routing), pipeline, __main__
+  crypto/       eight layers (layer1_onchain .. layer8_security) + providers/
+                (DexScreener, GeckoTerminal, GoPlus, Coinglass, LunarCrush, ...)
+  shared/       http_client (retry + per-host limit), technicals (indicator
+                maths), market_data + series (quote/candle transport), listed/
+                (generic non-crypto layers the market packages compose)
+  equities/ etfs/ indices/ forex/ commodities/ rates/   routed market manifests
 storage/      SQLite hot store, Parquet lake (+ optional R2)
 dashboard/    Streamlit read-only UI
 tests/        hermetic pytest suite

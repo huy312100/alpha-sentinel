@@ -10,11 +10,11 @@ from config.settings import DEFAULT_ENABLED_LAYERS, ScannerSettings, Settings
 from core.instruments import AssetClass, InstrumentError
 from core.models import Layer, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext
-from scanners.dex import DexScanner
-from scanners.fundamentals import FundamentalsScanner
-from scanners.market import MarketScanner
-from scanners.market_data import MarketQuote
+from scanners.crypto.providers.dex import DexScanner
 from scanners.pipeline import SCANNER_REGISTRY, ScanPipeline
+from scanners.shared.listed.fundamentals import FundamentalsScanner
+from scanners.shared.listed.market import MarketScanner
+from scanners.shared.market_data import MarketQuote
 
 
 def snapshot(asset_class: str = "crypto", **overrides) -> TokenSnapshot:
@@ -81,13 +81,13 @@ class TestGating:
         assert not MarketScanner(settings).supports(snapshot("martian"))
 
     async def test_missing_price_series_is_a_skip_not_a_failure(self, settings, monkeypatch):
-        from scanners.series import SeriesUnavailable
-        from scanners.technicals import TechnicalsScanner
+        from scanners.shared.listed.technicals import TechnicalsScanner
+        from scanners.shared.series import SeriesUnavailable
 
         async def boom(token, ctx):
             raise SeriesUnavailable("no pool address available for OHLCV")
 
-        monkeypatch.setattr("scanners.technicals.load_price_series", boom)
+        monkeypatch.setattr("scanners.shared.listed.technicals.load_price_series", boom)
         signal = await TechnicalsScanner(settings).collect(snapshot("crypto"), ScanContext(None, settings))
         assert signal.status.value == "skipped"
         assert "no pool" in signal.summary
@@ -189,8 +189,8 @@ class TestMacroCache:
     async def test_a_stale_entry_is_refetched(self, settings, monkeypatch):
         import time
 
-        from scanners.macro import CRYPTO_CACHE_KEY
         from scanners.pipeline import MACRO_CACHE_TTL_SECONDS
+        from scanners.shared.listed.macro import CRYPTO_CACHE_KEY
 
         calls: list[str] = []
 

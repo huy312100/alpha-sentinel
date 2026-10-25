@@ -46,12 +46,12 @@ from scanners.crypto.layer8_security import CryptoSecurityScanner
 from scanners.equities.edgar import EQUITY_LAYERS, EquityOwnershipScanner
 from scanners.etfs.flows import ETF_LAYERS, EtfFlowsScanner
 from scanners.forex.carry import FX_LAYERS, FxCarryScanner
-from scanners.fundamentals import FundamentalsScanner
 from scanners.indices.breadth import INDEX_LAYERS, IndexBreadthScanner
-from scanners.macro import MacroScanner
-from scanners.market import MarketScanner
 from scanners.rates.curve import RATE_LAYERS, RatesCurveScanner
-from scanners.technicals import TechnicalsScanner
+from scanners.shared.listed.fundamentals import FundamentalsScanner
+from scanners.shared.listed.macro import MacroScanner
+from scanners.shared.listed.market import MarketScanner
+from scanners.shared.listed.technicals import TechnicalsScanner
 
 
 log = get_logger(__name__)

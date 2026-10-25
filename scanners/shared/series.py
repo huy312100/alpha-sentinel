@@ -8,6 +8,9 @@ ordering and an explicit bar interval.
 * **Crypto** - GeckoTerminal hourly OHLCV for the deepest pool, exactly as before.
 * **Everything else** - Yahoo daily bars (one year), shared with the market layer
   so a cycle fetches each instrument once.
+
+The crypto leg is imported inside the branch, so ``shared`` never drags a crypto
+module into an import cycle: the arrow only points ``crypto -> shared``.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from typing import Any
 from core.http import request_json
 from core.instruments import AssetClass
 from core.models import TokenSnapshot, get_chain_profile
-from scanners.market_data import load_market_series
+from scanners.shared.market_data import load_market_series
 
 GECKO_OHLCV_URL = "https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool}/ohlcv/hour"
 
@@ -112,7 +115,7 @@ async def load_price_series(token: TokenSnapshot, ctx: Any) -> PriceSeries:
 
 
 async def _crypto_series(token: TokenSnapshot, ctx: Any) -> PriceSeries:
-    from scanners.dex import load_market
+    from scanners.crypto.providers.dex import load_market
 
     market = await load_market(token, ctx)
     pool = (market.pair_address if market else None) or token.pair_address or ""

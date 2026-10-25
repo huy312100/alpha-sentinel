@@ -7,8 +7,13 @@ layers, and a scanner that explodes must never take the scan with it.
 
 from __future__ import annotations
 
+import ast
+import re
+from pathlib import Path
+
 import pytest
 
+import scanners
 from config.settings import DEFAULT_ENABLED_LAYERS
 from core.instruments import AssetClass, InstrumentError
 from core.models import Layer, RiskAudit, SecurityReport, SignalStatus, TokenSnapshot, WashTradingReport
@@ -33,6 +38,28 @@ from scanners.registry import (
 )
 
 TOKEN = "0x" + "ab" * 20
+
+#: The only modules allowed at the scanner package root: the layer contract, the
+#: routing table and the coordinator. Anything that knows about one market lives
+#: in that market's package or in ``shared``.
+FRAMEWORK_MODULES = {"__init__", "__main__", "base", "pipeline", "registry"}
+
+#: Modules that used to sit at the root and must never be imported from there again.
+RETIRED_ROOT_MODULES = (
+    "airdrop",
+    "derivatives",
+    "dex",
+    "fundamentals",
+    "macro",
+    "market",
+    "market_data",
+    "onchain",
+    "security",
+    "series",
+    "social",
+    "technicals",
+    "wash",
+)
 
 #: Asset class -> the package that owns its dedicated layers.
 MARKET_PACKAGES = {
@@ -225,3 +252,78 @@ class TestSecurityVeto:
         assert signal.status is SignalStatus.DEGRADED
         assert token.meta["security_veto"] is True
         assert token.security.critical_flags() == ["honeypot", "hidden_owner"]
+
+
+class TestPackageLayout:
+    """The scanner root is framework only; a market owns its own modules."""
+
+    def test_root_holds_only_framework_modules(self):
+        root = Path(scanners.__file__).parent
+        assert {path.stem for path in root.glob("*.py")} == FRAMEWORK_MODULES
+
+    def test_crypto_owns_eight_layers_plus_provider_adapters(self):
+        crypto = Path(scanners.__file__).parent / "crypto"
+        assert sorted(path.stem for path in crypto.glob("layer*.py")) == [
+            "layer1_onchain",
+            "layer2_derivatives",
+            "layer3_social",
+            "layer4_dex",
+            "layer5_ecosystem",
+            "layer6_tokenomics",
+            "layer7_technicals",
+            "layer8_security",
+        ]
+        providers = {path.stem for path in (crypto / "providers").glob("*.py")} - {"__init__"}
+        assert providers == {"airdrop", "derivatives", "dex", "onchain", "security", "social", "wash"}
+
+    def test_shared_owns_the_cross_market_clients(self):
+        shared = Path(scanners.__file__).parent / "shared"
+        assert {"http_client.py", "technicals.py", "market_data.py", "series.py"} <= {
+            path.name for path in shared.iterdir()
+        }
+        assert {path.stem for path in (shared / "listed").glob("*.py")} - {"__init__"} == {
+            "fundamentals",
+            "macro",
+            "market",
+            "technicals",
+        }
+
+    def test_every_market_package_ships_a_routed_layer(self):
+        root = Path(scanners.__file__).parent
+        for asset_class, package in MARKET_PACKAGES.items():
+            modules = [
+                path.name
+                for path in (root / package.split(".")[-1]).glob("*.py")
+                if path.stem != "__init__"
+            ]
+            assert modules, f"{asset_class.value} has no layer module"
+
+    def test_providers_never_import_a_layer(self):
+        providers = Path(scanners.__file__).parent / "crypto" / "providers"
+        for path in providers.glob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    assert not node.module.startswith("scanners.crypto.layer"), path.name
+                    assert not node.module.startswith("scanners.shared.listed"), path.name
+
+    def test_layers_never_import_each_other(self):
+        crypto = Path(scanners.__file__).parent / "crypto"
+        for path in crypto.glob("layer*.py"):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    if node.module.startswith("scanners.crypto.layer"):
+                        assert node.module.endswith(path.stem), f"{path.name} imports {node.module}"
+
+    def test_no_module_imports_a_retired_root_path(self):
+        pattern = re.compile(
+            rf"^from scanners\.({'|'.join(RETIRED_ROOT_MODULES)}) import",
+            re.MULTILINE,
+        )
+        root = Path(scanners.__file__).parent.parent
+        offenders = [
+            str(path.relative_to(root))
+            for path in root.rglob("*.py")
+            if not {".venv", "__pycache__", "build"} & set(path.parts)
+            and pattern.search(path.read_text(encoding="utf-8"))
+        ]
+        assert not offenders, offenders

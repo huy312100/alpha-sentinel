@@ -1,7 +1,7 @@
 """Layer 7 - technical engine on M15 and H1 bars.
 
 Indicators are computed with the repo's own audited implementations
-(:mod:`scanners.technicals`) rather than ``pandas-ta``: the dependency set is
+(:mod:`scanners.shared.listed.technicals`) rather than ``pandas-ta``: the dependency set is
 pinned deliberately (see ``requirements.txt``), and these functions are already
 unit-tested. Nothing here needs a vendor key - GeckoTerminal provides both the
 candles and the trade tape.
@@ -21,10 +21,9 @@ from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, clamp, get_chain_profile
 from scanners.base import BaseScanner, ScanContext, linear, log_scale, safe_div
-from scanners.dex import load_market
-from scanners.series import parse_ohlcv
-
+from scanners.crypto.providers.dex import load_market
 from scanners.shared.http_client import first_row, request_json, to_float
+from scanners.shared.series import parse_ohlcv
 from scanners.shared.technicals import atr, ema, obv, percent_change, rsi
 
 log = get_logger(__name__)

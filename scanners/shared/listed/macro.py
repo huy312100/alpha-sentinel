@@ -22,7 +22,7 @@ from core.http import request_json, to_float
 from core.instruments import AssetClass
 from core.models import Layer, SignalStatus, LayerSignal, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, clamp, linear, safe_div
-from scanners.market_data import YAHOO_CHART_URL, parse_yahoo_chart
+from scanners.shared.market_data import YAHOO_CHART_URL, parse_yahoo_chart
 
 COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
 FEAR_GREED_URL = "https://api.alternative.me/fng/"

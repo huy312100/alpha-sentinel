@@ -2,10 +2,10 @@
 
 The maths lives in :mod:`scanners.shared.technicals` so crypto, listed markets and
 any future asset class score momentum identically. This module owns the *layer*:
-sourcing candles through :mod:`scanners.series`, composing the component scores and
+sourcing candles through :mod:`scanners.shared.series`, composing the component scores and
 turning them into a :class:`LayerSignal`.
 
-The layer is asset-class agnostic: candles come from :mod:`scanners.series`, which
+The layer is asset-class agnostic: candles come from :mod:`scanners.shared.series`, which
 uses GeckoTerminal for crypto and daily exchange bars for everything else.
 """
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, clamp, linear, log_scale, safe_div
-from scanners.series import GECKO_OHLCV_URL, SeriesUnavailable, load_price_series, parse_ohlcv
+from scanners.shared.series import SeriesUnavailable, load_price_series
 from scanners.shared.technicals import (
     atr,
     bollinger,
@@ -195,7 +195,6 @@ class TechnicalsScanner(BaseScanner):
 
 
 __all__ = [
-    "GECKO_OHLCV_URL",
     "TechnicalsScanner",
     "atr",
     "bollinger",
@@ -203,7 +202,6 @@ __all__ = [
     "ema_series",
     "macd",
     "obv",
-    "parse_ohlcv",
     "percent_change",
     "rsi",
     "sma",

@@ -1,6 +1,6 @@
 """Layer 8 - contract security screen with a hard veto.
 
-GoPlus (via :class:`scanners.security.SecurityScanner`) supplies ownership powers,
+GoPlus (via :class:`scanners.crypto.providers.security.SecurityScanner`) supplies ownership powers,
 mint/blacklist/pause flags, buy/sell tax and LP-lock data. **honeypot.is** is a
 second, independent simulation of an actual buy and sell, which catches honeypots
 that GoPlus misses and confirms taxes with real execution.
@@ -21,8 +21,7 @@ from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SecurityReport, SignalStatus, TokenSnapshot, clamp, get_chain_profile
 from scanners.base import BaseScanner, ScanContext
-from scanners.security import SecurityScanner
-
+from scanners.crypto.providers.security import SecurityScanner
 from scanners.shared.http_client import request_json, to_float
 
 log = get_logger(__name__)

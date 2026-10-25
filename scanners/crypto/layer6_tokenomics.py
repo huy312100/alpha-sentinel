@@ -24,9 +24,8 @@ from config.settings import Settings
 from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, clamp, utcnow
-from scanners.airdrop import COINGECKO_PLATFORMS
 from scanners.base import BaseScanner, ScanContext, linear
-
+from scanners.crypto.providers.airdrop import COINGECKO_PLATFORMS
 from scanners.shared.http_client import ProviderResult, fetch_provider, first_float, request_json, to_float
 
 log = get_logger(__name__)

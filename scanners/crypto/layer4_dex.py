@@ -1,7 +1,7 @@
 """Layer 4 - DEX microstructure: pool depth, turnover and volume spikes.
 
 DexScreener and GeckoTerminal are free and keyless. Both are queried once by
-:func:`scanners.dex.load_market`; this layer adds a volume-spike read on top of
+:func:`scanners.crypto.providers.dex.load_market`; this layer adds a volume-spike read on top of
 that merged view instead of issuing duplicate requests.
 """
 
@@ -14,7 +14,7 @@ from scanners.shared.http_client import to_float
 from core.instruments import AssetClass
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, clamp, linear, log_scale
-from scanners.dex import DexMarket, load_market
+from scanners.crypto.providers.dex import DexMarket, load_market
 
 
 MIN_LIQUIDITY_USD = 20_000.0

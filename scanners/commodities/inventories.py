@@ -5,9 +5,9 @@ from __future__ import annotations
 from core.instruments import AssetClass
 from core.models import Layer
 from scanners.base import StubScanner
-from scanners.macro import MacroScanner
-from scanners.market import MarketScanner
-from scanners.technicals import TechnicalsScanner
+from scanners.shared.listed.macro import MacroScanner
+from scanners.shared.listed.market import MarketScanner
+from scanners.shared.listed.technicals import TechnicalsScanner
 
 
 class CommodityInventoryScanner(StubScanner):

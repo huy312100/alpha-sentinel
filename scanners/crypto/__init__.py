@@ -1,4 +1,10 @@
-"""The crypto layer manifest consumed by :mod:`scanners.registry`."""
+"""The crypto layer manifest consumed by :mod:`scanners.registry`.
+
+``layer1_onchain`` .. ``layer8_security`` are the eight scoring layers, in
+execution order. ``providers/`` holds the vendor adapters they call - request
+shapes and payload parsing only, never score arithmetic - and requires no
+knowledge of the registry.
+"""
 
 from __future__ import annotations
 

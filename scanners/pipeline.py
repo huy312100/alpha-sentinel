@@ -27,16 +27,9 @@ from core.logging import get_logger
 from core.models import LayerSignal, SignalStatus, TokenSnapshot, json_safe, utcnow
 from core.scoring import weighted_prior
 from scanners.base import BaseScanner, ScanContext
-from scanners.dex import DexMarket, load_market
-from scanners.macro import (
-    CRYPTO_CACHE_KEY,
-    CROSS_ASSET_CACHE_KEY,
-    cross_asset_usable,
-    crypto_backdrop_usable,
-    fetch_cross_asset_backdrop,
-    fetch_crypto_backdrop,
-)
-from scanners.market_data import MarketQuote, load_quote
+from scanners.crypto.providers.dex import DexMarket, load_market
+from scanners.crypto.providers.security import SecurityScanner
+from scanners.crypto.providers.wash import WashTradingFilter
 from scanners.registry import (
     ASSET_LAYER_MAP,
     SCANNER_REGISTRY,
@@ -44,8 +37,15 @@ from scanners.registry import (
     run_isolated,
     validate_enabled,
 )
-from scanners.security import SecurityScanner
-from scanners.wash import WashTradingFilter
+from scanners.shared.listed.macro import (
+    CRYPTO_CACHE_KEY,
+    CROSS_ASSET_CACHE_KEY,
+    cross_asset_usable,
+    crypto_backdrop_usable,
+    fetch_cross_asset_backdrop,
+    fetch_crypto_backdrop,
+)
+from scanners.shared.market_data import MarketQuote, load_quote
 
 
 log = get_logger(__name__)

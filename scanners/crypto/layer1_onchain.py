@@ -23,13 +23,12 @@ from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, clamp, get_chain_profile
 from scanners.base import BaseScanner, ScanContext, log_scale
-from scanners.onchain import (
+from scanners.crypto.providers.onchain import (
     TOKEN_COUNTERS_PATH,
     TOKEN_HOLDERS_PATH,
     TOKEN_INFO_PATH,
     concentration_from_holders,
 )
-
 from scanners.shared.http_client import ProviderResult, fetch_provider, first_float, first_row, request_json, to_float, to_int
 
 log = get_logger(__name__)
