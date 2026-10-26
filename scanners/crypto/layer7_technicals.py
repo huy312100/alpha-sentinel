@@ -24,7 +24,6 @@ from typing import Any, Mapping, Sequence
 
 from config.settings import Settings
 from core.instruments import AssetClass
-from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, get_chain_profile
 from scanners.base import BaseScanner, ScanContext, log_scale
 from scanners.crypto.layer4_dex import fetch_pool_trades, load_market
@@ -41,8 +40,6 @@ from scanners.shared.technicals import (
     structure_flags,
     trend_score,
 )
-
-log = get_logger(__name__)
 
 
 def parse_trade_flow(trades: Sequence[Mapping[str, Any]], *, window: int = 300) -> dict[str, Any]:
@@ -149,8 +146,11 @@ class CryptoTechnicalsScanner(BaseScanner):
             parts.append(f"M15 RSI {m15_rsi:.1f}")
         if ofi is not None:
             parts.append(f"OFI {ofi:+.2f}")
-        if "h1_atr_pct" in metrics:
-            parts.append(f"ATR {metrics['h1_atr_pct']:.1f}%")
+        # ``compute_indicators`` keeps unset indicators as ``None``; the key alone
+        # does not guarantee a number.
+        atr_pct = to_float(metrics.get("h1_atr_pct"))
+        if atr_pct is not None:
+            parts.append(f"ATR {atr_pct:.1f}%")
         summary = f"{token.symbol or 'token'}: " + ", ".join(parts)
         return self.signal(
             token,

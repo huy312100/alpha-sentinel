@@ -16,6 +16,7 @@ from config.settings import (
     Settings,
     iter_secret_values,
 )
+from core.logging import redact
 from scanners import __file__ as scanners_module
 
 
@@ -264,6 +265,27 @@ def test_a_mounted_catalogue_overlays_the_bundled_one(tmp_path):
     assert settings.endpoints.url("cryptopanic.posts") == "https://news.internal/api/v1/posts/"
     # Entries the overlay does not mention keep their bundled values.
     assert settings.endpoints.url("defillama.protocols") == "https://api.llama.fi/protocols"
+
+
+def test_a_duplicated_key_in_a_mounted_catalogue_is_rejected(tmp_path):
+    """``yaml.safe_load`` keeps the last duplicate - live traffic would move silently."""
+    overlay = tmp_path / "endpoints.yaml"
+    overlay.write_text(
+        "coingecko:\n"
+        "  base: https://first.internal/v3\n"
+        "  base: https://second.internal/v3\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="duplicate key 'base'"):
+        load(ENDPOINTS_FILE=str(overlay))
+
+
+def test_a_calendar_url_is_registered_for_redaction():
+    url = "https://calendar.internal/feed?key=calendar-secret-key"
+    settings = load(TOKENOMICS_CALENDAR_URL=url)
+    assert settings.providers.tokenomics_calendar_url == url
+    # A feed URL can carry its own credential; the log filter must scrub it whole.
+    assert url not in redact(f"calendar fetch {url}")
 
 
 def test_an_unknown_endpoint_name_fails_loudly():

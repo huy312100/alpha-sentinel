@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime, timezone
+
+import pytest
+
 from core.models import SignalStatus, TokenSnapshot
 from scanners.base import ScanContext
 from scanners.crypto.layer1_onchain import concentration_from_holders
+from scanners.crypto.layer2_derivatives import CryptoDerivativesScanner, parse_hyperliquid_context
+from scanners.crypto.layer3_social import CryptoSocialScanner
 from scanners.crypto.layer4_dex import (
     CryptoDexScanner,
     DexMarket,
     _epoch_seconds,
     _gecko_row_is_base,
-    _parse_trades,
+    _pair_created_at,
     _pick_best_pair,
+    parse_trades,
     self_trade_share,
 )
+from scanners.crypto.layer5_ecosystem import match_protocol
+from scanners.crypto.layer6_tokenomics import parse_event_calendar
+from scanners.shared.http_client import fetch_provider
 from tests.conftest import TOKEN
 
 
@@ -128,7 +139,7 @@ def test_trades_without_a_timestamp_are_not_assumed_simultaneous():
             {"attributes": {"volume_in_usd": "10", "tx_from_address": "0xA", "kind": "sell"}},
         ]
     }
-    trades = _parse_trades(payload)
+    trades = parse_trades(payload)
     assert [trade["timestamp"] for trade in trades] == [None, None]
     assert self_trade_share(trades) == 0.0
 
@@ -154,4 +165,164 @@ def test_iso_trades_far_apart_are_not_self_trading():
             },
         ]
     }
-    assert self_trade_share(_parse_trades(payload)) == 0.0
+    assert self_trade_share(parse_trades(payload)) == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# On-chain: Blockscout returns a holder's address as a string or an object
+# --------------------------------------------------------------------------- #
+def test_object_shaped_holder_addresses_still_match_the_sinks():
+    rows = [
+        {"address": {"hash": "0x000000000000000000000000000000000000dEaD"}, "value": "90000"},
+        {"address": {"hash": "0x" + "aa" * 20}, "value": "1000"},
+    ]
+    pct, inspected = concentration_from_holders(rows, total_supply=1_000_000)
+
+    assert inspected == 2
+    assert pct == 0.1  # burn address excluded: 1000 / 1_000_000
+
+
+# --------------------------------------------------------------------------- #
+# DEX: a pair on another chain is a different market, not a fallback
+# --------------------------------------------------------------------------- #
+def test_pick_best_pair_never_crosses_chains():
+    pairs = [{"chainId": "bsc", "baseToken": {"address": TOKEN}, "liquidity": {"usd": "9000000"}}]
+
+    assert _pick_best_pair(pairs, "ethereum", TOKEN) is None
+    # No chain on the instrument -> nothing to filter by, keep the deepest pair.
+    assert _pick_best_pair(pairs, "", TOKEN) is not None
+
+
+def test_geckoterminal_pool_age_is_parsed_from_iso():
+    created = _pair_created_at("2024-03-08T10:41:47Z")
+
+    assert created == datetime(2024, 3, 8, 10, 41, 47, tzinfo=timezone.utc)
+    assert _pair_created_at(1_709_894_507_000) == created  # DexScreener's milliseconds
+    assert _pair_created_at("not-a-date") is None
+
+
+# --------------------------------------------------------------------------- #
+# Derivatives: funding units and empty provider reads
+# --------------------------------------------------------------------------- #
+def test_hyperliquid_hourly_funding_is_reported_per_8h():
+    payload = [
+        {"universe": [{"name": "PEPE"}]},
+        [{"funding": "0.0001", "markPx": "0.00001", "openInterest": "1000", "dayNtlVlm": "5000"}],
+    ]
+    metrics = parse_hyperliquid_context(payload, ["PEPE"])
+
+    assert metrics["funding_rate"] == pytest.approx(0.0008)
+    assert metrics["funding_interval_hours"] == 8
+
+
+async def test_an_empty_coinglass_read_is_not_a_success(settings, monkeypatch):
+    """A dict of ``None`` placeholders would count as ok and overwrite Hyperliquid."""
+
+    async def empty(*_, **__):
+        return {}
+
+    monkeypatch.setattr("scanners.crypto.layer2_derivatives.request_json", empty)
+    scanner = CryptoDerivativesScanner(settings)
+    calls = scanner._coinglass("PEPE", ScanContext(None, settings))
+
+    results = await asyncio.gather(*(fetch_provider(name, coro) for name, coro in calls.items()))
+
+    assert all(not result.ok for result in results)
+    assert all(result.metrics == {} for result in results)
+
+
+# --------------------------------------------------------------------------- #
+# Social: a provider that never ran is not "nobody is talking"
+# --------------------------------------------------------------------------- #
+async def test_a_missing_x_read_does_not_penalise_discussion(settings, monkeypatch):
+    async def cryptopanic_only():
+        return {
+            "news_posts": 40,
+            "news_bullish_votes": 12,
+            "news_bearish_votes": 4,
+            "news_sentiment_ratio": 0.75,
+        }
+
+    monkeypatch.setattr(
+        CryptoSocialScanner,
+        "_provider_calls",
+        lambda self, symbol, ctx: {"cryptopanic": cryptopanic_only()},
+    )
+    token = TokenSnapshot(token_address=TOKEN, chain="ethereum", asset_class="crypto", symbol="TEST")
+
+    signal = await CryptoSocialScanner(settings).collect(token, ScanContext(None, settings))
+
+    assert "thin_discussion" not in signal.flags
+    assert "few_authors_dominate" not in signal.flags
+
+
+async def test_a_measured_but_thin_discussion_is_still_flagged(settings, monkeypatch):
+    async def thin():
+        return {"mentions_total": 3, "mentions_velocity": 1.0}
+
+    monkeypatch.setattr(CryptoSocialScanner, "_provider_calls", lambda self, symbol, ctx: {"x": thin()})
+    token = TokenSnapshot(token_address=TOKEN, chain="ethereum", asset_class="crypto", symbol="TEST")
+
+    signal = await CryptoSocialScanner(settings).collect(token, ScanContext(None, settings))
+
+    assert "thin_discussion" in signal.flags
+
+
+# --------------------------------------------------------------------------- #
+# Ecosystem: DeFiLlama needs the chain, and the address when it has one
+# --------------------------------------------------------------------------- #
+def test_match_protocol_requires_the_requested_chain():
+    rows = [
+        {"symbol": "USDC", "name": "Usdc Bsc", "chains": ["Binance"], "tvl": 9e9, "address": "0xb"},
+        {"symbol": "USDC", "name": "Usdc Eth", "chains": ["Ethereum"], "tvl": 1e9, "address": "0xe"},
+    ]
+
+    assert match_protocol(rows, "USDC", "ethereum")["name"] == "Usdc Eth"
+    assert match_protocol(rows, "USDC", "bsc")["name"] == "Usdc Bsc"  # "Binance" alias
+    assert match_protocol(rows, "USDC", "solana") is None  # no cross-chain fallback
+
+
+def test_match_protocol_refuses_another_tokens_tvl():
+    rows = [{"symbol": "USDC", "chains": ["Ethereum"], "tvl": 1e9, "address": "0xother"}]
+
+    assert match_protocol(rows, "USDC", "ethereum", address="0xmine") is None
+    assert match_protocol(rows, "USDC", "ethereum", address="0xother") is not None
+    # A catalogue row without an address cannot contradict the ticker match.
+    assert match_protocol(
+        [{"symbol": "USDC", "chains": ["Ethereum"], "tvl": 1}], "USDC", "ethereum", address="0xmine"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Tokenomics: one malformed calendar row must not discard the whole calendar
+# --------------------------------------------------------------------------- #
+def test_a_malformed_calendar_row_is_skipped_not_fatal():
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    payload = {
+        "events": [
+            {"symbol": "TEST", "type": "unlock", "date": float("nan")},
+            {"symbol": "TEST", "type": "unlock", "date": 1e300},
+            {"symbol": "TEST", "type": "unlock", "date": "2026-01-10T00:00:00Z", "pct_of_supply": 5.0},
+        ]
+    }
+
+    metrics = parse_event_calendar(payload, "TEST", now=now)
+
+    assert metrics["events_considered"] == 1
+    assert metrics["next_unlock_days"] == pytest.approx(9.0)
+
+
+def test_calendar_rows_without_a_symbol_belong_to_nobody():
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    payload = {
+        "events": [
+            {"type": "unlock", "date": "2026-01-05T00:00:00Z", "pct_of_supply": 10.0},
+            {"symbol": "OTHER", "type": "unlock", "date": "2026-01-06T00:00:00Z", "pct_of_supply": 10.0},
+            {"symbol": "TEST", "type": "upgrade", "date": "2026-01-07T00:00:00Z"},
+        ]
+    }
+
+    metrics = parse_event_calendar(payload, "TEST", now=now)
+
+    assert "next_unlock_days" not in metrics
+    assert metrics["next_upgrade_days"] == pytest.approx(6.0)

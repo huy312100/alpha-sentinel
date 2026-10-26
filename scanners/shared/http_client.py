@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 
 from core.http import RateLimiter, request_json as _core_request_json
 from core.http import to_float, to_int
-from core.logging import get_logger
+from core.logging import get_logger, redact, scrub_url_params
 
 log = get_logger(__name__)
 
@@ -35,15 +35,23 @@ DEFAULT_REQUESTS_PER_SECOND = 8.0
 #: Live token buckets, one per host. Module-level on purpose: the limiter must
 #: survive individual scans, otherwise every cycle gets a fresh burst.
 _LIMITERS: dict[str, RateLimiter] = {}
+#: The rate each live bucket was built with, so a stricter caller can replace it.
+_RATES: dict[str, float] = {}
 
 
 def limiter_for(url: str, rate_per_second: float = DEFAULT_REQUESTS_PER_SECOND) -> RateLimiter:
-    """Return (and lazily create) the token bucket for ``url``'s host."""
+    """Return (and lazily create) the token bucket for ``url``'s host.
+
+    One bucket per host, but the *strictest* caller wins: asking for a later,
+    lower ``rate_per_second`` replaces the cached bucket instead of being ignored,
+    otherwise the first caller's rate would silently govern every other one.
+    """
     host = urlparse(url).netloc.lower() or "unknown"
     limiter = _LIMITERS.get(host)
-    if limiter is None:
+    if limiter is None or rate_per_second < _RATES.get(host, rate_per_second):
         limiter = RateLimiter(rate_per_second, burst=max(1, int(rate_per_second)))
         _LIMITERS[host] = limiter
+        _RATES[host] = rate_per_second
     return limiter
 
 
@@ -144,7 +152,10 @@ async def fetch_provider(source: str, awaitable: Awaitable[dict[str, Any]]) -> P
     try:
         metrics = await awaitable
     except Exception as exc:  # noqa: BLE001 - providers fail in creative ways
-        message = f"{type(exc).__name__}: {str(exc)[:160]}"
+        # Both sinks matter: the log line and ``ProviderResult.error``, which is
+        # stored on the signal and rendered by the dashboard. Vendor error text can
+        # carry the request URL - and with it a query-string credential.
+        message = f"{type(exc).__name__}: {redact(scrub_url_params(str(exc)))[:160]}"
         log.info("provider_failed", extra={"source": source, "error": message})
         return ProviderResult(source=source, error=message)
     if not isinstance(metrics, dict) or not metrics:

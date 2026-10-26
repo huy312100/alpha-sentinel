@@ -84,8 +84,7 @@ def concentration_from_holders(
         value = to_float(row.get("value")) or 0.0
         if value <= 0:
             continue
-        address = str(row.get("address") or row.get("holder_address") or "").lower()
-        values.append((address, value))
+        values.append((_holder_address(row), value))
     if not values:
         return None, 0
     denominator = total_supply if total_supply is not None and total_supply > 0 else sum(value for _, value in values)
@@ -95,6 +94,21 @@ def concentration_from_holders(
     )
     top = sum(eligible[:top_n])
     return round(min(100.0, top / denominator * 100.0), 2), len(values)
+
+
+def _holder_address(row: dict[str, Any]) -> str:
+    """Lower-case holder address from Blockscout's two payload shapes.
+
+    Blockscout v2 returns ``address`` either as a plain string or as an object
+    (``{"hash": "0x...", "is_contract": ...}``). ``str(dict)`` never equals a sink
+    address, so the burn/mint wallets used to stay in the top-N numerator.
+    """
+    raw = row.get("address")
+    if isinstance(raw, dict):
+        raw = raw.get("hash") or raw.get("address")
+    if not raw:
+        raw = row.get("holder_address")
+    return str(raw or "").strip().lower()
 
 
 def _entity_text(address: Any) -> str:

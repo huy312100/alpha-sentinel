@@ -126,13 +126,36 @@ def _entry_env_key(name: str) -> str:
 # ---------------------------------------------------------------------------
 # Catalogue loading
 # ---------------------------------------------------------------------------
+class _StrictLoader(yaml.SafeLoader):
+    """``SafeLoader`` that refuses a repeated mapping key.
+
+    ``yaml.safe_load`` keeps only the last occurrence, so a copy-pasted vendor
+    block or a duplicated ``base:`` in a mounted overlay would silently redirect
+    live traffic - and ``_validate`` sees the already-collapsed mapping, so it
+    cannot notice. An override file is exactly where that typo lands.
+    """
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        seen: set[Any] = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise ConfigError(f"duplicate key {key!r} in endpoint catalogue")
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def _read_catalogue(path: Path) -> dict[str, Any]:
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"cannot read endpoint catalogue {path}: {exc}") from exc
+    try:
+        raw = yaml.load(text, Loader=_StrictLoader)  # noqa: S506 - SafeLoader subclass
     except yaml.YAMLError as exc:  # pragma: no cover - malformed deploy artefact
         raise ConfigError(f"invalid YAML in endpoint catalogue {path}: {exc}") from exc
+    except ConfigError as exc:  # duplicate key - the loader does not know the path
+        raise ConfigError(f"{path}: {exc}") from exc
     if raw is None:
         return {}
     if not isinstance(raw, dict):

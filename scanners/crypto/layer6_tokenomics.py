@@ -26,7 +26,6 @@ from typing import Any
 
 from config.settings import Settings
 from core.instruments import AssetClass
-from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, clamp, utcnow
 from scanners.base import BaseScanner, ScanContext, linear, log_scale
 from scanners.shared.http_client import (
@@ -37,8 +36,6 @@ from scanners.shared.http_client import (
     to_float,
     to_int,
 )
-
-log = get_logger(__name__)
 
 
 #: Our chain slug -> CoinGecko asset-platform id.
@@ -138,12 +135,23 @@ def _calendar_rows(payload: Any) -> list[Any]:
 
 
 def _event_date(row: dict[str, Any]) -> datetime | None:
+    """Parse one calendar row's date; a malformed row is skipped, not fatal.
+
+    Third-party feeds mix ISO strings, epoch seconds and epoch milliseconds, and
+    occasionally emit ``nan``/``inf`` or an out-of-range number. One bad row used to
+    raise out of :func:`parse_event_calendar`, which dropped the entire calendar -
+    every unlock and upgrade signal for the token - and degraded the layer.
+    """
     raw = row.get("date") or row.get("unlock_date") or row.get("timestamp") or row.get("at")
-    if raw is None:
+    if isinstance(raw, bool) or raw is None:
         return None
     if isinstance(raw, (int, float)):
-        seconds = float(raw) / 1000.0 if float(raw) > 1e11 else float(raw)
-        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        try:
+            value = float(raw)
+            seconds = value / 1000.0 if abs(value) > 1e11 else value
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     text = str(raw).strip()
     if not text:
         return None
@@ -164,8 +172,11 @@ def parse_event_calendar(payload: Any, symbol: str, *, now: datetime | None = No
     for row in _calendar_rows(payload):
         if not isinstance(row, dict):
             continue
-        row_symbol = str(row.get("symbol") or row.get("token") or row.get("ticker") or "").upper()
-        if wanted and row_symbol and row_symbol != wanted:
+        row_symbol = str(row.get("symbol") or row.get("token") or row.get("ticker") or "").strip().upper()
+        if row_symbol != wanted:
+            # The feed is not filtered per token, so a row that does not name this
+            # symbol - including one with no symbol at all - is somebody else's
+            # unlock, not this token's.
             continue
         when = _event_date(row)
         if when is None:

@@ -34,6 +34,10 @@ log = get_logger(__name__)
 #: Appended to the base asset to build the perp contract ticker.
 QUOTE_SUFFIX = "USDT"
 
+#: Hyperliquid pays ``funding`` every hour (one eighth of the 8h rate), while the
+#: Binance/Bybit fallbacks and every threshold below are 8h; normalise on read.
+HL_FUNDING_INTERVALS_PER_8H = 8.0
+
 
 def perp_symbol_candidates(symbol: str) -> list[str]:
     """Contract tickers to try, cheapest first: ``PEPE``, ``1000PEPE``, ``1000000PEPE``."""
@@ -76,6 +80,10 @@ def parse_hyperliquid_context(payload: Any, candidates: list[str]) -> dict[str, 
     The endpoint returns ``[meta, contexts]`` where the two lists share an index
     order. A symbol that is not listed returns ``{}`` (no perp market), which the
     caller reports as SKIPPED rather than as a provider outage.
+
+    ``funding`` is Hyperliquid's *hourly* payment; it is multiplied by
+    :data:`HL_FUNDING_INTERVALS_PER_8H` so ``funding_rate`` is comparable with
+    Binance's 8h rate and with :func:`funding_score`'s thresholds.
     """
     if not isinstance(payload, list) or len(payload) != 2:
         return {}
@@ -99,7 +107,10 @@ def parse_hyperliquid_context(payload: Any, candidates: list[str]) -> dict[str, 
         return {
             "source": "hyperliquid",
             "symbol": candidate.upper(),
-            "funding_rate": funding,
+            "funding_rate": (
+                funding * HL_FUNDING_INTERVALS_PER_8H if funding is not None else None
+            ),
+            "funding_interval_hours": 8,
             "mark_price": mark,
             "open_interest": open_interest,
             "open_interest_usd": open_interest_usd,
@@ -418,7 +429,18 @@ class CryptoDerivativesScanner(BaseScanner):
                 headers=headers,
             )
             series = parse_coinglass_series(payload)
-            return {"funding_rate": series.get("latest"), "coinglass_samples": series.get("samples")}
+            # ``interval=8h`` keeps this in the unit Hyperliquid is normalised to.
+            # Absent fields are omitted rather than set to ``None``: a dict of
+            # placeholders is a *successful* provider read, so it would overwrite
+            # the valid Hyperliquid funding rate it exists to complement.
+            metrics: dict[str, Any] = {}
+            latest = series.get("latest")
+            if latest is not None:
+                metrics["funding_rate"] = latest
+            samples = series.get("samples")
+            if samples:
+                metrics["coinglass_samples"] = samples
+            return metrics
 
         async def open_interest() -> dict[str, Any]:
             payload = await request_json(
@@ -428,11 +450,15 @@ class CryptoDerivativesScanner(BaseScanner):
                 headers=headers,
             )
             series = parse_coinglass_series(payload)
-            return {
-                "open_interest_change_pct": series.get("change_pct"),
-                "oi_change_pct": series.get("change_pct"),
-                "open_interest_usd": series.get("latest"),
-            }
+            metrics: dict[str, Any] = {}
+            change = series.get("change_pct")
+            if change is not None:
+                metrics["open_interest_change_pct"] = change
+                metrics["oi_change_pct"] = change
+            latest = series.get("latest")
+            if latest is not None:
+                metrics["open_interest_usd"] = latest
+            return metrics
 
         async def liquidation_map() -> dict[str, Any]:
             payload = await request_json(

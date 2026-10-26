@@ -109,11 +109,43 @@ class DexMarket:
         }
 
 
-def _pair_created_at(raw: Any) -> datetime | None:
-    millis = to_int(raw)
-    if millis is None or millis <= 0:
+def _epoch_seconds(raw: Any) -> float | None:
+    """Parse an epoch number or an ISO-8601 timestamp into epoch seconds.
+
+    ``to_float`` returns ``None`` for ``2026-10-25T12:00:00Z``; treating that as
+    ``0.0`` made every trade look simultaneous and inflated the self-trading score.
+    GeckoTerminal sends ISO-8601, DexScreener sends epoch milliseconds.
+    """
+    if isinstance(raw, bool) or raw is None:
         return None
-    return datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc)
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    text = str(raw).strip()
+    if not text:
+        return None
+    numeric = to_float(text)
+    if numeric is not None:
+        return numeric
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _pair_created_at(raw: Any) -> datetime | None:
+    """Creation time from epoch milliseconds (DexScreener) or ISO (GeckoTerminal)."""
+    seconds = _epoch_seconds(raw)
+    if seconds is None or seconds <= 0:
+        return None
+    if seconds > 1e11:  # milliseconds, not seconds
+        seconds /= 1000.0
+    try:
+        return datetime.fromtimestamp(seconds, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def market_from_dexscreener(pair: dict[str, Any]) -> DexMarket:
@@ -154,11 +186,14 @@ def _addresses_match(left: Any, right: str) -> bool:
 
 
 def _pick_best_pair(pairs: list[dict[str, Any]], chain: str, token_address: str) -> dict[str, Any] | None:
-    """Prefer base-token pairs on the requested chain, then the deepest liquidity.
+    """Deepest base-token pair *on the requested chain*.
 
-    DexScreener returns pairs where the scanned token is *either* side. Only the
-    base side's ``priceUsd``/``baseToken``/buy-sell counts describe our token, so a
-    quote-side pool would silently substitute another asset's price.
+    DexScreener returns pairs where the scanned token is *either* side, so a
+    quote-side pool would silently substitute another asset's price. It also
+    returns pairs from every chain the token is bridged to: a same-ticker pool on
+    another chain has its own price, liquidity and address, and handing its address
+    to GeckoTerminal with this token's network is invalid. ``None`` means "no market
+    for this token on this chain", which the caller reports as not listed.
     """
     if not pairs:
         return None
@@ -167,11 +202,13 @@ def _pick_best_pair(pairs: list[dict[str, Any]], chain: str, token_address: str)
     ]
     if not base_pairs:
         return None
-    chain_id = chain.lower()
-    same_chain = [pair for pair in base_pairs if str(pair.get("chainId", "")).lower() == chain_id]
-    candidates = same_chain or base_pairs
+    chain_id = (chain or "").strip().lower()
+    if chain_id:
+        base_pairs = [pair for pair in base_pairs if str(pair.get("chainId", "")).strip().lower() == chain_id]
+        if not base_pairs:
+            return None
     return max(
-        candidates,
+        base_pairs,
         key=lambda pair: to_float((pair.get("liquidity") or {}).get("usd")) or 0.0,
     )
 
@@ -435,37 +472,11 @@ MIN_TRADES_FOR_VERDICT = 30
 SELF_TRADE_WINDOW_SECONDS = 120
 
 
-def _epoch_seconds(raw: Any) -> float | None:
-    """Parse GeckoTerminal's ISO-8601 ``block_timestamp`` (or an epoch number).
-
-    ``to_float`` returns ``None`` for ``2026-10-25T12:00:00Z``; treating that as
-    ``0.0`` made every trade look simultaneous and inflated the self-trading score.
-    """
-    if isinstance(raw, bool) or raw is None:
-        return None
-    if isinstance(raw, (int, float)):
-        return float(raw)
-    text = str(raw).strip()
-    if not text:
-        return None
-    numeric = to_float(text)
-    if numeric is not None:
-        return numeric
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.timestamp()
-
-
 def parse_trades(payload: Any) -> list[dict[str, Any]]:
     """Normalise GeckoTerminal's trade tape into wallet/side/notional rows.
 
     One parser for both consumers: the wash-trading filter (layer 4) and the
-    order-flow imbalance read (layer 7). ``_parse_trades`` is kept as an alias for
-    older imports.
+    order-flow imbalance read (layer 7).
     """
     data = (payload or {}).get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
@@ -488,9 +499,6 @@ def parse_trades(payload: Any) -> list[dict[str, Any]]:
             }
         )
     return trades
-
-
-_parse_trades = parse_trades
 
 
 def is_round_amount(volume: float) -> bool:

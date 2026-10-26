@@ -616,6 +616,10 @@ class Settings:
             self.telegram.bot_token,
         ):
             register_secret(secret.get_secret_value())
+        #: A calendar URL is a plain string, and a self-hosted feed may carry its key
+        #: in the query string; ``register_secret`` ignores values that are too short
+        #: or empty, so an unset calendar is a no-op.
+        register_secret(self.providers.tokenomics_calendar_url)
 
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,11 @@ from typing import Any, Dict, Iterator, Set
 REDACTED = "***REDACTED***"
 _SECRETS: Set[str] = set()
 _JSON_STRING_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+#: ``scheme://host/path`` followed by a query string or fragment. Closing brackets
+#: are excluded so a URL wrapped in prose keeps its punctuation.
+_URL_WITH_QUERY_RE = re.compile(
+    r"(?i)\b(https?://[^\s'\"<>?#()\[\]{}]+)[?#][^\s'\"<>()\[\]{}]*"
+)
 _STANDARD_ATTRS = frozenset(
     {
         "args", "asctime", "created", "exc_info", "exc_text", "filename", "funcName",
@@ -48,6 +53,19 @@ def redact(text: str) -> str:
         if secret in text:
             text = text.replace(secret, REDACTED)
     return text
+
+
+def scrub_url_params(text: str) -> str:
+    """Drop query strings and fragments from every URL inside ``text``.
+
+    Several vendors authenticate with a query parameter (CryptoPanic's
+    ``auth_token``) and ``aiohttp`` exception text embeds the *real* URL, query
+    included. Provider errors are both logged and stored on the signal, so the
+    query is removed before either happens; the host and path that make the error
+    actionable survive. This complements :func:`redact`, which can only scrub
+    values it was told about and misses a truncated URL.
+    """
+    return _URL_WITH_QUERY_RE.sub(rf"\1?{REDACTED}", text)
 
 
 def _redact_json_strings(text: str) -> str:
@@ -166,4 +184,5 @@ __all__ = [
     "log_duration",
     "redact",
     "register_secret",
+    "scrub_url_params",
 ]

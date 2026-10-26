@@ -174,10 +174,15 @@ def obv(closes: Sequence[float], volumes: Sequence[float]) -> list[float]:
 
 
 def percent_change(current: float | None, previous: float | None) -> float | None:
-    """Percentage move from ``previous`` to ``current``; ``None`` without a base."""
+    """Percentage move from ``previous`` to ``current``; ``None`` without a base.
+
+    The base is ``|previous|`` because the same helper measures OBV, which is
+    signed: rising from ``-100`` to ``-50`` is accumulation, not a 50% collapse.
+    Divides by zero only when the base is exactly zero.
+    """
     if current is None or previous in (None, 0):
         return None
-    return (current - previous) / previous * 100.0
+    return (current - previous) / abs(previous) * 100.0
 
 
 def order_flow_imbalance(buy_volume_usd: float | None, sell_volume_usd: float | None) -> float | None:

@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from urllib.parse import quote
 
 from config.settings import Settings
 from core.instruments import AssetClass
-from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, linear, log_scale
 from scanners.shared.http_client import (
@@ -28,8 +28,6 @@ from scanners.shared.http_client import (
     request_json,
     to_float,
 )
-
-log = get_logger(__name__)
 
 
 def parse_x_counts(payload: Any, *, buckets_per_window: int = 6) -> dict[str, Any]:
@@ -205,7 +203,10 @@ class CryptoSocialScanner(BaseScanner):
             flags.append("news_sentiment_negative")
         if sentiment is not None and sentiment < 35.0:
             flags.append("social_sentiment_negative")
-        if (to_float(metrics.get("mentions_total")) or 0) < 20:
+        # ``mentions_total`` only exists when the X counts read succeeded; a missing
+        # key means "provider never ran", not "nobody is talking about this token".
+        mentions_total = to_float(metrics.get("mentions_total"))
+        if mentions_total is not None and mentions_total < 20:
             flags.append("thin_discussion")
         if (to_float(metrics.get("x_author_diversity")) or 1.0) < 0.5:
             flags.append("few_authors_dominate")
@@ -290,7 +291,9 @@ class CryptoSocialScanner(BaseScanner):
     async def _lunarcrush(self, symbol: str, ctx: ScanContext) -> dict[str, Any]:
         payload = await request_json(
             ctx.session,
-            self.settings.endpoints.url("lunarcrush.coin", coin=symbol),
+            # ``coin`` lands in the path of an authenticated request: quote it so a
+            # hostile ticker cannot add a segment or a query string.
+            self.settings.endpoints.url("lunarcrush.coin", coin=quote(symbol, safe="")),
             headers={
                 "Authorization": f"Bearer {self.settings.social.lunarcrush_api_key.get_secret_value()}"
             },

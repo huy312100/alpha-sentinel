@@ -10,12 +10,12 @@ unsupported chain simply drops that component instead of failing the layer.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any
 
 from config.settings import Settings
 from core.instruments import AssetClass
-from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, linear, log_scale, safe_div
 from scanners.shared.http_client import (
@@ -27,8 +27,6 @@ from scanners.shared.http_client import (
     to_float,
 )
 
-log = get_logger(__name__)
-
 
 #: Chain slug -> GrowThePie ``origin_key``. Absent means "not covered".
 GROWTHEPIE_CHAINS = {
@@ -37,6 +35,15 @@ GROWTHEPIE_CHAINS = {
     "base": "base",
     "optimism": "optimism",
     "polygon": "polygon",
+}
+
+#: Our chain slug -> the names DeFiLlama uses in ``protocol.chains``. ``bsc`` is
+#: listed as ``Binance`` and ``optimism`` as ``OP Mainnet``; without the mapping a
+#: correct match looks like a chain mismatch and the TVL read is dropped.
+DEFILLAMA_CHAIN_ALIASES: dict[str, tuple[str, ...]] = {
+    "bsc": ("bsc", "binance", "bnb smart chain"),
+    "optimism": ("optimism", "op mainnet", "op"),
+    "polygon": ("polygon", "polygon pos", "matic"),
 }
 
 
@@ -87,27 +94,62 @@ def parse_defillama_protocol(payload: Any) -> dict[str, Any]:
     }
 
 
-def match_protocol(protocols: Any, symbol: str, chain: str) -> dict[str, Any] | None:
+def _chain_key(name: Any) -> str:
+    """Chain name reduced to ``[a-z0-9]``: ``"OP Mainnet"`` -> ``opmainnet``."""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+def _chain_keys(chain: str) -> set[str]:
+    """Every DeFiLlama spelling of our ``chain`` slug."""
+    slug = (chain or "").strip().lower()
+    names = (slug, *DEFILLAMA_CHAIN_ALIASES.get(slug, ()))
+    return {_chain_key(name) for name in names if name}
+
+
+def _addresses_match(left: Any, right: str) -> bool:
+    return str(left or "").strip().lower() == (right or "").strip().lower()
+
+
+def match_protocol(
+    protocols: Any,
+    symbol: str,
+    chain: str,
+    *,
+    address: str | None = None,
+) -> dict[str, Any] | None:
     """Pick the DeFiLlama protocol that owns ``symbol`` on ``chain``.
 
-    Multiple protocols can share a ticker (bridged/wrapped variants), so chain
-    membership wins, then TVL. A symbol with no match is "not indexed", not an
-    outage.
+    A ticker is not an identity: bridged and wrapped variants share it, and the
+    catalogue covers every chain. The match therefore needs the chain, and when
+    ``address`` is supplied it needs the address too - the biggest same-ticker
+    protocol elsewhere is another token's TVL, not this one's.
+
+    ``None`` means "not indexed here", never an outage.
     """
     if not isinstance(protocols, list):
         return None
     wanted = symbol.strip().upper()
     if not wanted:
         return None
-    candidates = [
+    chain_keys = _chain_keys(chain)
+    pool = [
         row
         for row in protocols
-        if isinstance(row, dict) and str(row.get("symbol") or "").strip().upper() == wanted
+        if isinstance(row, dict)
+        and str(row.get("symbol") or "").strip().upper() == wanted
+        and chain_keys & {_chain_key(name) for name in (row.get("chains") or [])}
     ]
-    if not candidates:
+    if not pool:
         return None
-    on_chain = [row for row in candidates if chain in (row.get("chains") or [])]
-    pool = on_chain or candidates
+    token_address = (address or "").strip().lower()
+    if token_address:
+        matched = [row for row in pool if _addresses_match(row.get("address"), token_address)]
+        if matched:
+            pool = matched
+        elif any(str(row.get("address") or "").strip() for row in pool):
+            # The catalogue knows the addresses and none is ours: same ticker,
+            # different token on the same chain.
+            return None
     return max(pool, key=lambda row: to_float(row.get("tvl")) or 0.0)
 
 
@@ -153,7 +195,7 @@ class CryptoEcosystemScanner(BaseScanner):
         if not symbol:
             return self.skipped(token, "token symbol unknown; ecosystem lookup needs a ticker")
 
-        calls = self._provider_calls(symbol, token.chain, ctx)
+        calls = self._provider_calls(symbol, token.chain, token.token_address, ctx)
         results: list[ProviderResult] = await asyncio.gather(
             *(fetch_provider(name, coro) for name, coro in calls.items())
         )
@@ -219,15 +261,19 @@ class CryptoEcosystemScanner(BaseScanner):
         )
 
     # -- providers -----------------------------------------------------------
-    def _provider_calls(self, symbol: str, chain: str, ctx: ScanContext) -> dict[str, Any]:
-        calls: dict[str, Any] = {"defillama": self._defillama(symbol, chain, ctx)}
+    def _provider_calls(
+        self, symbol: str, chain: str, address: str, ctx: ScanContext
+    ) -> dict[str, Any]:
+        calls: dict[str, Any] = {"defillama": self._defillama(symbol, chain, address, ctx)}
         if GROWTHEPIE_CHAINS.get(chain.lower()):
             calls["growthepie"] = self._growthepie(chain.lower(), ctx)
         return calls
 
-    async def _defillama(self, symbol: str, chain: str, ctx: ScanContext) -> dict[str, Any]:
+    async def _defillama(
+        self, symbol: str, chain: str, address: str, ctx: ScanContext
+    ) -> dict[str, Any]:
         protocols = await self._protocol_catalogue(ctx)
-        protocol = match_protocol(protocols, symbol, chain)
+        protocol = match_protocol(protocols, symbol, chain, address=address)
         if protocol is None:
             return {}
         slug = str(protocol.get("slug") or protocol.get("id") or "").strip()
@@ -272,6 +318,7 @@ def build_scanner(settings: Settings) -> CryptoEcosystemScanner:
 
 __all__ = [
     "CryptoEcosystemScanner",
+    "DEFILLAMA_CHAIN_ALIASES",
     "GROWTHEPIE_CHAINS",
     "build_scanner",
     "match_protocol",

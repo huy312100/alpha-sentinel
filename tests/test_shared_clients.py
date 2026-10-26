@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from core.logging import REDACTED, clear_secrets, register_secret, scrub_url_params
 from scanners.shared import http_client
 from scanners.shared.http_client import (
     ProviderResult,
@@ -60,6 +61,23 @@ class TestProviderContainment:
         assert not result.ok
         assert result.error == "no usable data"
 
+    async def test_a_query_string_credential_never_reaches_the_signal(self):
+        """The error is stored on the layer, not only logged, so scrub it here."""
+        clear_secrets()
+        register_secret("news-token-123")
+
+        async def denied():
+            raise RuntimeError(
+                "404 from https://cryptopanic.com/api/v1/posts/?auth_token=news-token-123&public=true"
+            )
+
+        result = await fetch_provider("cryptopanic", denied())
+        clear_secrets()
+
+        assert not result.ok
+        assert "news-token-123" not in (result.error or "")
+        assert "https://cryptopanic.com/api/v1/posts/" in (result.error or "")
+
 
 class TestPayloadPolling:
     def test_first_float_skips_nulls_and_booleans(self):
@@ -85,6 +103,17 @@ class TestRateLimiting:
         other = limiter_for("https://beta.example.com/one")
         assert first is second
         assert other is not first
+
+    def test_a_later_stricter_rate_replaces_the_cached_bucket(self):
+        url = "https://strict.example.com/v1/thing"
+        fast = limiter_for(url, rate_per_second=20.0)
+        assert limiter_for(url, rate_per_second=20.0) is fast
+
+        slow = limiter_for(url, rate_per_second=1.0)
+        assert slow is not fast
+        assert slow._interval == pytest.approx(1.0)
+        # A later, faster request must not loosen the strictest caller's rate.
+        assert limiter_for(url, rate_per_second=20.0) is slow
 
     async def test_request_json_goes_through_the_shared_transport(self, monkeypatch):
         calls: list[tuple[str, dict]] = []
@@ -155,6 +184,25 @@ class TestIndicatorMaths:
         assert obv(closes, volumes) == [0.0, 20.0, -10.0, -10.0]
         assert percent_change(120.0, 100.0) == pytest.approx(20.0)
         assert percent_change(120.0, 0.0) is None
+
+    def test_percent_change_reads_a_signed_base_as_growth(self):
+        """OBV goes negative in a downtrend; improving flow must not look like a fall."""
+        assert percent_change(-50.0, -100.0) == pytest.approx(50.0)
+        assert percent_change(-150.0, -100.0) == pytest.approx(-50.0)
+
+
+class TestUrlScrubbing:
+    def test_the_query_is_dropped_and_the_path_kept(self):
+        text = "GET https://api.vendor.com/v1/thing?auth_token=abc123&x=1 failed"
+        assert scrub_url_params(text) == f"GET https://api.vendor.com/v1/thing?{REDACTED} failed"
+
+    def test_a_wrapped_url_keeps_its_punctuation(self):
+        text = "(see https://api.vendor.com/v1/thing?token=abc)"
+        assert scrub_url_params(text) == f"(see https://api.vendor.com/v1/thing?{REDACTED})"
+
+    def test_text_without_a_url_is_untouched(self):
+        assert scrub_url_params("connection reset by peer") == "connection reset by peer"
+        assert scrub_url_params("https://api.vendor.com/v1/thing") == "https://api.vendor.com/v1/thing"
 
     def test_order_flow_imbalance_is_bounded(self):
         assert order_flow_imbalance(100.0, 0.0) == 1.0
