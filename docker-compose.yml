@@ -50,7 +50,7 @@ services:
       bot:
         condition: service_started
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8501/_stcore/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/_stcore/health"]
       interval: 30s
       timeout: 10s
       start_period: 30s
