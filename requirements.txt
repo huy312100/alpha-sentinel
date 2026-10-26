@@ -31,9 +31,9 @@ plotly==5.24.1
 
 # --- Config / cloud / utilities ---------------------------------------------
 python-dotenv==1.2.4
-PyYAML==6.0.2
-boto3==1.43.117               # S3-compatible client for Cloudflare R2
-botocore==1.43.117
+PyYAML==6.0.3
+boto3==1.43.118               # S3-compatible client for Cloudflare R2
+botocore==1.43.118
 requests==2.34.2             # preflight / smoke-test tooling (scripts/)
 
 # --- Test & lint (installed in CI and locally) -------------------------------
