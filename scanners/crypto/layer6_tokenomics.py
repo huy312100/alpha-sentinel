@@ -1,9 +1,13 @@
-"""Layer 6 - tokenomics and dated catalysts.
+"""Layer 6 - tokenomics, dilution overhang and dated catalysts.
 
-Two reads:
+Three reads:
 
 * **CoinGecko** (keyless) - circulating/total/max supply, float ratio and FDV
   versus market cap. This is the dilution overhang that price must absorb.
+* **Catalyst tagging** (same CoinGecko payload) - a category naming an airdrop,
+  points, quest or farming programme, plus watchlist growth and commit activity.
+  This is the "why would anyone care next week" half of the thesis, so it is
+  scored only when present instead of being averaged in as a neutral 50.
 * **Event calendar** (optional) - a JSON feed of unlock/vesting cliffs and
   mainnet upgrades. Configure ``TOKENOMICS_CALENDAR_URL`` to point at
   TokenUnlocks, an internal sheet export or your own service; the parser accepts
@@ -24,14 +28,70 @@ from config.settings import Settings
 from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, clamp, utcnow
-from scanners.base import BaseScanner, ScanContext, linear
-from scanners.crypto.providers.airdrop import COINGECKO_PLATFORMS
-from scanners.shared.http_client import ProviderResult, fetch_provider, first_float, request_json, to_float
+from scanners.base import BaseScanner, ScanContext, linear, log_scale
+from scanners.shared.http_client import (
+    ProviderResult,
+    fetch_provider,
+    first_float,
+    request_json,
+    to_float,
+    to_int,
+)
 
 log = get_logger(__name__)
 
 
-COINGECKO_CONTRACT_URL = "https://api.coingecko.com/api/v3/coins/{platform}/contract/{address}"
+#: Our chain slug -> CoinGecko asset-platform id.
+COINGECKO_PLATFORMS: dict[str, str] = {
+    "ethereum": "ethereum",
+    "bsc": "binance-smart-chain",
+    "polygon": "polygon-pos",
+    "arbitrum": "arbitrum-one",
+    "base": "base",
+}
+
+#: Category keywords that name a live incentive programme - a reason for attention.
+CATALYST_KEYWORDS = ("airdrop", "points", "quest", "incentive", "farming", "retroactive", "launchpad")
+
+
+def catalyst_categories(categories: Any) -> list[str]:
+    """Keep only the CoinGecko categories that promise a reward programme."""
+    if not isinstance(categories, list):
+        return []
+    hits: list[str] = []
+    for category in categories:
+        if not isinstance(category, str):
+            continue
+        lowered = category.lower()
+        if any(keyword in lowered for keyword in CATALYST_KEYWORDS):
+            hits.append(category)
+    return hits
+
+
+def parse_catalysts(payload: Any) -> dict[str, Any]:
+    """Read the attention half of CoinGecko's contract payload.
+
+    A category is only a catalyst when it names an incentive programme; a token
+    filed under "DeFi" has none. Watchlist growth and live commits are the
+    supporting evidence that the programme is still running, so an unindexed
+    token yields nothing rather than a neutral score.
+    """
+    if not isinstance(payload, dict) or not payload.get("id"):
+        return {}
+    metrics: dict[str, Any] = {
+        "coingecko_id": payload.get("id"),
+        "catalyst_categories": catalyst_categories(payload.get("categories")),
+        "watchlist_users": to_float(payload.get("watchlist_portfolio_users")),
+        "sentiment_up_pct": to_float(payload.get("sentiment_votes_up_percentage")),
+        "market_cap_rank": to_int(payload.get("market_cap_rank")),
+    }
+    developer = payload.get("developer_data")
+    if isinstance(developer, dict):
+        metrics["commits_4w"] = to_float(developer.get("commit_count_4_weeks"))
+    community = payload.get("community_data")
+    if isinstance(community, dict):
+        metrics["twitter_followers"] = to_float(community.get("twitter_followers"))
+    return metrics
 
 
 UNLOCK_TYPES = {"unlock", "vesting", "cliff", "token_unlock", "emission"}
@@ -190,6 +250,9 @@ class CryptoTokenomicsScanner(BaseScanner):
         unlock_pct_30d = to_float(metrics.get("unlock_pct_30d"))
         next_unlock_days = to_float(metrics.get("next_unlock_days"))
         next_upgrade_days = to_float(metrics.get("next_upgrade_days"))
+        catalyst_hits = metrics.get("catalyst_categories") or []
+        watchlist_users = to_float(metrics.get("watchlist_users"))
+        commits_4w = to_float(metrics.get("commits_4w"))
 
         components: list[tuple[float, float]] = []
         if float_ratio is not None:
@@ -198,6 +261,11 @@ class CryptoTokenomicsScanner(BaseScanner):
             components.append((0.35, clamp(100.0 - unlock_pct_30d * 8.0)))
         if next_upgrade_days is not None:
             components.append((0.20, 65.0 if next_upgrade_days <= 30.0 else 50.0))
+        # Only positive catalysts are added: "no airdrop" is not a tokenomics flaw.
+        if catalyst_hits:
+            components.append((0.20, 88.0))
+        if watchlist_users is not None:
+            components.append((0.10, log_scale(watchlist_users, 1_000.0, 250_000.0)))
 
         total_weight = sum(weight for weight, _ in components) or 1.0
         score = sum(weight * value for weight, value in components) / total_weight
@@ -213,6 +281,8 @@ class CryptoTokenomicsScanner(BaseScanner):
             flags.append("next_unlock_is_cliff")
         if next_upgrade_days is not None and next_upgrade_days <= 30.0:
             flags.append("mainnet_upgrade_within_30d")
+        if commits_4w is not None and commits_4w <= 0:
+            flags.append("no_commits_4w")
 
         confidence = 0.75 if "calendar" in sources and "coingecko" in sources else 0.55
         if "calendar" not in sources:
@@ -222,9 +292,10 @@ class CryptoTokenomicsScanner(BaseScanner):
         float_text = f"{float_ratio:.1%}" if float_ratio is not None else "n/a"
         unlock_text = f"{unlock_pct_30d:.2f}% in 30d" if unlock_pct_30d is not None else "no unlock calendar"
         upgrade_text = f"{next_upgrade_days:.0f}d" if next_upgrade_days is not None else "n/a"
+        catalyst_text = f", catalyst {', '.join(catalyst_hits[:2])}" if catalyst_hits else ""
         summary = (
             f"{symbol or 'token'}: float {float_text}, {unlock_text}, "
-            f"next upgrade {upgrade_text} [{'+'.join(sources)}]"
+            f"next upgrade {upgrade_text}{catalyst_text} [{'+'.join(sources)}]"
         )
         return self.signal(
             token,
@@ -245,9 +316,11 @@ class CryptoTokenomicsScanner(BaseScanner):
         async def fetch() -> dict[str, Any]:
             payload = await request_json(
                 ctx.session,
-                COINGECKO_CONTRACT_URL.format(platform=platform, address=token.token_address),
+                ctx.settings.endpoints.url(
+                    "coingecko.contract", platform=platform, address=token.token_address
+                ),
             )
-            return parse_supply(payload)
+            return {**parse_supply(payload), **parse_catalysts(payload)}
 
         return fetch()
 
@@ -268,7 +341,6 @@ def build_scanner(settings: Settings) -> CryptoTokenomicsScanner:
 
 
 __all__ = [
-    "COINGECKO_CONTRACT_URL",
     "CryptoTokenomicsScanner",
     "UNLOCK_TYPES",
     "UPGRADE_TYPES",

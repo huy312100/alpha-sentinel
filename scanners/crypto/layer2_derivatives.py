@@ -19,17 +19,37 @@ from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, clamp
 from scanners.base import BaseScanner, ScanContext, linear, log_scale, safe_div
-from scanners.crypto.providers.derivatives import DerivativesScanner, funding_score, perp_symbol_candidates
-from scanners.shared.http_client import ProviderResult, fetch_provider, first_float, first_row, request_json, to_float
+from scanners.shared.http_client import (
+    ProviderResult,
+    fetch_provider,
+    first_float,
+    first_row,
+    request_json,
+    to_float,
+)
 
 log = get_logger(__name__)
 
 
-HYPERLIQUID_INFO_PATH = "/info"
-COINGLASS_BASE = "https://open-api-v4.coinglass.com/api"
-COINGLASS_FUNDING_PATH = "/futures/funding-rate/history"
-COINGLASS_OI_PATH = "/futures/open-interest/aggregated-history"
-COINGLASS_LIQUIDATION_MAP_PATH = "/futures/liquidation/coin-map"
+#: Appended to the base asset to build the perp contract ticker.
+QUOTE_SUFFIX = "USDT"
+
+
+def perp_symbol_candidates(symbol: str) -> list[str]:
+    """Contract tickers to try, cheapest first: ``PEPE``, ``1000PEPE``, ``1000000PEPE``."""
+    base = symbol.strip().upper()
+    if not base:
+        return []
+    return [f"{prefix}{base}{QUOTE_SUFFIX}" for prefix in ("", "1000", "1000000")]
+
+
+def funding_score(rate: float | None) -> float:
+    """Reward mildly positive funding, punish crowded longs and deep negative carry."""
+    if rate is None:
+        return 50.0
+    healthy = 0.0002  # ~0.02% per 8h
+    deviation = abs(rate - healthy) / 0.0008
+    return max(0.0, 100.0 - deviation * 100.0)
 
 
 def hl_coin_candidates(symbol: str) -> list[str]:
@@ -153,6 +173,121 @@ def depth_score(open_interest_usd: float | None, volume_24h_usd: float | None) -
     return 0.5 * oi_score + 0.5 * volume_score
 
 
+async def fetch_perp_metrics(symbol: str, ctx: ScanContext) -> dict[str, Any] | None:
+    """Keyless Binance/Bybit perp read.
+
+    ``None`` means "this contract is not listed"; ``{}`` means "every provider
+    failed". The caller distinguishes the two so an outage never looks like a
+    token without a perpetual market.
+    """
+    try:
+        binance = await _binance_metrics(symbol, ctx)
+        if binance is not None:
+            return binance
+    except Exception as exc:  # noqa: BLE001 - fall through to Bybit
+        log.debug("binance_derivatives_failed", extra={"symbol": symbol, "error": str(exc)[:200]})
+
+    try:
+        return await _bybit_metrics(symbol, ctx)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("bybit_derivatives_failed", extra={"symbol": symbol, "error": str(exc)[:200]})
+        return {}
+
+
+async def _binance_metrics(symbol: str, ctx: ScanContext) -> dict[str, Any] | None:
+    params = {"symbol": symbol}
+    endpoints = ctx.settings.endpoints
+    premium, oi_now, oi_hist, ticker, taker, ratio = await asyncio.gather(
+        request_json(ctx.session, endpoints.url("binance_futures.premium_index"), params=params),
+        request_json(ctx.session, endpoints.url("binance_futures.open_interest"), params=params),
+        request_json(
+            ctx.session,
+            endpoints.url("binance_futures.open_interest_history"),
+            params={"symbol": symbol, "period": "1h", "limit": 25},
+        ),
+        request_json(ctx.session, endpoints.url("binance_futures.ticker_24h"), params=params),
+        request_json(
+            ctx.session,
+            endpoints.url("binance_futures.taker_ratio"),
+            params={"symbol": symbol, "period": "1h", "limit": 24},
+        ),
+        request_json(
+            ctx.session,
+            endpoints.url("binance_futures.long_short_ratio"),
+            params={"symbol": symbol, "period": "1h", "limit": 1},
+        ),
+        return_exceptions=True,
+    )
+    if isinstance(premium, Exception) or not isinstance(premium, dict):
+        return None
+    if to_float(premium.get("markPrice")) is None:
+        return None  # symbol not listed on perps
+
+    oi_change = _oi_change_pct(oi_hist if isinstance(oi_hist, list) else None)
+    taker_ratio = _taker_ratio(taker if isinstance(taker, list) else None)
+    ls_ratio = None
+    if isinstance(ratio, list) and ratio:
+        ls_ratio = to_float((ratio[-1] or {}).get("longShortRatio"))
+    return {
+        "source": "binance",
+        "funding_rate": to_float(premium.get("lastFundingRate")),
+        "mark_price": to_float(premium.get("markPrice")),
+        "open_interest": to_float((oi_now or {}).get("openInterest")) if isinstance(oi_now, dict) else None,
+        "oi_change_pct": oi_change,
+        "taker_buy_sell_ratio": taker_ratio,
+        "long_short_ratio": ls_ratio,
+        "quote_volume_24h": to_float((ticker or {}).get("quoteVolume")) if isinstance(ticker, dict) else None,
+        "price_change_24h_pct": to_float((ticker or {}).get("priceChangePercent")) if isinstance(ticker, dict) else None,
+    }
+
+
+async def _bybit_metrics(symbol: str, ctx: ScanContext) -> dict[str, Any] | None:
+    payload = await request_json(
+        ctx.session,
+        ctx.settings.endpoints.url("bybit.tickers"),
+        params={"category": "linear", "symbol": symbol},
+    )
+    rows = ((payload or {}).get("result") or {}).get("list") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict) or to_float(row.get("markPrice")) is None:
+        return None
+    pct = to_float(row.get("price24hPcnt"))
+    return {
+        "source": "bybit",
+        "funding_rate": to_float(row.get("fundingRate")),
+        "mark_price": to_float(row.get("markPrice")),
+        "open_interest": to_float(row.get("openInterest")),
+        "oi_change_pct": None,  # Bybit's ticker carries no OI history
+        "taker_buy_sell_ratio": None,
+        "long_short_ratio": None,
+        "quote_volume_24h": to_float(row.get("turnover24h")),
+        "price_change_24h_pct": round(pct * 100.0, 3) if pct is not None else None,
+    }
+
+
+def _oi_change_pct(history: list[dict[str, Any]] | None) -> float | None:
+    """Percent change in open interest between the first and last history rows."""
+    if not history or len(history) < 2:
+        return None
+    first = to_float((history[0] or {}).get("sumOpenInterestValue"))
+    last = to_float((history[-1] or {}).get("sumOpenInterestValue"))
+    if first is None or last is None:
+        return None
+    change = safe_div(last - first, first)
+    return round(change * 100.0, 2) if change is not None else None
+
+
+def _taker_ratio(rows: list[dict[str, Any]] | None) -> float | None:
+    if not rows:
+        return None
+    buys = sum(to_float((row or {}).get("buyVol")) or 0.0 for row in rows)
+    sells = sum(to_float((row or {}).get("sellVol")) or 0.0 for row in rows)
+    ratio = safe_div(buys, sells)
+    return round(ratio, 3) if ratio is not None else None
+
+
 class CryptoDerivativesScanner(BaseScanner):
     """Layer 2: funding, open interest, depth and liquidation positioning."""
 
@@ -262,7 +397,7 @@ class CryptoDerivativesScanner(BaseScanner):
     async def _hyperliquid(self, candidates: list[str], ctx: ScanContext) -> dict[str, Any]:
         payload = await request_json(
             ctx.session,
-            f"{self.settings.providers.hyperliquid_base_url.rstrip('/')}{HYPERLIQUID_INFO_PATH}",
+            self.settings.endpoints.url("hyperliquid.info"),
             method="POST",
             json_body={"type": "metaAndAssetCtxs"},
         )
@@ -278,7 +413,7 @@ class CryptoDerivativesScanner(BaseScanner):
         async def funding() -> dict[str, Any]:
             payload = await request_json(
                 ctx.session,
-                f"{COINGLASS_BASE}{COINGLASS_FUNDING_PATH}",
+                ctx.settings.endpoints.url("coinglass.funding_history"),
                 params={"exchange": "Binance", "symbol": pair, "interval": "8h", "limit": 1},
                 headers=headers,
             )
@@ -288,7 +423,7 @@ class CryptoDerivativesScanner(BaseScanner):
         async def open_interest() -> dict[str, Any]:
             payload = await request_json(
                 ctx.session,
-                f"{COINGLASS_BASE}{COINGLASS_OI_PATH}",
+                ctx.settings.endpoints.url("coinglass.open_interest_history"),
                 params={"symbol": coin, "interval": "1h", "limit": 25},
                 headers=headers,
             )
@@ -302,7 +437,7 @@ class CryptoDerivativesScanner(BaseScanner):
         async def liquidation_map() -> dict[str, Any]:
             payload = await request_json(
                 ctx.session,
-                f"{COINGLASS_BASE}{COINGLASS_LIQUIDATION_MAP_PATH}",
+                ctx.settings.endpoints.url("coinglass.liquidation_map"),
                 params={"symbol": coin, "interval": "1h"},
                 headers=headers,
             )
@@ -311,10 +446,9 @@ class CryptoDerivativesScanner(BaseScanner):
         return {"coinglass_funding": funding(), "coinglass_oi": open_interest(), "coinglass_liquidation": liquidation_map()}
 
     async def _legacy(self, symbol: str, ctx: ScanContext) -> dict[str, Any]:
-        """Keyless Binance/Bybit fallback, reusing the original derivatives client."""
-        scanner = DerivativesScanner(self.settings)
+        """Keyless Binance/Bybit fallback when Hyperliquid does not list the contract."""
         for contract in perp_symbol_candidates(symbol):
-            metrics = await scanner._fetch(contract, ctx)  # noqa: SLF001 - shared in-tree client
+            metrics = await fetch_perp_metrics(contract, ctx)
             if metrics:
                 return metrics
         return {}
@@ -325,14 +459,16 @@ def build_scanner(settings: Settings) -> CryptoDerivativesScanner:
 
 
 __all__ = [
-    "COINGLASS_BASE",
     "CryptoDerivativesScanner",
-    "HYPERLIQUID_INFO_PATH",
+    "QUOTE_SUFFIX",
     "build_scanner",
     "depth_score",
+    "fetch_perp_metrics",
+    "funding_score",
     "hl_coin_candidates",
     "liquidation_score",
     "parse_coinglass_liquidation_map",
     "parse_coinglass_series",
     "parse_hyperliquid_context",
+    "perp_symbol_candidates",
 ]

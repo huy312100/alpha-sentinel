@@ -1,0 +1,147 @@
+# =============================================================================
+# AlphaSentinel - vendor endpoint catalogue
+# =============================================================================
+# Every outbound URL this system calls is declared here; no scanner, client or
+# layer contains a host or a path. A vendor group is a ``base`` plus one entry
+# per resource:
+#
+#     <vendor>:
+#       base: https://api.example.com/v1     # origin + API prefix
+#       thing: /things/{id}                  # path joined onto base
+#       other: https://files.example.com/x   # absolute URL = its own host
+#
+# ``{placeholders}`` are filled by the caller (``endpoints.url(...)``); a missing
+# placeholder is a boot/runtime configuration error, never a silently malformed
+# URL.
+#
+# Addresses only, not credentials: API keys belong in the ``*_API_KEY`` /
+# ``*_TOKEN`` settings so the logger can redact them. Anything written here ends
+# up in diagnostics output and in error text.
+#
+# Overrides, highest priority last:
+#   1. this file (bundled defaults)
+#   2. ENDPOINTS_FILE=/etc/alphasentinel/endpoints.yaml
+#      - a mounted ConfigMap/secret; merged entry-by-entry over this file, so it
+#        only has to list what the deployment changes
+#   3. <VENDOR>_BASE_URL           e.g. COINGECKO_BASE_URL, BINANCE_FUTURES_BASE_URL
+#   4. <VENDOR>_<RESOURCE>_URL     e.g. COINGECKO_CONTRACT_URL (absolute URL, one entry)
+#
+# Vendor group names double as env prefixes, so ``sec_files`` is overridden by
+# SEC_FILES_BASE_URL and ``x_api`` by X_API_BASE_URL.
+# =============================================================================
+
+# --- keyless market data -----------------------------------------------------
+coingecko:
+  base: https://api.coingecko.com/api/v3
+  global: /global
+  contract: /coins/{platform}/contract/{address}
+
+geckoterminal:
+  base: https://api.geckoterminal.com/api/v2
+  token_pools: /networks/{network}/tokens/{address}/pools
+  pool_trades: /networks/{network}/pools/{pool}/trades
+  pool_ohlcv: /networks/{network}/pools/{pool}/ohlcv/{frame}
+
+dexscreener:
+  base: https://api.dexscreener.com
+  token: /latest/dex/tokens/{address}
+
+yahoo:
+  base: https://query1.finance.yahoo.com
+  chart: /v8/finance/chart/{symbol}
+
+defillama:
+  base: https://api.llama.fi
+  protocols: /protocols
+  protocol: /protocol/{slug}
+
+growthepie:
+  base: https://api.growthepie.com/v1
+  chain_metric: /metrics/chains/{chain}/{metric}.json
+
+fear_greed:
+  base: https://api.alternative.me
+  index: /fng/
+
+# --- SEC EDGAR (two hosts: API vs fair-access file server) --------------------
+sec:
+  base: https://data.sec.gov
+  company_facts: /api/xbrl/companyfacts/CIK{cik:010d}.json
+
+sec_files:
+  base: https://www.sec.gov
+  company_tickers: /files/company_tickers.json
+
+# --- derivatives venues ------------------------------------------------------
+binance_futures:
+  base: https://fapi.binance.com
+  premium_index: /fapi/v1/premiumIndex
+  open_interest: /fapi/v1/openInterest
+  open_interest_history: /futures/data/openInterestHist
+  ticker_24h: /fapi/v1/ticker/24hr
+  taker_ratio: /futures/data/takerlongshortRatio
+  long_short_ratio: /futures/data/globalLongShortAccountRatio
+
+bybit:
+  base: https://api.bybit.com
+  tickers: /v5/market/tickers
+
+hyperliquid:
+  base: https://api.hyperliquid.xyz
+  info: /info
+
+coinglass:
+  base: https://open-api-v4.coinglass.com
+  funding_history: /api/futures/funding-rate/history
+  open_interest_history: /api/futures/open-interest/aggregated-history
+  liquidation_map: /api/futures/liquidation/coin-map
+
+# --- keyed research / social providers ---------------------------------------
+arkham:
+  base: https://api.arkhamintelligence.com
+  transfers: /transfers
+
+nansen:
+  base: https://api.nansen.ai
+  smart_money_netflows: /api/v1/smart-money/netflows
+
+dune:
+  base: https://api.dune.com
+  query_results: /api/v1/query/{query_id}/results
+
+x_api:
+  base: https://api.x.com
+  tweet_counts: /2/tweets/counts/recent
+  tweet_search: /2/tweets/search/recent
+
+cryptopanic:
+  base: https://cryptopanic.com
+  posts: /api/v1/posts/
+
+lunarcrush:
+  base: https://lunarcrush.com
+  coin: /api4/public/coins/{coin}/v1
+
+# --- security ----------------------------------------------------------------
+goplus:
+  base: https://api.gopluslabs.io
+  token_security: /api/v1/token_security/{chain_id}
+
+honeypot:
+  base: https://api.honeypot.is
+  check: /v2/IsHoneypot
+
+# --- explorers ---------------------------------------------------------------
+# ``base`` keeps ``{chain}``: it is formatted per token and can be replaced per
+# chain through BLOCKSCOUT_BASE_URL_<CHAIN> (BLOCKSCOUT_EXPLORER_BASE_URL moves
+# every chain at once).
+blockscout:
+  base: https://{chain}.blockscout.com
+  token: /api/v2/tokens/{address}
+  counters: /api/v2/tokens/{address}/counters
+  holders: /api/v2/tokens/{address}/holders
+
+# --- notifications -----------------------------------------------------------
+telegram:
+  base: https://api.telegram.org
+  send_message: /bot{token}/sendMessage

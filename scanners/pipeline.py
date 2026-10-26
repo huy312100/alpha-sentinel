@@ -27,9 +27,8 @@ from core.logging import get_logger
 from core.models import LayerSignal, SignalStatus, TokenSnapshot, json_safe, utcnow
 from core.scoring import weighted_prior
 from scanners.base import BaseScanner, ScanContext
-from scanners.crypto.providers.dex import DexMarket, load_market
-from scanners.crypto.providers.security import SecurityScanner
-from scanners.crypto.providers.wash import WashTradingFilter
+from scanners.crypto.layer4_dex import DexMarket, WashTradingFilter, load_market
+from scanners.crypto.layer8_security import fetch_security_report
 from scanners.registry import (
     ASSET_LAYER_MAP,
     SCANNER_REGISTRY,
@@ -147,7 +146,6 @@ class ScanPipeline:
         self._scanner_cache: dict[AssetClass, list[BaseScanner]] = {}
         #: Backwards-compatible default view; execution is routed per asset class.
         self.scanners: list[BaseScanner] = self.scanners_for(AssetClass.CRYPTO)
-        self.security = SecurityScanner(settings)
         self.wash = WashTradingFilter(wash_threshold or 85.0)
         self.health: dict[str, ScannerHealth] = {
             layer: ScannerHealth(layer)
@@ -272,7 +270,7 @@ class ScanPipeline:
         snapshot thinner, never broken.
         """
         try:
-            snapshot.security = await self.security.scan(snapshot, ctx)
+            snapshot.security = await fetch_security_report(snapshot, ctx)
         except Exception as exc:  # noqa: BLE001 - scan() already degrades, belt and braces
             log.debug("security_stage_failed", extra={"token": snapshot.token_address, "error": str(exc)[:200]})
 
@@ -365,10 +363,14 @@ class ScanPipeline:
                     continue
                 try:
                     if kind == "crypto":
-                        value = await fetch_crypto_backdrop(self.session)
+                        value = await fetch_crypto_backdrop(
+                            self.session, endpoints=self.settings.endpoints
+                        )
                         usable = crypto_backdrop_usable(value)
                     else:
-                        value = await fetch_cross_asset_backdrop(self.session)
+                        value = await fetch_cross_asset_backdrop(
+                            self.session, endpoints=self.settings.endpoints
+                        )
                         usable = cross_asset_usable(value)
                 except Exception as exc:  # noqa: BLE001 - the layer degrades to UNAVAILABLE
                     log.warning(

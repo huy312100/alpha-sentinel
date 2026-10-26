@@ -4,9 +4,16 @@ from __future__ import annotations
 
 from core.models import SignalStatus, TokenSnapshot
 from scanners.base import ScanContext
-from scanners.crypto.providers.dex import DexMarket, DexScanner, _gecko_row_is_base, _pick_best_pair
-from scanners.crypto.providers.onchain import concentration_from_holders
-from scanners.crypto.providers.wash import _epoch_seconds, _parse_trades, self_trade_share
+from scanners.crypto.layer1_onchain import concentration_from_holders
+from scanners.crypto.layer4_dex import (
+    CryptoDexScanner,
+    DexMarket,
+    _epoch_seconds,
+    _gecko_row_is_base,
+    _parse_trades,
+    _pick_best_pair,
+    self_trade_share,
+)
 from tests.conftest import TOKEN
 
 
@@ -70,12 +77,12 @@ async def test_dex_summary_survives_a_missing_turnover(settings, monkeypatch):
     async def fake_load(token, ctx):
         return market
 
-    monkeypatch.setattr("scanners.crypto.providers.dex.load_market", fake_load)
+    monkeypatch.setattr("scanners.crypto.layer4_dex.load_market", fake_load)
     token = TokenSnapshot(token_address=TOKEN, chain="ethereum", asset_class="crypto", symbol="TEST")
-    signal = await DexScanner(settings).collect(token, ScanContext(None, settings))
+    signal = await CryptoDexScanner(settings).collect(token, ScanContext(None, settings))
 
-    assert "turnover n/a" in signal.summary
     assert "24h vol n/a" in signal.summary
+    assert signal.metrics["turnover"] is None
     assert signal.status is SignalStatus.DEGRADED
 
 

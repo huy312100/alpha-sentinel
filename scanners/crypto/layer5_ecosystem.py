@@ -18,14 +18,16 @@ from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, linear, log_scale, safe_div
-from scanners.shared.http_client import ProviderResult, fetch_provider, first_float, first_row, request_json, to_float
+from scanners.shared.http_client import (
+    ProviderResult,
+    fetch_provider,
+    first_float,
+    first_row,
+    request_json,
+    to_float,
+)
 
 log = get_logger(__name__)
-
-
-DEFILLAMA_PROTOCOLS_URL = "https://api.llama.fi/protocols"
-DEFILLAMA_PROTOCOL_URL = "https://api.llama.fi/protocol/{slug}"
-GROWTHEPIE_METRIC_URL = "https://api.growthepie.com/v1/metrics/chains/{chain}/{metric}.json"
 
 
 #: Chain slug -> GrowThePie ``origin_key``. Absent means "not covered".
@@ -231,19 +233,24 @@ class CryptoEcosystemScanner(BaseScanner):
         slug = str(protocol.get("slug") or protocol.get("id") or "").strip()
         if not slug:
             return {}
-        payload = await request_json(ctx.session, DEFILLAMA_PROTOCOL_URL.format(slug=slug))
+        payload = await request_json(
+            ctx.session,
+            self.settings.endpoints.url("defillama.protocol", slug=slug),
+        )
         metrics = parse_defillama_protocol(payload)
         metrics["defillama_slug"] = slug
         metrics["defillama_name"] = protocol.get("name")
         return metrics
 
-    @staticmethod
-    async def _protocol_catalogue(ctx: ScanContext) -> list[Any]:
+    async def _protocol_catalogue(self, ctx: ScanContext) -> list[Any]:
         now = time.monotonic()
         rows = _protocols_cache.get("rows")
         if rows and now - float(_protocols_cache.get("stamp") or 0.0) <= PROTOCOLS_TTL_SECONDS:
             return rows
-        payload = await request_json(ctx.session, DEFILLAMA_PROTOCOLS_URL)
+        payload = await request_json(
+            ctx.session,
+            self.settings.endpoints.url("defillama.protocols"),
+        )
         rows = payload if isinstance(payload, list) else []
         if rows:
             _protocols_cache["stamp"] = now
@@ -253,7 +260,8 @@ class CryptoEcosystemScanner(BaseScanner):
     async def _growthepie(self, chain: str, ctx: ScanContext) -> dict[str, Any]:
         origin = GROWTHEPIE_CHAINS[chain]
         payload = await request_json(
-            ctx.session, GROWTHEPIE_METRIC_URL.format(chain=origin, metric="daa")
+            ctx.session,
+            self.settings.endpoints.url("growthepie.chain_metric", chain=origin, metric="daa"),
         )
         return parse_growthepie_metric(payload)
 
@@ -264,10 +272,7 @@ def build_scanner(settings: Settings) -> CryptoEcosystemScanner:
 
 __all__ = [
     "CryptoEcosystemScanner",
-    "DEFILLAMA_PROTOCOLS_URL",
-    "DEFILLAMA_PROTOCOL_URL",
     "GROWTHEPIE_CHAINS",
-    "GROWTHEPIE_METRIC_URL",
     "build_scanner",
     "match_protocol",
     "parse_defillama_protocol",

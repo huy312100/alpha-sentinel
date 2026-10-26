@@ -23,22 +23,23 @@ from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, clamp, get_chain_profile
 from scanners.base import BaseScanner, ScanContext, log_scale
-from scanners.crypto.providers.onchain import (
-    TOKEN_COUNTERS_PATH,
-    TOKEN_HOLDERS_PATH,
-    TOKEN_INFO_PATH,
-    concentration_from_holders,
+from scanners.shared.http_client import (
+    ProviderResult,
+    fetch_provider,
+    first_float,
+    first_row,
+    request_json,
+    to_float,
+    to_int,
 )
-from scanners.shared.http_client import ProviderResult, fetch_provider, first_float, first_row, request_json, to_float, to_int
 
 log = get_logger(__name__)
 
 
-ARKHAM_BASE = "https://api.arkhamintelligence.com"
-ARKHAM_TRANSFERS_PATH = "/transfers"
-NANSEN_BASE = "https://api.nansen.ai"
-NANSEN_NETFLOW_PATH = "/api/v1/smart-money/netflows"
-DUNE_QUERY_RESULTS = "https://api.dune.com/api/v1/query/{query_id}/results"
+#: Addresses that hold supply but are not "insiders": the zero address and burns.
+_SINK_ADDRESSES = frozenset(
+    {"0x0000000000000000000000000000000000000000", "0x000000000000000000000000000000000000dead"}
+)
 
 
 CEX_HINTS = (
@@ -59,6 +60,41 @@ CEX_HINTS = (
     "crypto.com",
 )
 SMART_MONEY_HINTS = ("smart money", "fund", "capital", "ventures", "family office")
+
+
+def concentration_from_holders(
+    rows: Any,
+    *,
+    top_n: int = 10,
+    total_supply: float | None = None,
+) -> tuple[float | None, int]:
+    """Return ``(top-N share %, rows inspected)`` from a Blockscout holder list.
+
+    Blockscout returns only the first page (~50 holders), so dividing by the page
+    total would measure "share of the top 50" and flag almost every token. When
+    the token endpoint reports ``total_supply`` (same raw base units) that is the
+    denominator; the page total is a last resort and the caller lowers confidence.
+    """
+    if not isinstance(rows, list) or not rows:
+        return None, 0
+    values: list[tuple[str, float]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = to_float(row.get("value")) or 0.0
+        if value <= 0:
+            continue
+        address = str(row.get("address") or row.get("holder_address") or "").lower()
+        values.append((address, value))
+    if not values:
+        return None, 0
+    denominator = total_supply if total_supply is not None and total_supply > 0 else sum(value for _, value in values)
+    eligible = sorted(
+        (value for address, value in values if address not in _SINK_ADDRESSES),
+        reverse=True,
+    )
+    top = sum(eligible[:top_n])
+    return round(min(100.0, top / denominator * 100.0), 2), len(values)
 
 
 def _entity_text(address: Any) -> str:
@@ -297,7 +333,7 @@ class CryptoOnChainScanner(BaseScanner):
     async def _arkham(self, token: TokenSnapshot, ctx: ScanContext) -> dict[str, Any]:
         payload = await request_json(
             ctx.session,
-            f"{ARKHAM_BASE}{ARKHAM_TRANSFERS_PATH}",
+            self.settings.endpoints.url("arkham.transfers"),
             params={"base": token.token_address, "chains": token.chain, "flow": "all", "limit": 100},
             headers={"API-Key": self.settings.providers.arkham_api_key.get_secret_value()},
         )
@@ -306,7 +342,7 @@ class CryptoOnChainScanner(BaseScanner):
     async def _nansen(self, token: TokenSnapshot, ctx: ScanContext) -> dict[str, Any]:
         payload = await request_json(
             ctx.session,
-            f"{NANSEN_BASE}{NANSEN_NETFLOW_PATH}",
+            self.settings.endpoints.url("nansen.smart_money_netflows"),
             method="POST",
             json_body={
                 "chains": [token.chain],
@@ -324,7 +360,7 @@ class CryptoOnChainScanner(BaseScanner):
         query_id = self.settings.providers.dune_smart_money_query_id
         payload = await request_json(
             ctx.session,
-            DUNE_QUERY_RESULTS.format(query_id=query_id),
+            self.settings.endpoints.url("dune.query_results", query_id=query_id),
             headers={"X-Dune-API-Key": self.settings.providers.dune_api_key.get_secret_value()},
         )
         return parse_dune_rows(payload, token.token_address)
@@ -332,22 +368,33 @@ class CryptoOnChainScanner(BaseScanner):
     async def _holder_metrics(self, token: TokenSnapshot, ctx: ScanContext) -> dict[str, Any]:
         """Keyless Blockscout read: concentration, holder count, transfer count."""
         profile = get_chain_profile(token.chain)
-        if not profile.blockscout_url:
+        endpoints = self.settings.endpoints
+        explorer = {
+            resource: endpoints.blockscout(
+                resource,
+                chain=token.chain,
+                default=profile.blockscout_url,
+                address=token.token_address,
+            )
+            for resource in ("token", "counters", "holders")
+        }
+        if explorer["token"] is None:
             return {}
-        base = profile.blockscout_url.rstrip("/")
 
-        async def get(path: str) -> dict[str, Any]:
+        async def get(url: str | None) -> dict[str, Any]:
+            if url is None:
+                return {}
             try:
-                payload = await request_json(ctx.session, base + path.format(address=token.token_address))
+                payload = await request_json(ctx.session, url)
                 return payload if isinstance(payload, dict) else {}
             except Exception as exc:  # noqa: BLE001 - enrichment must not fail the layer
-                log.debug("blockscout_endpoint_failed", extra={"path": path, "error": str(exc)[:160]})
+                log.debug("blockscout_endpoint_failed", extra={"url": url, "error": str(exc)[:160]})
                 return {}
 
         info, counters, holders = await asyncio.gather(
-            get(TOKEN_INFO_PATH),
-            get(TOKEN_COUNTERS_PATH),
-            get(TOKEN_HOLDERS_PATH),
+            get(explorer["token"]),
+            get(explorer["counters"]),
+            get(explorer["holders"]),
         )
         total_supply = to_float(info.get("total_supply"))
         top10, inspected = concentration_from_holders(
@@ -376,11 +423,9 @@ def build_scanner(settings: Settings) -> CryptoOnChainScanner:
 
 
 __all__ = [
-    "ARKHAM_BASE",
     "CryptoOnChainScanner",
-    "DUNE_QUERY_RESULTS",
-    "NANSEN_BASE",
     "build_scanner",
+    "concentration_from_holders",
     "flow_score",
     "is_cex_entity",
     "is_smart_money_entity",

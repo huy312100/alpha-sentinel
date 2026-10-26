@@ -261,7 +261,7 @@ class TestPackageLayout:
         root = Path(scanners.__file__).parent
         assert {path.stem for path in root.glob("*.py")} == FRAMEWORK_MODULES
 
-    def test_crypto_owns_eight_layers_plus_provider_adapters(self):
+    def test_crypto_owns_one_module_per_layer(self):
         crypto = Path(scanners.__file__).parent / "crypto"
         assert sorted(path.stem for path in crypto.glob("layer*.py")) == [
             "layer1_onchain",
@@ -273,13 +273,31 @@ class TestPackageLayout:
             "layer7_technicals",
             "layer8_security",
         ]
-        providers = {path.stem for path in (crypto / "providers").glob("*.py")} - {"__init__"}
-        assert providers == {"airdrop", "derivatives", "dex", "onchain", "security", "social", "wash"}
+        # No adapter pen: a vendor client lives in the layer that scores it.
+        assert {path.name for path in crypto.glob("*.py")} == {
+            "__init__.py",
+            "layer1_onchain.py",
+            "layer2_derivatives.py",
+            "layer3_social.py",
+            "layer4_dex.py",
+            "layer5_ecosystem.py",
+            "layer6_tokenomics.py",
+            "layer7_technicals.py",
+            "layer8_security.py",
+        }
 
     def test_shared_owns_the_cross_market_clients(self):
         shared = Path(scanners.__file__).parent / "shared"
-        assert {"http_client.py", "technicals.py", "market_data.py", "series.py"} <= {
+        assert {"http_client.py", "market_data.py", "series.py"} <= {
             path.name for path in shared.iterdir()
+        }
+        # One module per analysis family, not one 500-line technicals.py.
+        assert {path.stem for path in (shared / "technicals").glob("*.py")} == {
+            "__init__",
+            "flags",
+            "primitives",
+            "scoring",
+            "snapshot",
         }
         assert {path.stem for path in (shared / "listed").glob("*.py")} - {"__init__"} == {
             "fundamentals",
@@ -298,21 +316,28 @@ class TestPackageLayout:
             ]
             assert modules, f"{asset_class.value} has no layer module"
 
-    def test_providers_never_import_a_layer(self):
-        providers = Path(scanners.__file__).parent / "crypto" / "providers"
-        for path in providers.glob("*.py"):
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-                if isinstance(node, ast.ImportFrom) and node.module:
-                    assert not node.module.startswith("scanners.crypto.layer"), path.name
-                    assert not node.module.startswith("scanners.shared.listed"), path.name
-
     def test_layers_never_import_each_other(self):
+        """Layers stay independent; one documented data edge is allowed."""
+        allowed = {("layer7_technicals", "scanners.crypto.layer4_dex")}
         crypto = Path(scanners.__file__).parent / "crypto"
         for path in crypto.glob("layer*.py"):
             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
                 if isinstance(node, ast.ImportFrom) and node.module:
                     if node.module.startswith("scanners.crypto.layer"):
-                        assert node.module.endswith(path.stem), f"{path.name} imports {node.module}"
+                        assert node.module.endswith(path.stem) or (path.stem, node.module) in allowed, (
+                            f"{path.name} imports {node.module}"
+                        )
+
+    def test_no_module_imports_the_retired_vendor_pen(self):
+        pattern = re.compile(r"^\s*from scanners\.crypto\.providers", re.MULTILINE)
+        root = Path(scanners.__file__).parent.parent
+        offenders = [
+            str(path.relative_to(root))
+            for path in root.rglob("*.py")
+            if not {".venv", "__pycache__", "build"} & set(path.parts)
+            and pattern.search(path.read_text(encoding="utf-8"))
+        ]
+        assert not offenders, offenders
 
     def test_no_module_imports_a_retired_root_path(self):
         pattern = re.compile(

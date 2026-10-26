@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 import aiohttp
 
+from config.endpoints import EndpointSettings
 from config.settings import TelegramSettings
 from core.http import request_json
 from core.logging import get_logger
@@ -141,11 +142,14 @@ class TelegramAlerter:
         self,
         telegram: TelegramSettings,
         *,
+        endpoints: EndpointSettings | None = None,
         session: aiohttp.ClientSession | None = None,
         store: HotStore | None = None,
         dedupe_hours: float = DEDUPE_WINDOW_HOURS,
     ) -> None:
         self.telegram = telegram
+        #: Bot API URL template; the token is substituted per send, never stored.
+        self.endpoints = endpoints or EndpointSettings()
         self._session = session
         self._owns_session = session is None
         self.store = store
@@ -190,12 +194,15 @@ class TelegramAlerter:
         try:
             response = await request_json(
                 self.session,
-                f"{self.telegram.api_base}/sendMessage",
+                self.endpoints.url(
+                    "telegram.send_message",
+                    token=self.telegram.bot_token.get_secret_value(),
+                ),
                 method="POST",
                 json_body=payload,
             )
         except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError) as exc:
-            # ``api_base`` embeds the bot token, and HttpError text includes the URL.
+            # The URL embeds the bot token and HttpError text includes the URL.
             # Only the exception class is safe to store or log.
             log.warning("telegram_send_failed", extra={"error": type(exc).__name__})
             return AlertResult(sent=False, reason=f"{type(exc).__name__}: telegram request failed")

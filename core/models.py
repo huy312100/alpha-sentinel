@@ -131,6 +131,9 @@ class ChainProfile:
     name: str
     goplus_id: str | None          # GoPlus EVM chain id (None -> unsupported)
     geckoterminal: str             # GeckoTerminal network slug
+    #: Last-resort explorer URL. ``None`` means "this chain has no explorer" and is
+    #: what the on-chain layer checks; the host actually used comes from
+    #: ``EndpointSettings.blockscout_url`` (``BLOCKSCOUT_BASE_URL_*``).
     blockscout_url: str | None
     evm: bool = True
 

@@ -20,15 +20,16 @@ from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, linear, log_scale
-from scanners.crypto.providers.social import LUNARCRUSH_COIN_URL
-from scanners.shared.http_client import ProviderResult, fetch_provider, first_float, first_row, request_json, to_float
+from scanners.shared.http_client import (
+    ProviderResult,
+    fetch_provider,
+    first_float,
+    first_row,
+    request_json,
+    to_float,
+)
 
 log = get_logger(__name__)
-
-
-X_COUNTS_URL = "https://api.x.com/2/tweets/counts/recent"
-X_SEARCH_URL = "https://api.x.com/2/tweets/search/recent"
-CRYPTOPANIC_POSTS_URL = "https://cryptopanic.com/api/v1/posts/"
 
 
 def parse_x_counts(payload: Any, *, buckets_per_window: int = 6) -> dict[str, Any]:
@@ -251,16 +252,17 @@ class CryptoSocialScanner(BaseScanner):
     async def _x(self, symbol: str, ctx: ScanContext) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self.settings.social.x_bearer_token.get_secret_value()}"}
         query = f"${symbol} -is:retweet"
+        endpoints = self.settings.endpoints
         counts, search = await asyncio.gather(
             request_json(
                 ctx.session,
-                X_COUNTS_URL,
+                endpoints.url("x_api.tweet_counts"),
                 params={"query": query, "granularity": "hour"},
                 headers=headers,
             ),
             request_json(
                 ctx.session,
-                X_SEARCH_URL,
+                endpoints.url("x_api.tweet_search"),
                 params={"query": query, "max_results": 100, "tweet.fields": "public_metrics,author_id"},
                 headers=headers,
             ),
@@ -276,7 +278,7 @@ class CryptoSocialScanner(BaseScanner):
     async def _cryptopanic(self, symbol: str, ctx: ScanContext) -> dict[str, Any]:
         payload = await request_json(
             ctx.session,
-            CRYPTOPANIC_POSTS_URL,
+            self.settings.endpoints.url("cryptopanic.posts"),
             params={
                 "auth_token": self.settings.providers.cryptopanic_token.get_secret_value(),
                 "currencies": symbol,
@@ -288,7 +290,7 @@ class CryptoSocialScanner(BaseScanner):
     async def _lunarcrush(self, symbol: str, ctx: ScanContext) -> dict[str, Any]:
         payload = await request_json(
             ctx.session,
-            LUNARCRUSH_COIN_URL.format(coin=symbol),
+            self.settings.endpoints.url("lunarcrush.coin", coin=symbol),
             headers={
                 "Authorization": f"Bearer {self.settings.social.lunarcrush_api_key.get_secret_value()}"
             },
@@ -301,10 +303,7 @@ def build_scanner(settings: Settings) -> "CryptoSocialScanner":
 
 
 __all__ = [
-    "CRYPTOPANIC_POSTS_URL",
     "CryptoSocialScanner",
-    "X_COUNTS_URL",
-    "X_SEARCH_URL",
     "build_scanner",
     "parse_cryptopanic",
     "parse_lunarcrush",

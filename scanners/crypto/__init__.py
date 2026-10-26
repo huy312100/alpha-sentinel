@@ -1,9 +1,9 @@
 """The crypto layer manifest consumed by :mod:`scanners.registry`.
 
 ``layer1_onchain`` .. ``layer8_security`` are the eight scoring layers, in
-execution order. ``providers/`` holds the vendor adapters they call - request
-shapes and payload parsing only, never score arithmetic - and requires no
-knowledge of the registry.
+execution order. Each one is self-contained: it owns the vendor endpoints it
+calls (request shapes, payload parsing and its own score arithmetic) so there is
+no adapter pen to keep in sync, and it requires no knowledge of the registry.
 """
 
 from __future__ import annotations

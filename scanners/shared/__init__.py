@@ -11,8 +11,11 @@ Contents
     fail-closed wrapper that turns a dead vendor into a skipped layer instead of
     an aborted scan.
 ``technicals``
-    Pure indicator functions (SMA/EMA/RSI/MACD/ATR/OBV/Bollinger/z-score) and
-    order-flow imbalance - auditable maths with no ``pandas``/``TA-Lib`` runtime.
+    The technical-analysis library, one module per analysis family:
+    ``primitives`` (SMA/EMA/RSI/MACD/ATR/OBV/Bollinger/z-score), ``snapshot``
+    (:class:`Indicators` / :func:`compute_indicators`), ``scoring`` (0-100 curves)
+    and ``flags`` (exhaustion/structure flags plus their score ceilings). Pure
+    functions, no ``pandas``/``TA-Lib`` runtime; both technical layers read them.
 ``market_data``
     Keyless venue quotes and daily candles (Yahoo chart API) for every listed
     instrument, with the parsing quirks normalised at the edge.

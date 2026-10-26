@@ -18,12 +18,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.http import request_json
 from core.instruments import AssetClass
 from core.models import TokenSnapshot, get_chain_profile
-from scanners.shared.market_data import load_market_series
-
-GECKO_OHLCV_URL = "https://api.geckoterminal.com/api/v2/networks/{network}/pools/{pool}/ohlcv/hour"
+from scanners.shared.http_client import request_json
+from scanners.shared.market_data import endpoints_for, load_market_series
 
 #: Hourly crypto bars: 24 bars = one day, so momentum needs 25 closes.
 CRYPTO_CHANGE_BARS = 25
@@ -100,6 +98,32 @@ def parse_ohlcv(payload: Any) -> dict[str, list[float]]:
     return series if series["close"] else {}
 
 
+async def fetch_ohlcv(
+    ctx: Any,
+    *,
+    network: str,
+    pool: str,
+    frame: str = "hour",
+    aggregate: int = 1,
+    limit: int = 200,
+) -> dict[str, list[float]]:
+    """Candles for one pool/frame, normalised oldest-first.
+
+    The single caller-facing wrapper for GeckoTerminal OHLCV: layer 7 (M15/H1) and
+    :func:`load_price_series` (H1) both use it, so the endpoint exists once.
+    """
+    payload = await request_json(
+        ctx.session,
+        endpoints_for(ctx).url(
+            "geckoterminal.pool_ohlcv", network=network, pool=pool, frame=frame
+        ),
+        params={"aggregate": aggregate, "limit": limit},
+    )
+    if not isinstance(payload, dict):
+        raise ValueError("unexpected GeckoTerminal OHLCV payload")
+    return parse_ohlcv(payload)
+
+
 async def load_price_series(token: TokenSnapshot, ctx: Any) -> PriceSeries:
     """Resolve the provider for ``token``'s asset class and return its candles."""
     kind = AssetClass.coerce(token.asset_class)
@@ -115,20 +139,16 @@ async def load_price_series(token: TokenSnapshot, ctx: Any) -> PriceSeries:
 
 
 async def _crypto_series(token: TokenSnapshot, ctx: Any) -> PriceSeries:
-    from scanners.crypto.providers.dex import load_market
+    from scanners.crypto.layer4_dex import load_market
 
     market = await load_market(token, ctx)
     pool = (market.pair_address if market else None) or token.pair_address or ""
     if not pool:
         raise SeriesUnavailable("no pool address available for OHLCV")
     network = get_chain_profile(token.chain).geckoterminal
-    payload = await request_json(
-        ctx.session,
-        GECKO_OHLCV_URL.format(network=network, pool=pool),
-        params={"aggregate": 1, "limit": 200},
-    )
+    candles = await fetch_ohlcv(ctx, network=network, pool=pool, frame="hour")
     return PriceSeries(
-        candles=parse_ohlcv(payload),
+        candles=candles,
         bar_interval="1h",
         change_bars=CRYPTO_CHANGE_BARS,
         source=f"geckoterminal:{pool}",
@@ -138,9 +158,9 @@ async def _crypto_series(token: TokenSnapshot, ctx: Any) -> PriceSeries:
 __all__ = [
     "CRYPTO_CHANGE_BARS",
     "DAILY_CHANGE_BARS",
-    "GECKO_OHLCV_URL",
     "PriceSeries",
     "SeriesUnavailable",
+    "fetch_ohlcv",
     "load_price_series",
     "parse_ohlcv",
 ]

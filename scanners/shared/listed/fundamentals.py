@@ -28,8 +28,6 @@ from core.instruments import AssetClass
 from core.models import Layer, SignalStatus, LayerSignal, TokenSnapshot, clamp
 from scanners.base import BaseScanner, ScanContext, linear
 
-SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-SEC_FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 #: SEC asks for <10 requests/second; 150 ms spacing keeps us far below that.
 MIN_SEC_INTERVAL_SECONDS = 0.15
 TICKER_CACHE_SECONDS = 86_400.0
@@ -367,7 +365,11 @@ class FundamentalsScanner(BaseScanner):
             return self.skipped(token, f"no SEC CIK for {symbol} (non-US listing?)")
 
         await _respect_sec_rate_limit()
-        payload = await request_json(ctx.session, SEC_FACTS_URL.format(cik=cik), headers=headers)
+        payload = await request_json(
+            ctx.session,
+            ctx.settings.endpoints.url("sec.company_facts", cik=cik),
+            headers=headers,
+        )
         fundamentals = parse_company_facts(payload, symbol=symbol)
         score, flags, confidence, components = score_fundamentals(fundamentals)
 
@@ -411,7 +413,11 @@ class FundamentalsScanner(BaseScanner):
                 entry = _TICKER_INDEX.lookup(symbol)
                 return (entry[0], entry[1]) if entry else (None, "")
             await _respect_sec_rate_limit()
-            payload = await request_json(ctx.session, SEC_TICKERS_URL, headers=headers)
+            payload = await request_json(
+                ctx.session,
+                ctx.settings.endpoints.url("sec_files.company_tickers"),
+                headers=headers,
+            )
             _TICKER_INDEX.store(parse_ticker_index(payload))
         entry = _TICKER_INDEX.lookup(symbol)
         return (entry[0], entry[1]) if entry else (None, "")
@@ -422,8 +428,6 @@ __all__ = [
     "FundamentalsScanner",
     "MIN_SEC_INTERVAL_SECONDS",
     "REVENUE_CONCEPTS",
-    "SEC_FACTS_URL",
-    "SEC_TICKERS_URL",
     "TICKER_CACHE_SECONDS",
     "parse_company_facts",
     "parse_ticker_index",

@@ -289,12 +289,43 @@ the groups that change behaviour:
 | Storage | `DATA_DIR`, `HOT_DB_PATH`, `PARQUET_ROOT`, `PARQUET_COMPRESSION`, retention windows | one SQLite file + one Parquet lake |
 | R2 | `R2_ENABLED`, `R2_ENDPOINT_URL`, `R2_BUCKET`, keys, prefix | optional mirror of the cold lake |
 | Scanners | `GOPLUS_APP_KEY/SECRET`, `ETHERSCAN_API_KEY`, `LUNARCRUSH_API_KEY`, `X_BEARER_TOKEN`, `SEC_USER_AGENT`, timeouts | a missing key degrades that layer to `SKIPPED`, it does not fail the cycle |
+| Endpoints | `ENDPOINTS_FILE`, `<VENDOR>_BASE_URL`, `<VENDOR>_<NAME>_URL` | every outbound URL (host **and** path) lives in `config/endpoints.yaml`; mount that shape as a ConfigMap via `ENDPOINTS_FILE` to replace entries in bulk, or move one vendor/one endpoint from `.env`. No scanner contains a URL |
+| Explorers | `BLOCKSCOUT_EXPLORER_BASE_URL`, `BLOCKSCOUT_BASE_URL_<CHAIN>` | per-chain override for holder/transfer reads; the template covers the rest |
 | Layers | `ENABLED_LAYERS` (default: every layer routed for the instrument's asset class) | narrow globally; crypto and listed markets each keep their own manifest, and `security` cannot be switched off |
 | Alerting | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ALERT_MIN_SCORE`, `ALERT_ON_VETO` | empty credentials = alerts silently disabled |
 | Loop | `SCAN_INTERVAL_SECONDS`, `TOKEN_CONCURRENCY`, `MAINTENANCE_INTERVAL_SECONDS` | |
 
 `Settings.missing_critical()` names the keys that would make a non-demo run unusable,
 and the bot prints them instead of burning API credits on a half-configured stack.
+
+### Vendor endpoints are data
+
+Every outbound URL — host *and* path — lives in [`config/endpoints.yaml`](config/endpoints.yaml),
+one entry per vendor resource (`coingecko.contract`, `geckoterminal.pool_ohlcv`,
+`sec.company_facts`, ...). Scanner code asks for a name and never sees a URL:
+
+```python
+url = ctx.settings.endpoints.url("coingecko.contract", platform=platform, address=token.token_address)
+```
+
+A deployment can therefore redirect traffic without touching Python:
+
+```yaml
+# /etc/alphasentinel/endpoints.yaml - mounted, merged over the bundled catalogue
+coingecko:
+  base: https://coingecko-proxy.internal/api/v3
+```
+
+```bash
+ENDPOINTS_FILE=/etc/alphasentinel/endpoints.yaml   # or, for one vendor:
+COINGECKO_BASE_URL=https://coingecko-proxy.internal/api/v3
+COINGECKO_CONTRACT_URL=https://other-gateway.internal/coins/{platform}/{address}
+```
+
+Boot fails loudly (`ConfigError`) if an entry is missing its scheme/host, uses an
+unknown placeholder, or if the effective catalogue cannot satisfy a name the code
+calls (`REQUIRED_ENDPOINTS`). A test also asserts that no file under `scanners/`
+contains an `http(s)://` literal, so a hardcoded URL cannot creep back in.
 
 ---
 
@@ -339,7 +370,7 @@ writes to the repo — which is why CI can run it on every push.
 
 | File | Covers |
 | --- | --- |
-| `test_settings.py` | provider presets, `LLM_*` parsing, legacy `DEEPSEEK_*` aliases, fail-fast validation |
+| `test_settings.py` | provider presets, `LLM_*` parsing, legacy `DEEPSEEK_*` aliases, fail-fast validation, the endpoint catalogue (overrides, missing entries, no URL literals left in scanners) |
 | `test_llm_client.py` | request shaping per provider, JSON-mode/`max_tokens`/`temperature` adaptation, cost ledger, error paths |
 | `test_instruments.py` | asset classes, symbol normalisation, provider-symbol mapping, identity/venue rules |
 | `test_market_data.py` | Yahoo chart parsing (null bars, halted sessions), quote metrics, series intervals, caching |
@@ -409,15 +440,18 @@ docker compose down
 ```
 ai_engine/    LLM client (any OpenAI-compatible API), prompts, parsers, dual-agent flow, demo client
 bot/          watchlist loader (crypto + listed markets), scan engine, Telegram alerter, CLI
-config/       settings (env-driven dataclasses), watchlists.yaml
+config/       settings (env-driven dataclasses), endpoints.yaml (every vendor URL),
+              watchlists.yaml
 core/         instrument identity, models, deterministic scoring, HTTP + logging helpers
 scanners/     framework only at the root: __init__, base (layer contract),
               registry (asset_class -> layer routing), pipeline, __main__
-  crypto/       eight layers (layer1_onchain .. layer8_security) + providers/
-                (DexScreener, GeckoTerminal, GoPlus, Coinglass, LunarCrush, ...)
-  shared/       http_client (retry + per-host limit), technicals (indicator
-                maths), market_data + series (quote/candle transport), listed/
-                (generic non-crypto layers the market packages compose)
+  crypto/       eight self-contained layers (layer1_onchain .. layer8_security);
+                each layer owns the vendor clients it scores (DexScreener,
+                GeckoTerminal, GoPlus, Coinglass, LunarCrush, ...)
+  shared/       http_client (retry + per-host limit), technicals/ (analysis
+                library split into primitives, snapshot, scoring, flags),
+                market_data + series (quote/candle transport), listed/ (generic
+                non-crypto layers the market packages compose)
   equities/ etfs/ indices/ forex/ commodities/ rates/   routed market manifests
 storage/      SQLite hot store, Parquet lake (+ optional R2)
 dashboard/    Streamlit read-only UI

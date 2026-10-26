@@ -1,13 +1,10 @@
-"""Pure technical-indicator maths shared by every layer and market.
+"""Raw indicator arithmetic - the smallest auditable unit of the technical stack.
 
-No ``pandas-ta``/``TA-Lib`` dependency: the handful of indicators this system
-actually trades on are implemented here and covered by unit tests. That keeps the
-container small and the maths auditable - an indicator we cannot reason about is a
-liability in a pipeline that can veto on its output.
-
-Every function is side-effect free and returns ``None`` (never raises) when there
-is not enough history. Callers keep their own scoring; this module owns only
-arithmetic.
+Every function is pure, takes a plain ``Sequence[float]`` and returns ``None``
+rather than raising when history is short. Nothing here knows about scoring,
+vendors or asset classes, so the numbers can be pinned in isolation by
+``tests/test_technicals.py``. No ``pandas-ta``/``TA-Lib``: the handful of
+indicators this system trades on stay readable and the container stays small.
 """
 
 from __future__ import annotations
@@ -45,7 +42,7 @@ def ema(values: Sequence[float], period: int) -> float | None:
 
 
 # ---------------------------------------------------------------------------
-# Momentum / volatility
+# Momentum
 # ---------------------------------------------------------------------------
 def rsi(values: Sequence[float], period: int = 14) -> float | None:
     """Wilder's RSI. Returns ``None`` when there is not enough history."""
@@ -98,6 +95,9 @@ def macd(
     }
 
 
+# ---------------------------------------------------------------------------
+# Volatility
+# ---------------------------------------------------------------------------
 def atr(
     highs: Sequence[float],
     lows: Sequence[float],
@@ -137,11 +137,11 @@ def bollinger(values: Sequence[float], period: int = 20, mult: float = 2.0) -> d
 
 
 def zscore(values: Sequence[float], period: int = 20) -> float | None:
-    """How many standard deviations the latest value sits from its rolling mean.
+    """How many standard deviations the latest value sits from its window mean.
 
-    This is the displacement measure used to separate a real breakout from a move
-    that is already stretched: ``|z| > 2`` is statistically rare for the window,
-    whatever the price scale happens to be.
+    Scale free by construction, so it compares a 0.0001-priced memecoin with a
+    $60k bar: ``|z| > 2`` is statistically rare for the window, whatever the
+    price happens to be.
     """
     if period <= 1 or len(values) < period:
         return None
@@ -174,6 +174,7 @@ def obv(closes: Sequence[float], volumes: Sequence[float]) -> list[float]:
 
 
 def percent_change(current: float | None, previous: float | None) -> float | None:
+    """Percentage move from ``previous`` to ``current``; ``None`` without a base."""
     if current is None or previous in (None, 0):
         return None
     return (current - previous) / previous * 100.0

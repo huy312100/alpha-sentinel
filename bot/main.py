@@ -237,7 +237,7 @@ async def main(argv: list[str] | None = None) -> int:
                 return EXIT_USAGE
 
         telegram = replace(settings.telegram, chat_id="") if args.no_alerts else settings.telegram
-        alerter = TelegramAlerter(telegram, store=store)
+        alerter = TelegramAlerter(telegram, endpoints=settings.endpoints, store=store)
 
         async with ScanEngine(settings, store=store, alerter=alerter, loader=loader) as engine:
             _install_signal_handlers(engine)

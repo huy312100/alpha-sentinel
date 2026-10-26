@@ -22,6 +22,7 @@ from scanners.shared.listed import technicals as technicals_layer
 from scanners.shared.technicals import (
     atr,
     bollinger,
+    compute_indicators,
     ema,
     macd,
     obv,
@@ -164,8 +165,14 @@ class TestIndicatorMaths:
 
 
 class TestSingleImplementation:
-    def test_the_technicals_layer_reuses_the_shared_maths(self):
-        assert technicals_layer.rsi is rsi
-        assert technicals_layer.macd is macd
-        assert technicals_layer.atr is atr
-        assert technicals_layer.bollinger is bollinger
+    def test_the_technicals_layer_does_not_re_export_the_maths(self):
+        """The layer wires in the shared package instead of duplicating it.
+
+        Re-exporting ``rsi``/``macd``/``atr`` from a layer module made the layer
+        look like a second technicals implementation; the maths now has exactly one
+        home (``scanners.shared.technicals``) and the layer's public surface is its
+        scanner.
+        """
+        assert technicals_layer.compute_indicators is compute_indicators
+        for duplicated in ("rsi", "macd", "atr", "bollinger", "obv", "sma", "ema"):
+            assert not hasattr(technicals_layer, duplicated)

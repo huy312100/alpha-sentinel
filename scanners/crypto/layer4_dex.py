@@ -1,24 +1,312 @@
-"""Layer 4 - DEX microstructure: pool depth, turnover and volume spikes.
+"""Layer 4 - DEX microstructure: pool discovery, depth, turnover and volume spikes.
 
-DexScreener and GeckoTerminal are free and keyless. Both are queried once by
-:func:`scanners.crypto.providers.dex.load_market`; this layer adds a volume-spike read on top of
-that merged view instead of issuing duplicate requests.
+Layer 4 owns the token's DEX pair. Two free, keyless providers are queried once
+by :func:`load_market` and cross-checked:
+
+* **DexScreener** - best pair coverage, plus buy/sell counts per window.
+* **GeckoTerminal** - an independent liquidity/volume read, and the pool the
+  technicals layer fetches candles from.
+
+Disagreement between the two is itself a signal: if one reports 10x the liquidity
+of the other the layer returns ``DEGRADED`` instead of pretending to be precise.
+
+The layer also owns trade-tape integrity: :class:`WashTradingFilter` reads
+GeckoTerminal's recent trades and decides whether the volume behind a spike is
+real. Every other consumer (layers 2, 7, the pipeline) reads the merged pair
+through :func:`load_market`, which caches on the scan context, so a token costs
+one pair lookup per scan - not one per layer.
 """
 
 from __future__ import annotations
 
+import asyncio
 import math
+import statistics
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Mapping, Sequence
 
-from config.settings import Settings
-from scanners.shared.http_client import to_float
+import aiohttp
+
+from config.settings import EndpointSettings, Settings
 from core.instruments import AssetClass
-from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
-from scanners.base import BaseScanner, ScanContext, clamp, linear, log_scale
-from scanners.crypto.providers.dex import DexMarket, load_market
+from core.logging import get_logger
+from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, WashTradingReport, get_chain_profile
+from scanners.base import BaseScanner, ScanContext, clamp, linear, log_scale, safe_div
+from scanners.shared.http_client import request_json, to_float, to_int
+
+log = get_logger(__name__)
 
 
 MIN_LIQUIDITY_USD = 20_000.0
 MAX_LIQUIDITY_USD = 5_000_000.0
+
+
+@dataclass(slots=True)
+class DexMarket:
+    """Best-known market snapshot for a token pair."""
+
+    pair_address: str = ""
+    dex_id: str = ""
+    base_symbol: str = ""
+    quote_symbol: str = "USD"
+    price_usd: float | None = None
+    liquidity_usd: float | None = None
+    volume_24h_usd: float | None = None
+    volume_1h_usd: float | None = None
+    volume_6h_usd: float | None = None
+    fdv_usd: float | None = None
+    market_cap_usd: float | None = None
+    price_change_1h_pct: float | None = None
+    price_change_24h_pct: float | None = None
+    buys_24h: int | None = None
+    sells_24h: int | None = None
+    buys_1h: int | None = None
+    sells_1h: int | None = None
+    pair_created_at: datetime | None = None
+    sources: list[str] = field(default_factory=list)
+    gecko_liquidity_usd: float | None = None
+
+    @property
+    def turnover(self) -> float | None:
+        return safe_div(self.volume_24h_usd, self.liquidity_usd)
+
+    @property
+    def buy_ratio(self) -> float | None:
+        total = (self.buys_24h or 0) + (self.sells_24h or 0)
+        if not total:
+            return None
+        return (self.buys_24h or 0) / total
+
+    @property
+    def age_hours(self) -> float | None:
+        if self.pair_created_at is None:
+            return None
+        delta = datetime.now(timezone.utc) - self.pair_created_at
+        return max(0.0, delta.total_seconds() / 3600.0)
+
+    @property
+    def source_count(self) -> int:
+        return len(set(self.sources))
+
+    def to_metrics(self) -> dict[str, Any]:
+        return {
+            "pair_address": self.pair_address,
+            "dex": self.dex_id,
+            "price_usd": self.price_usd,
+            "liquidity_usd": self.liquidity_usd,
+            "gecko_liquidity_usd": self.gecko_liquidity_usd,
+            "volume_24h_usd": self.volume_24h_usd,
+            "volume_1h_usd": self.volume_1h_usd,
+            "turnover": round(self.turnover, 3) if self.turnover is not None else None,
+            "buy_ratio": round(self.buy_ratio, 3) if self.buy_ratio is not None else None,
+            "price_change_1h_pct": self.price_change_1h_pct,
+            "price_change_24h_pct": self.price_change_24h_pct,
+            "fdv_usd": self.fdv_usd,
+            "market_cap_usd": self.market_cap_usd,
+            "age_hours": round(self.age_hours, 1) if self.age_hours is not None else None,
+            "sources": sorted(set(self.sources)),
+        }
+
+
+def _pair_created_at(raw: Any) -> datetime | None:
+    millis = to_int(raw)
+    if millis is None or millis <= 0:
+        return None
+    return datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc)
+
+
+def market_from_dexscreener(pair: dict[str, Any]) -> DexMarket:
+    """Normalise one DexScreener pair object."""
+    txns = pair.get("txns") or {}
+    h24 = txns.get("h24") or {}
+    h1 = txns.get("h1") or {}
+    volumes = pair.get("volume") or {}
+    changes = pair.get("priceChange") or {}
+    liquidity = pair.get("liquidity") or {}
+    base = pair.get("baseToken") or {}
+    quote = pair.get("quoteToken") or {}
+    return DexMarket(
+        pair_address=str(pair.get("pairAddress") or ""),
+        dex_id=str(pair.get("dexId") or ""),
+        base_symbol=str(base.get("symbol") or ""),
+        quote_symbol=str(quote.get("symbol") or "USD"),
+        price_usd=to_float(pair.get("priceUsd")),
+        liquidity_usd=to_float(liquidity.get("usd")),
+        volume_24h_usd=to_float(volumes.get("h24")),
+        volume_1h_usd=to_float(volumes.get("h1")),
+        volume_6h_usd=to_float(volumes.get("h6")),
+        fdv_usd=to_float(pair.get("fdv")),
+        market_cap_usd=to_float(pair.get("marketCap")),
+        price_change_1h_pct=to_float(changes.get("h1")),
+        price_change_24h_pct=to_float(changes.get("h24")),
+        buys_24h=to_int(h24.get("buys")),
+        sells_24h=to_int(h24.get("sells")),
+        buys_1h=to_int(h1.get("buys")),
+        sells_1h=to_int(h1.get("sells")),
+        pair_created_at=_pair_created_at(pair.get("pairCreatedAt")),
+        sources=["dexscreener"],
+    )
+
+
+def _addresses_match(left: Any, right: str) -> bool:
+    return str(left or "").strip().lower() == str(right or "").strip().lower()
+
+
+def _pick_best_pair(pairs: list[dict[str, Any]], chain: str, token_address: str) -> dict[str, Any] | None:
+    """Prefer base-token pairs on the requested chain, then the deepest liquidity.
+
+    DexScreener returns pairs where the scanned token is *either* side. Only the
+    base side's ``priceUsd``/``baseToken``/buy-sell counts describe our token, so a
+    quote-side pool would silently substitute another asset's price.
+    """
+    if not pairs:
+        return None
+    base_pairs = [
+        pair for pair in pairs if _addresses_match((pair.get("baseToken") or {}).get("address"), token_address)
+    ]
+    if not base_pairs:
+        return None
+    chain_id = chain.lower()
+    same_chain = [pair for pair in base_pairs if str(pair.get("chainId", "")).lower() == chain_id]
+    candidates = same_chain or base_pairs
+    return max(
+        candidates,
+        key=lambda pair: to_float((pair.get("liquidity") or {}).get("usd")) or 0.0,
+    )
+
+
+async def fetch_dexscreener_market(
+    session: aiohttp.ClientSession,
+    token: TokenSnapshot,
+    *,
+    endpoints: EndpointSettings | None = None,
+) -> DexMarket | None:
+    endpoints = endpoints or EndpointSettings()
+    payload = await request_json(
+        session,
+        endpoints.url("dexscreener.token", address=token.token_address),
+    )
+    pairs = payload.get("pairs") if isinstance(payload, dict) else None
+    if not isinstance(pairs, list):
+        return None
+    best = _pick_best_pair(pairs, token.chain, token.token_address)
+    return market_from_dexscreener(best) if best else None
+
+
+def _gecko_base_address(row: Mapping[str, Any]) -> str:
+    """Extract the base-token address from a GeckoTerminal pool row (``net_0x...``)."""
+    relationships = row.get("relationships") or {}
+    data = (relationships.get("base_token") or {}).get("data") or {}
+    identifier = str(data.get("id") or "")
+    return identifier.split("_", 1)[1] if "_" in identifier else ""
+
+
+def _gecko_row_is_base(row: Any, token_address: str) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    base = _gecko_base_address(row)
+    # Older payloads omit the relationship; keep the row only when we cannot tell.
+    return not base or _addresses_match(base, token_address)
+
+
+async def fetch_gecko_market(
+    session: aiohttp.ClientSession,
+    token: TokenSnapshot,
+    *,
+    endpoints: EndpointSettings | None = None,
+    headers: dict[str, str] | None = None,
+) -> DexMarket | None:
+    network = get_chain_profile(token.chain).geckoterminal
+    payload = await request_json(
+        session,
+        (endpoints or EndpointSettings()).url(
+            "geckoterminal.token_pools", network=network, address=token.token_address
+        ),
+        headers=headers,
+    )
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return None
+    rows = [row for row in rows if _gecko_row_is_base(row, token.token_address)]
+    if not rows:
+        return None
+    best = max(rows, key=lambda row: to_float((row.get("attributes") or {}).get("reserve_in_usd")) or 0.0)
+    attrs = best.get("attributes") or {}
+    volume = attrs.get("volume_usd") or {}
+    txns = (attrs.get("transactions") or {}).get("h24") or {}
+    changes = attrs.get("price_change_percentage") or {}
+    return DexMarket(
+        pair_address=str(attrs.get("address") or ""),
+        dex_id=str(attrs.get("dex_id") or best.get("relationships", {}).get("dex", {}).get("data", {}).get("id", "")),
+        base_symbol=str(attrs.get("base_token_symbol") or ""),
+        quote_symbol=str(attrs.get("quote_token_symbol") or "USD"),
+        price_usd=to_float(attrs.get("base_token_price_usd")),
+        liquidity_usd=to_float(attrs.get("reserve_in_usd")),
+        gecko_liquidity_usd=to_float(attrs.get("reserve_in_usd")),
+        volume_24h_usd=to_float(volume.get("h24")),
+        volume_1h_usd=to_float(volume.get("h1")),
+        price_change_1h_pct=to_float(changes.get("h1")),
+        price_change_24h_pct=to_float(changes.get("h24")),
+        buys_24h=to_int(txns.get("buys")),
+        sells_24h=to_int(txns.get("sells")),
+        fdv_usd=to_float(attrs.get("fdv_usd")),
+        market_cap_usd=to_float(attrs.get("market_cap_usd")),
+        pair_created_at=_pair_created_at(attrs.get("pool_created_at")),
+        sources=["geckoterminal"],
+    )
+
+
+def merge_markets(primary: DexMarket | None, secondary: DexMarket | None) -> DexMarket | None:
+    """Keep the richer DexScreener read, fill gaps from GeckoTerminal, flag conflict."""
+    if primary is None:
+        return secondary
+    if secondary is None:
+        return primary
+    merged = primary
+    merged.sources = sorted(set(primary.sources + secondary.sources))
+    merged.gecko_liquidity_usd = secondary.liquidity_usd
+    for attr in (
+        "volume_24h_usd",
+        "volume_1h_usd",
+        "price_change_1h_pct",
+        "price_change_24h_pct",
+        "fdv_usd",
+        "market_cap_usd",
+        "buys_24h",
+        "sells_24h",
+        "pair_created_at",
+    ):
+        if getattr(merged, attr) in (None, 0, "") and getattr(secondary, attr) not in (None, 0, ""):
+            setattr(merged, attr, getattr(secondary, attr))
+    if not merged.pair_address:
+        merged.pair_address = secondary.pair_address
+    return merged
+
+
+async def load_market(token: TokenSnapshot, ctx: ScanContext) -> DexMarket | None:
+    """Fetch both providers once per token and cache the merged view in the context."""
+    cached = ctx.get_shared("market")
+    if isinstance(cached, DexMarket):
+        return cached
+
+    results = await asyncio.gather(
+        fetch_dexscreener_market(ctx.session, token, endpoints=ctx.settings.endpoints),
+        fetch_gecko_market(ctx.session, token, endpoints=ctx.settings.endpoints),
+        return_exceptions=True,
+    )
+    markets: list[DexMarket] = []
+    for result in results:
+        if isinstance(result, DexMarket):
+            markets.append(result)
+        elif isinstance(result, Exception):
+            log.debug("dex_provider_failed", extra={"token": token.token_address, "error": str(result)[:200]})
+    primary = next((market for market in markets if "dexscreener" in market.sources), None)
+    secondary = next((market for market in markets if "geckoterminal" in market.sources), None)
+    merged = merge_markets(primary, secondary)
+    if merged is not None:
+        ctx.set_shared("market", merged)
+    return merged
 
 
 def volume_spike_ratio(market: DexMarket) -> float | None:
@@ -137,14 +425,272 @@ class CryptoDexScanner(BaseScanner):
         )
 
 
+# -- trade-tape integrity ----------------------------------------------------
+
+
+WASH_SUSPICION_THRESHOLD = 85.0
+MIN_TRADES_FOR_VERDICT = 30
+
+# Wallets trading within this window, in alternating directions, look like churn.
+SELF_TRADE_WINDOW_SECONDS = 120
+
+
+def _epoch_seconds(raw: Any) -> float | None:
+    """Parse GeckoTerminal's ISO-8601 ``block_timestamp`` (or an epoch number).
+
+    ``to_float`` returns ``None`` for ``2026-10-25T12:00:00Z``; treating that as
+    ``0.0`` made every trade look simultaneous and inflated the self-trading score.
+    """
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    text = str(raw).strip()
+    if not text:
+        return None
+    numeric = to_float(text)
+    if numeric is not None:
+        return numeric
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def parse_trades(payload: Any) -> list[dict[str, Any]]:
+    """Normalise GeckoTerminal's trade tape into wallet/side/notional rows.
+
+    One parser for both consumers: the wash-trading filter (layer 4) and the
+    order-flow imbalance read (layer 7). ``_parse_trades`` is kept as an alias for
+    older imports.
+    """
+    data = (payload or {}).get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+    trades: list[dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        attrs = row.get("attributes") or {}
+        volume = to_float(attrs.get("volume_in_usd"))
+        if volume is None or volume <= 0:
+            continue
+        trades.append(
+            {
+                "wallet": str(attrs.get("tx_from_address") or "unknown").lower(),
+                "kind": str(attrs.get("kind") or "").lower(),
+                "volume_usd": volume,
+                "timestamp": _epoch_seconds(attrs.get("block_timestamp")),
+                "tx_hash": str(attrs.get("tx_hash") or ""),
+            }
+        )
+    return trades
+
+
+_parse_trades = parse_trades
+
+
+def is_round_amount(volume: float) -> bool:
+    """Heuristic: trade sizes that land on clean multiples are usually scripts."""
+    if volume <= 0:
+        return False
+    for step in (1_000.0, 500.0, 100.0, 50.0, 10.0):
+        if volume >= step and abs(volume % step) < 0.01:
+            return True
+    return False
+
+
+def wallet_concentration(trades: Sequence[dict[str, Any]]) -> float:
+    """Share of total volume produced by the top 3 wallets (0-1)."""
+    total = sum(trade["volume_usd"] for trade in trades)
+    if total <= 0:
+        return 0.0
+    by_wallet: dict[str, float] = {}
+    for trade in trades:
+        by_wallet[trade["wallet"]] = by_wallet.get(trade["wallet"], 0.0) + trade["volume_usd"]
+    top = sorted(by_wallet.values(), reverse=True)[:3]
+    return min(1.0, sum(top) / total)
+
+
+def self_trade_share(trades: Sequence[dict[str, Any]], window: int = SELF_TRADE_WINDOW_SECONDS) -> float:
+    """Fraction of timestamped trades that alternate direction on one wallet."""
+    timed = [trade for trade in trades if trade.get("timestamp") is not None]
+    if len(timed) < 2:
+        return 0.0
+    ordered = sorted(timed, key=lambda trade: trade["timestamp"])
+    last_seen: dict[str, tuple[str, float]] = {}
+    flagged = 0
+    for trade in ordered:
+        wallet = trade["wallet"]
+        previous = last_seen.get(wallet)
+        if previous is not None:
+            previous_kind, previous_ts = previous
+            if previous_kind and previous_kind != trade["kind"] and abs(trade["timestamp"] - previous_ts) <= window:
+                flagged += 1
+        last_seen[wallet] = (trade["kind"], trade["timestamp"])
+    return flagged / len(ordered)
+
+
+def buy_sell_imbalance(trades: Sequence[dict[str, Any]]) -> float:
+    """``|buy - sell| / total`` - near zero despite heavy volume is suspicious churn."""
+    buys = sum(trade["volume_usd"] for trade in trades if trade["kind"] == "buy")
+    sells = sum(trade["volume_usd"] for trade in trades if trade["kind"] == "sell")
+    total = buys + sells
+    return abs(buys - sells) / total if total > 0 else 0.0
+
+
+def analyse_trades(trades: Sequence[dict[str, Any]]) -> WashTradingReport:
+    """Turn a trade tape into a scored report. Pure function - easy to unit test."""
+    if not trades:
+        return WashTradingReport(evaluated=False, flags=["no_trade_tape"])
+
+    volumes = [trade["volume_usd"] for trade in trades]
+    wallets = {trade["wallet"] for trade in trades}
+    unique_ratio = len(wallets) / len(trades)
+    round_ratio = sum(1 for volume in volumes if is_round_amount(volume)) / len(volumes)
+    self_ratio = self_trade_share(trades)
+    imbalance = buy_sell_imbalance(trades)
+    concentration = wallet_concentration(trades)
+
+    flags: list[str] = []
+    score = 0.0
+    # Each signal is bounded; none of them alone can condemn a token.
+    if len(trades) >= MIN_TRADES_FOR_VERDICT:
+        if unique_ratio < 0.2:
+            flags.append("few_wallets_many_trades")
+            score += 30.0
+        elif unique_ratio < 0.35:
+            flags.append("low_wallet_diversity")
+            score += 15.0
+        if concentration > 0.7:
+            flags.append("top3_wallets_dominate_volume")
+            score += 25.0
+        elif concentration > 0.5:
+            flags.append("top3_wallets_majority_volume")
+            score += 12.0
+        if round_ratio > 0.5:
+            flags.append("repeated_round_trade_sizes")
+            score += 20.0
+        elif round_ratio > 0.3:
+            flags.append("many_round_trade_sizes")
+            score += 10.0
+        if self_ratio > 0.25:
+            flags.append("rapid_self_trading")
+            score += 25.0
+        elif self_ratio > 0.12:
+            flags.append("some_self_trading")
+            score += 12.0
+        if imbalance < 0.05 and len(trades) > 100:
+            flags.append("balanced_churn_no_net_flow")
+            score += 10.0
+    else:
+        flags.append("thin_trade_tape")
+        score += 10.0
+
+    return WashTradingReport(
+        suspicion_score=round(clamp(score), 2),
+        trade_count=len(trades),
+        unique_wallets=len(wallets),
+        avg_trade_usd=round(sum(volumes) / len(volumes), 2),
+        median_trade_usd=round(statistics.median(volumes), 2),
+        unique_wallet_ratio=round(unique_ratio, 4),
+        round_amount_ratio=round(round_ratio, 4),
+        self_trade_ratio=round(self_ratio, 4),
+        buy_sell_imbalance=round(imbalance, 4),
+        flags=flags,
+        metrics={
+            "top3_wallet_volume_share": round(concentration, 4),
+            "tape_volume_usd": round(sum(volumes), 2),
+        },
+        evaluated=True,
+    )
+
+
+async def fetch_pool_trades(
+    token: TokenSnapshot,
+    ctx: ScanContext,
+    pool: str,
+    *,
+    min_volume_usd: float = 0.0,
+) -> list[dict[str, Any]]:
+    """One GeckoTerminal trade-tape read, normalised through :func:`parse_trades`.
+
+    Both consumers go through here: the wash filter wants every print
+    (``min_volume_usd=0``), layer 7 wants the meaningful ones. That keeps the
+    endpoint, its parameters and the payload shape in one place.
+    """
+    network = get_chain_profile(token.chain).geckoterminal
+    payload = await request_json(
+        ctx.session,
+        ctx.settings.endpoints.url("geckoterminal.pool_trades", network=network, pool=pool),
+        params={"trade_volume_in_usd_greater_than": min_volume_usd},
+    )
+    return parse_trades(payload)
+
+
+async def fetch_wash_report(token: TokenSnapshot, ctx: ScanContext, pool: str) -> WashTradingReport:
+    return analyse_trades(await fetch_pool_trades(token, ctx, pool))
+
+
+class WashTradingFilter:
+    """Thin adapter so the pipeline can call ``await wash.evaluate(...)``."""
+
+    def __init__(self, threshold: float = WASH_SUSPICION_THRESHOLD) -> None:
+        self.threshold = threshold
+
+    def is_compromised(self, report: WashTradingReport) -> bool:
+        return report.evaluated and report.suspicion_score >= self.threshold
+
+    async def evaluate(self, token: TokenSnapshot, ctx: ScanContext, pool: str | None) -> WashTradingReport:
+        if not pool:
+            return WashTradingReport(evaluated=False, flags=["no_pool_address"])
+        try:
+            report = await fetch_wash_report(token, ctx, pool)
+        except Exception as exc:  # noqa: BLE001 - an unreachable tape is not evidence
+            log.debug("wash_tape_failed", extra={"token": token.token_address, "error": str(exc)[:200]})
+            return WashTradingReport(evaluated=False, flags=["trade_tape_unavailable"])
+        if self.is_compromised(report):
+            log.warning(
+                "wash_trading_suspected",
+                extra={
+                    "token": token.token_address,
+                    "suspicion": report.suspicion_score,
+                    "flags": report.flags,
+                },
+            )
+        return report
+
+
 def build_scanner(settings: Settings) -> CryptoDexScanner:
     return CryptoDexScanner(settings)
 
 
 __all__ = [
-    "CryptoDexScanner",
+    "DexMarket",
+    "MAX_LIQUIDITY_USD",
     "MIN_LIQUIDITY_USD",
+    "MIN_TRADES_FOR_VERDICT",
+    "SELF_TRADE_WINDOW_SECONDS",
+    "WASH_SUSPICION_THRESHOLD",
+    "WashTradingFilter",
+    "CryptoDexScanner",
+    "analyse_trades",
     "build_scanner",
+    "buy_sell_imbalance",
+    "fetch_dexscreener_market",
+    "fetch_gecko_market",
+    "fetch_pool_trades",
+    "fetch_wash_report",
+    "is_round_amount",
     "liquidity_conflict",
+    "load_market",
+    "market_from_dexscreener",
+    "merge_markets",
+    "parse_trades",
+    "self_trade_share",
     "volume_spike_ratio",
+    "wallet_concentration",
 ]

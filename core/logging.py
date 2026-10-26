@@ -3,7 +3,8 @@
 Every log line is JSON so it can be shipped to Loki/CloudWatch/Datadog without a
 parser. A filter walks the *rendered* message and replaces any registered secret
 with ``***REDACTED***`` - defence in depth against the classic
-``logger.info("calling %s", settings.telegram.api_base)`` leak.
+``logger.info("calling %s", settings.endpoints.url("telegram.send_message", ...))``
+leak.
 """
 
 from __future__ import annotations

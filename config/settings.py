@@ -22,13 +22,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from config.endpoints import (
+    BLOCKSCOUT_CHAINS,
+    REQUIRED_ENDPOINTS,
+    EndpointSettings,
+    load_endpoint_settings,
+)
+from config.errors import ConfigError
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ENV_TRUE = {"1", "true", "yes", "y", "on"}
 _ENV_FALSE = {"0", "false", "no", "n", "off", ""}
-
-
-class ConfigError(RuntimeError):
-    """Raised when the environment cannot be parsed into a valid configuration."""
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +294,8 @@ class StorageSettings:
 
 @dataclass(frozen=True, slots=True)
 class GoPlusSettings:
-    base_url: str = "https://api.gopluslabs.io"
+    """GoPlus credentials; its endpoint URL lives in the endpoint catalogue."""
+
     app_key: SecretStr = SecretStr()
     app_secret: SecretStr = SecretStr()
     timeout_seconds: float = 15.0
@@ -332,8 +337,6 @@ class ProviderSettings:
     #: Optional JSON calendar for unlock/vesting/mainnet-upgrade events. Teams can
     #: point this at TokenUnlocks, an internal sheet export or their own service.
     tokenomics_calendar_url: str = ""
-    hyperliquid_base_url: str = "https://api.hyperliquid.xyz"
-    honeypot_base_url: str = "https://api.honeypot.is"
 
     def configured_sources(self) -> tuple[str, ...]:
         """Names only - never values - for boot logs and ``/status``."""
@@ -360,10 +363,6 @@ class TelegramSettings:
 
     def is_configured(self) -> bool:
         return self.bot_token.is_configured() and bool(self.chat_id)
-
-    @property
-    def api_base(self) -> str:
-        return f"https://api.telegram.org/bot{self.bot_token.get_secret_value()}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +401,7 @@ class Settings:
     goplus: GoPlusSettings = GoPlusSettings()
     social: SocialSettings = SocialSettings()
     providers: ProviderSettings = ProviderSettings()
+    endpoints: EndpointSettings = EndpointSettings()
     telegram: TelegramSettings = TelegramSettings()
     scanners: ScannerSettings = ScannerSettings()
     thresholds: ThresholdSettings = ThresholdSettings()
@@ -434,6 +434,13 @@ class Settings:
                 "unknown ENABLED_LAYERS slug(s): "
                 + ", ".join(sorted(unknown_layers))
                 + f"; expected one of: {', '.join(DEFAULT_ENABLED_LAYERS)}"
+            )
+        missing_endpoints = [name for name in REQUIRED_ENDPOINTS if not self.endpoints.has(name)]
+        if missing_endpoints:
+            problems.append(
+                "endpoint catalogue is missing: "
+                + ", ".join(missing_endpoints)
+                + " (add them to config/endpoints.yaml or the file mounted at ENDPOINTS_FILE)"
             )
         return problems
 
@@ -528,7 +535,6 @@ class Settings:
         )
 
         goplus = GoPlusSettings(
-            base_url=_env_str(env, "GOPLUS_BASE_URL", "https://api.gopluslabs.io").rstrip("/"),
             app_key=_env_secret(env, "GOPLUS_APP_KEY"),
             app_secret=_env_secret(env, "GOPLUS_APP_SECRET"),
         )
@@ -546,11 +552,9 @@ class Settings:
             coinglass_api_key=_env_secret(env, "COINGLASS_API_KEY"),
             cryptopanic_token=_env_secret(env, "CRYPTOPANIC_TOKEN"),
             tokenomics_calendar_url=_env_str(env, "TOKENOMICS_CALENDAR_URL", ""),
-            hyperliquid_base_url=_env_str(
-                env, "HYPERLIQUID_BASE_URL", "https://api.hyperliquid.xyz"
-            ).rstrip("/"),
-            honeypot_base_url=_env_str(env, "HONEYPOT_BASE_URL", "https://api.honeypot.is").rstrip("/"),
         )
+
+        endpoints = load_endpoint_settings(env, default_chain=runtime.default_chain)
 
         telegram = TelegramSettings(
             bot_token=_env_secret(env, "TELEGRAM_BOT_TOKEN"),
@@ -583,6 +587,7 @@ class Settings:
             goplus=goplus,
             social=social,
             providers=providers,
+            endpoints=endpoints,
             telegram=telegram,
             scanners=scanners,
             thresholds=thresholds,
@@ -716,8 +721,10 @@ def iter_secret_values(settings: Settings) -> Iterable[str]:
 
 
 __all__ = [
+    "BLOCKSCOUT_CHAINS",
     "ConfigError",
     "DEFAULT_LLM_PROVIDER",
+    "EndpointSettings",
     "GoPlusSettings",
     "LEGACY_LAYER_ALIASES",
     "LLM_PROVIDER_PRESETS",

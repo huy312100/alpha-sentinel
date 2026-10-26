@@ -153,7 +153,9 @@ class ScanEngine:
         )
         self.pipeline = pipeline
         self.audit = audit
-        self.alerter = alerter or TelegramAlerter(settings.telegram, store=self.store)
+        self.alerter = alerter or TelegramAlerter(
+            settings.telegram, endpoints=settings.endpoints, store=self.store
+        )
         self.loader = loader or WatchlistLoader(
             settings.scanners.watchlist_path, default_chain=settings.runtime.default_chain
         )

@@ -25,6 +25,7 @@ from urllib.parse import quote as url_quote
 
 import aiohttp
 
+from config.settings import EndpointSettings
 from core.http import request_json, to_float
 from core.instruments import (
     AssetClass,
@@ -33,7 +34,6 @@ from core.instruments import (
 )
 from core.models import TokenSnapshot
 
-YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 DEFAULT_RANGE = "1y"
 DEFAULT_INTERVAL = "1d"
 #: Trading days per year used to annualise volatility from daily bars.
@@ -202,17 +202,30 @@ def parse_yahoo_chart(
     return quote, series
 
 
+def endpoints_for(ctx: Any) -> EndpointSettings:
+    """Configured vendor hosts for this scan.
+
+    ``ScanContext`` always carries them; a test that fakes the context with only a
+    ``session`` gets the canonical defaults instead of an ``AttributeError``.
+    """
+    settings = getattr(ctx, "settings", None)
+    return getattr(settings, "endpoints", None) or EndpointSettings()
+
+
 async def fetch_yahoo_chart(
     session: aiohttp.ClientSession,
     provider_symbol: str,
     *,
+    endpoints: EndpointSettings | None = None,
     range_: str = DEFAULT_RANGE,
     interval: str = DEFAULT_INTERVAL,
 ) -> tuple[MarketQuote, dict[str, list[float]]]:
     """Fetch one instrument's chart and normalise it."""
     if not provider_symbol:
         raise ValueError("provider symbol is empty")
-    url = YAHOO_CHART_URL.format(symbol=url_quote(provider_symbol, safe=""))
+    url = (endpoints or EndpointSettings()).url(
+        "yahoo.chart", symbol=url_quote(provider_symbol, safe="")
+    )
     payload = await request_json(
         session,
         url,
@@ -236,7 +249,13 @@ async def load_market_series(
     cached = ctx.get_shared(cache_key)
     if cached is not None:
         return cached
-    result = await fetch_yahoo_chart(ctx.session, provider_symbol, range_=range_, interval=interval)
+    result = await fetch_yahoo_chart(
+        ctx.session,
+        provider_symbol,
+        endpoints=endpoints_for(ctx),
+        range_=range_,
+        interval=interval,
+    )
     ctx.set_shared(cache_key, result)
     return result
 
@@ -252,7 +271,7 @@ __all__ = [
     "DEFAULT_INTERVAL",
     "DEFAULT_RANGE",
     "MarketQuote",
-    "YAHOO_CHART_URL",
+    "endpoints_for",
     "fetch_yahoo_chart",
     "load_market_series",
     "load_quote",

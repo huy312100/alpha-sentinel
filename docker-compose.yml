@@ -17,6 +17,9 @@ x-service: &service
   volumes:
     - ./data:/app/data
     - ./config/watchlists.yaml:/app/config/watchlists.yaml:ro
+    # Optional: mount an endpoint catalogue overlay (the ConfigMap equivalent)
+    # and point ENDPOINTS_FILE at it; entries merge over config/endpoints.yaml.
+    # - ./config/endpoints.local.yaml:/etc/alphasentinel/endpoints.yaml:ro
   environment:
     DATA_DIR: /app/data
     HOT_DB_PATH: /app/data/hot/alpha_sentinel.db
