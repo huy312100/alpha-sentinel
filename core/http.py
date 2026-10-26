@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 import aiohttp
 
-from core.logging import get_logger
+from core.logging import get_logger, scrub_url_params
 from core.models import utcnow
 
 log = get_logger(__name__)
@@ -98,7 +98,13 @@ async def request_json(
             delay = backoff ** attempt + random.uniform(0, 0.3)
             log.warning(
                 "http_retry",
-                extra={"url": url, "attempt": attempt + 1, "delay_s": round(delay, 2), "error": str(exc)[:200]},
+                extra={
+                    "url": url,
+                    "attempt": attempt + 1,
+                    "delay_s": round(delay, 2),
+                    # ``aiohttp`` puts the real URL (query included) in ``str(exc)``.
+                    "error": scrub_url_params(str(exc))[:200],
+                },
             )
             await asyncio.sleep(delay)
     assert last_error is not None

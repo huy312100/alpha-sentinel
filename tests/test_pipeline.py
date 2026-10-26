@@ -8,13 +8,13 @@ import pytest
 
 from config.settings import DEFAULT_ENABLED_LAYERS, ScannerSettings, Settings
 from core.instruments import AssetClass, InstrumentError
-from core.models import Layer, TokenSnapshot
+from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext
-from scanners.dex import DexScanner
-from scanners.fundamentals import FundamentalsScanner
-from scanners.market import MarketScanner
-from scanners.market_data import MarketQuote
+from scanners.crypto.layer4_dex import CryptoDexScanner
 from scanners.pipeline import SCANNER_REGISTRY, ScanPipeline
+from scanners.shared.listed.fundamentals import FundamentalsScanner
+from scanners.shared.listed.market import MarketScanner
+from scanners.shared.market_data import MarketQuote
 
 
 def snapshot(asset_class: str = "crypto", **overrides) -> TokenSnapshot:
@@ -25,6 +25,17 @@ def snapshot(asset_class: str = "crypto", **overrides) -> TokenSnapshot:
     defaults["asset_class"] = asset_class
     defaults.update(overrides)
     return TokenSnapshot(**defaults)
+
+
+def signal(
+    layer: str,
+    status: SignalStatus,
+    *,
+    error: str | None = None,
+    original_status: str | None = None,
+) -> LayerSignal:
+    metrics = {"original_status": original_status} if original_status else {}
+    return LayerSignal(layer=Layer(layer), status=status, error=error, metrics=metrics)
 
 
 class TestRegistry:
@@ -57,7 +68,7 @@ class TestRegistry:
 class TestGating:
     @pytest.mark.parametrize("asset_class", ["equity", "etf", "index", "fx", "commodity", "rate"])
     def test_crypto_only_scanners_skip_listed_instruments(self, settings, asset_class):
-        assert not DexScanner(settings).supports(snapshot(asset_class))
+        assert not CryptoDexScanner(settings).supports(snapshot(asset_class))
 
     def test_market_scanner_supports_every_listed_class(self, settings):
         scanner = MarketScanner(settings)
@@ -71,7 +82,7 @@ class TestGating:
         assert not scanner.supports(snapshot("etf"))
 
     async def test_unsupported_run_is_a_zero_weight_skip(self, settings):
-        signal = await DexScanner(settings).run(snapshot("equity"), ScanContext(session=None, settings=settings))
+        signal = await CryptoDexScanner(settings).run(snapshot("equity"), ScanContext(session=None, settings=settings))
         assert signal.status.value == "skipped"
         assert signal.weight == 0.0
         assert signal.confidence == 0.0
@@ -81,13 +92,13 @@ class TestGating:
         assert not MarketScanner(settings).supports(snapshot("martian"))
 
     async def test_missing_price_series_is_a_skip_not_a_failure(self, settings, monkeypatch):
-        from scanners.series import SeriesUnavailable
-        from scanners.technicals import TechnicalsScanner
+        from scanners.shared.listed.technicals import TechnicalsScanner
+        from scanners.shared.series import SeriesUnavailable
 
         async def boom(token, ctx):
             raise SeriesUnavailable("no pool address available for OHLCV")
 
-        monkeypatch.setattr("scanners.technicals.load_price_series", boom)
+        monkeypatch.setattr("scanners.shared.listed.technicals.load_price_series", boom)
         signal = await TechnicalsScanner(settings).collect(snapshot("crypto"), ScanContext(None, settings))
         assert signal.status.value == "skipped"
         assert "no pool" in signal.summary
@@ -154,61 +165,89 @@ class TestCliTarget:
 
 
 class TestMacroCache:
-    async def test_prefetch_fetches_each_market_once(self, settings, monkeypatch):
+    async def test_prefetch_fetches_the_cross_asset_backdrop_once(self, settings, monkeypatch):
         calls: list[str] = []
 
-        async def fake_crypto(session):
-            calls.append("crypto")
-            return {"market_cap_change_24h_pct": 1.5, "btc_dominance": 51.0, "fear_greed": 55.0}
-
-        async def fake_cross(session):
+        async def fake_cross(session, **_):
             calls.append("cross_asset")
             return {"vix": {"level": 15.0, "change_5d_pct": -2.0}}
 
-        monkeypatch.setattr("scanners.pipeline.fetch_crypto_backdrop", fake_crypto)
         monkeypatch.setattr("scanners.pipeline.fetch_cross_asset_backdrop", fake_cross)
         pipeline = ScanPipeline(settings)
 
-        await pipeline._prefetch_macro([snapshot("crypto"), snapshot("crypto")])
-        await pipeline._prefetch_macro([snapshot("crypto")])
+        await pipeline._prefetch_macro([snapshot("equity"), snapshot("equity")])
         await pipeline._prefetch_macro([snapshot("equity")])
 
-        assert calls == ["crypto", "cross_asset"]
+        assert calls == ["cross_asset"]
 
-    async def test_unusable_macro_data_is_not_cached(self, settings, monkeypatch):
-        async def empty_crypto(session):
-            return {"market_cap_change_24h_pct": None, "btc_dominance": None, "fear_greed": None}
+    async def test_a_crypto_only_batch_never_fetches_a_backdrop(self, settings, monkeypatch):
+        async def boom(session, **_):  # pragma: no cover - must never be called
+            raise AssertionError("no crypto layer reads the macro backdrop")
 
-        monkeypatch.setattr("scanners.pipeline.fetch_crypto_backdrop", empty_crypto)
+        monkeypatch.setattr("scanners.pipeline.fetch_cross_asset_backdrop", boom)
         pipeline = ScanPipeline(settings)
 
-        await pipeline._prefetch_macro([snapshot("crypto")])
+        await pipeline._prefetch_macro([snapshot("crypto"), snapshot("crypto")])
+
+        assert pipeline._macro_cache == {}
+
+    async def test_unusable_macro_data_is_not_cached(self, settings, monkeypatch):
+        async def empty_cross(session, **_):
+            return {"vix": {"level": None, "change_5d_pct": None}}
+
+        monkeypatch.setattr("scanners.pipeline.fetch_cross_asset_backdrop", empty_cross)
+        pipeline = ScanPipeline(settings)
+
+        await pipeline._prefetch_macro([snapshot("equity")])
 
         assert pipeline._macro_cache == {}
 
     async def test_a_stale_entry_is_refetched(self, settings, monkeypatch):
         import time
 
-        from scanners.macro import CRYPTO_CACHE_KEY
         from scanners.pipeline import MACRO_CACHE_TTL_SECONDS
+        from scanners.shared.listed.macro import CROSS_ASSET_CACHE_KEY
 
         calls: list[str] = []
 
-        async def fake_crypto(session):
-            calls.append("crypto")
-            return {"market_cap_change_24h_pct": 2.0}
+        async def fake_cross(session, **_):
+            calls.append("cross_asset")
+            return {"vix": {"level": 15.0, "change_5d_pct": -2.0}}
 
-        monkeypatch.setattr("scanners.pipeline.fetch_crypto_backdrop", fake_crypto)
+        monkeypatch.setattr("scanners.pipeline.fetch_cross_asset_backdrop", fake_cross)
         pipeline = ScanPipeline(settings)
-        pipeline._macro_cache[CRYPTO_CACHE_KEY] = (
+        pipeline._macro_cache[CROSS_ASSET_CACHE_KEY] = (
             time.monotonic() - MACRO_CACHE_TTL_SECONDS - 1.0,
-            {"market_cap_change_24h_pct": 9.0},
+            {"vix": {"level": 9.0}},
         )
 
-        await pipeline._prefetch_macro([snapshot("crypto")])
+        await pipeline._prefetch_macro([snapshot("equity")])
 
-        assert calls == ["crypto"]
-        assert pipeline._macro_cache[CRYPTO_CACHE_KEY][1]["market_cap_change_24h_pct"] == 2.0
+        assert calls == ["cross_asset"]
+        assert pipeline._macro_cache[CROSS_ASSET_CACHE_KEY][1]["vix"]["level"] == 15.0
+
+
+class TestScannerHealth:
+    def test_a_folded_outage_is_still_an_outage(self):
+        """``run_isolated`` reports SKIPPED; health must not lose the provider failure."""
+        from scanners.pipeline import ScannerHealth
+
+        health = ScannerHealth("derivatives")
+        health.record(signal("derivatives", SignalStatus.OK))
+        health.record(
+            signal(
+                "derivatives",
+                SignalStatus.SKIPPED,
+                error="HTTP 503 from hyperliquid",
+                original_status="unavailable",
+            )
+        )
+        health.record(signal("derivatives", SignalStatus.SKIPPED))
+
+        assert (health.runs, health.ok, health.skipped) == (3, 1, 1)
+        assert health.unavailable == 1
+        assert health.last_error == "HTTP 503 from hyperliquid"
+        assert health.success_rate == pytest.approx(1 / 3, abs=1e-3)
 
 
 class TestBaseScannerContract:

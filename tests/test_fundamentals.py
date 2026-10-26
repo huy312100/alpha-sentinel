@@ -7,7 +7,7 @@ import pytest
 from core.instruments import AssetClass
 from core.models import TokenSnapshot
 from scanners.base import ScanContext
-from scanners.fundamentals import (
+from scanners.shared.listed.fundamentals import (
     Fundamentals,
     FundamentalsScanner,
     parse_company_facts,

@@ -17,7 +17,7 @@ from __future__ import annotations
 from core.instruments import AssetClass
 from core.models import Layer, SignalStatus, LayerSignal, TokenSnapshot, clamp
 from scanners.base import BaseScanner, ScanContext, linear, log_scale
-from scanners.market_data import load_market_series
+from scanners.shared.market_data import load_market_series
 
 #: Venues where less than a million dollars a day cannot absorb a real position.
 MIN_LIQUID_DOLLAR_VOLUME = 1_000_000.0

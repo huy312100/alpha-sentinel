@@ -18,14 +18,12 @@ import asyncio
 from typing import Any, Mapping
 from urllib.parse import quote as url_quote
 
+from config.settings import EndpointSettings
 from core.http import request_json, to_float
 from core.instruments import AssetClass
 from core.models import Layer, SignalStatus, LayerSignal, TokenSnapshot
 from scanners.base import BaseScanner, ScanContext, clamp, linear, safe_div
-from scanners.market_data import YAHOO_CHART_URL, parse_yahoo_chart
-
-COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
-FEAR_GREED_URL = "https://api.alternative.me/fng/"
+from scanners.shared.market_data import parse_yahoo_chart
 
 #: Cross-asset dashboard used for non-crypto instruments. All keyless on Yahoo.
 CROSS_ASSET_SYMBOLS: dict[str, str] = {
@@ -137,11 +135,20 @@ def cross_asset_usable(metrics: Mapping[str, Any]) -> bool:
     return cross_asset_score(metrics)[2] > 0
 
 
-async def fetch_crypto_backdrop(session: Any) -> dict[str, Any]:
+async def fetch_crypto_backdrop(
+    session: Any,
+    *,
+    endpoints: EndpointSettings | None = None,
+) -> dict[str, Any]:
     """Fetch the crypto market-wide read once (CoinGecko global + Fear & Greed)."""
+    endpoints = endpoints or EndpointSettings()
     global_payload, fng_payload = await asyncio.gather(
-        request_json(session, COINGECKO_GLOBAL_URL),
-        request_json(session, FEAR_GREED_URL, params={"limit": 2}),
+        request_json(session, endpoints.url("coingecko.global")),
+        request_json(
+            session,
+            endpoints.url("fear_greed.index"),
+            params={"limit": 2},
+        ),
         return_exceptions=True,
     )
     metrics = parse_global(None if isinstance(global_payload, Exception) else global_payload)
@@ -150,13 +157,18 @@ async def fetch_crypto_backdrop(session: Any) -> dict[str, Any]:
     return metrics
 
 
-async def fetch_cross_asset_backdrop(session: Any) -> dict[str, Any]:
+async def fetch_cross_asset_backdrop(
+    session: Any,
+    *,
+    endpoints: EndpointSettings | None = None,
+) -> dict[str, Any]:
     """Fetch the VIX/dollar/yields/S&P tape once for every listed instrument."""
+    endpoints = endpoints or EndpointSettings()
     payloads = await asyncio.gather(
         *(
             request_json(
                 session,
-                YAHOO_CHART_URL.format(symbol=url_quote(symbol, safe="")),
+                endpoints.url("yahoo.chart", symbol=url_quote(symbol, safe="")),
                 params={"range": "3mo", "interval": "1d", "includePrePost": "false"},
             )
             for symbol in CROSS_ASSET_SYMBOLS.values()
@@ -235,7 +247,7 @@ class MacroScanner(BaseScanner):
         cached = ctx.get_shared(CRYPTO_CACHE_KEY)
         if not isinstance(cached, dict):
             try:
-                cached = await fetch_crypto_backdrop(ctx.session)
+                cached = await fetch_crypto_backdrop(ctx.session, endpoints=ctx.settings.endpoints)
             except Exception:  # noqa: BLE001 - an unreachable backdrop is not a token failure
                 cached = {}
             # Never cache a failed read: a later instrument would inherit the gap.
@@ -294,7 +306,7 @@ class MacroScanner(BaseScanner):
         cached = ctx.get_shared(CROSS_ASSET_CACHE_KEY)
         if not isinstance(cached, dict):
             try:
-                cached = await fetch_cross_asset_backdrop(ctx.session)
+                cached = await fetch_cross_asset_backdrop(ctx.session, endpoints=ctx.settings.endpoints)
             except Exception:  # noqa: BLE001 - degrade to UNAVAILABLE, never crash the layer
                 cached = {}
             if cross_asset_usable(cached):
@@ -330,11 +342,9 @@ class MacroScanner(BaseScanner):
 
 
 __all__ = [
-    "COINGECKO_GLOBAL_URL",
     "CROSS_ASSET_CACHE_KEY",
     "CROSS_ASSET_SYMBOLS",
     "CRYPTO_CACHE_KEY",
-    "FEAR_GREED_URL",
     "MacroScanner",
     "cross_asset_score",
     "cross_asset_usable",

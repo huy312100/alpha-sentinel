@@ -24,48 +24,32 @@ from config.settings import Settings
 from core.http import build_session
 from core.instruments import AssetClass
 from core.logging import get_logger
-from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, json_safe, utcnow
+from core.models import LayerSignal, SignalStatus, TokenSnapshot, json_safe, utcnow
 from core.scoring import weighted_prior
-from scanners.airdrop import AirdropScanner
 from scanners.base import BaseScanner, ScanContext
-from scanners.derivatives import DerivativesScanner
-from scanners.dex import DexMarket, DexScanner, load_market
-from scanners.fundamentals import FundamentalsScanner
-from scanners.macro import (
-    CRYPTO_CACHE_KEY,
-    CROSS_ASSET_CACHE_KEY,
-    MacroScanner,
-    cross_asset_usable,
-    crypto_backdrop_usable,
-    fetch_cross_asset_backdrop,
-    fetch_crypto_backdrop,
+from scanners.crypto.layer4_dex import DexMarket, WashTradingFilter, load_market
+from scanners.crypto.layer8_security import fetch_security_report
+from scanners.registry import (
+    ASSET_LAYER_MAP,
+    SCANNER_REGISTRY,
+    build_scanners,
+    run_isolated,
+    validate_enabled,
 )
-from scanners.market import MarketScanner
-from scanners.market_data import MarketQuote, load_quote
-from scanners.onchain import OnChainScanner
-from scanners.security import SecurityScanner
-from scanners.social import SocialScanner
-from scanners.technicals import TechnicalsScanner
-from scanners.wash import WashTradingFilter
+from scanners.shared.listed.macro import (
+    CROSS_ASSET_CACHE_KEY,
+    cross_asset_usable,
+    fetch_cross_asset_backdrop,
+)
+from scanners.shared.market_data import MarketQuote, load_quote
+
 
 log = get_logger(__name__)
+
 
 #: Market-wide reads are shared across a daemon's cycles, but not forever: a
 #: stale macro backdrop silently biases every instrument in the next run.
 MACRO_CACHE_TTL_SECONDS = 300.0
-
-#: Layer slug (as used in ``SCANNER_LAYERS``) -> implementation.
-SCANNER_REGISTRY: dict[str, type[BaseScanner]] = {
-    Layer.ONCHAIN.value: OnChainScanner,
-    Layer.DERIVATIVES.value: DerivativesScanner,
-    Layer.SOCIAL.value: SocialScanner,
-    Layer.DEX.value: DexScanner,
-    Layer.MARKET.value: MarketScanner,
-    Layer.FUNDAMENTALS.value: FundamentalsScanner,
-    Layer.AIRDROP.value: AirdropScanner,
-    Layer.MACRO.value: MacroScanner,
-    Layer.TECHNICALS.value: TechnicalsScanner,
-}
 
 
 @dataclass(slots=True)
@@ -108,15 +92,27 @@ class ScannerHealth:
     last_duration_ms: float = 0.0
 
     def record(self, signal: LayerSignal) -> None:
+        """Count one finished layer, keeping provider outages visible.
+
+        ``registry.run_isolated`` folds ``UNAVAILABLE`` into ``SKIPPED`` so the
+        weighted prior renormalises. Reading only the final status would make an
+        outage look exactly like "not applicable": ``unavailable`` would stay at
+        zero and ``last_error`` would never be populated, which is precisely the
+        column ``health_report()`` tells you to check first.
+        """
         self.runs += 1
         self.last_duration_ms = signal.latency_ms
-        if signal.status is SignalStatus.OK:
+        outage = signal.status is SignalStatus.UNAVAILABLE or (
+            signal.status is SignalStatus.SKIPPED
+            and (signal.metrics or {}).get("original_status") == "unavailable"
+        )
+        if outage:
+            self.unavailable += 1
+            self.last_error = signal.error
+        elif signal.status is SignalStatus.OK:
             self.ok += 1
         elif signal.status is SignalStatus.DEGRADED:
             self.degraded += 1
-        elif signal.status is SignalStatus.UNAVAILABLE:
-            self.unavailable += 1
-            self.last_error = signal.error
         else:
             self.skipped += 1
 
@@ -152,12 +148,21 @@ class ScanPipeline:
         self.settings = settings
         self._session = session
         self._owns_session = session is None
-        self.scanners: list[BaseScanner] = self._build_scanners(settings)
-        self.security = SecurityScanner(settings)
+        self._enabled_layers = settings.scanners.enabled_layers
+        # Fail fast at construction: a typo in ENABLED_LAYERS must not silently
+        # delete a layer from every future scan.
+        validate_enabled(self._enabled_layers)
+        self._scanner_cache: dict[AssetClass, list[BaseScanner]] = {}
+        #: Backwards-compatible default view; execution is routed per asset class.
+        self.scanners: list[BaseScanner] = self.scanners_for(AssetClass.CRYPTO)
         self.wash = WashTradingFilter(wash_threshold or 85.0)
         self.health: dict[str, ScannerHealth] = {
-            scanner.layer.value: ScannerHealth(scanner.layer.value) for scanner in self.scanners
+            layer: ScannerHealth(layer)
+            for layer in sorted(
+                {spec.layer.value for specs in ASSET_LAYER_MAP.values() for spec in specs}
+            )
         }
+
         #: Market-wide reads (``macro:crypto`` / ``macro:cross_asset``) reused by
         #: every instrument in a cycle. Values are ``(monotonic_stamp, data)`` and
         #: only *usable* reads are stored.
@@ -187,13 +192,14 @@ class ScanPipeline:
         return self._session
 
     # -- construction --------------------------------------------------------
-    @staticmethod
-    def _build_scanners(settings: Settings) -> list[BaseScanner]:
-        enabled = [name.strip().lower() for name in settings.scanners.enabled_layers]
-        unknown = [name for name in enabled if name not in SCANNER_REGISTRY]
-        if unknown:
-            raise ValueError(f"unknown scanner layer(s): {unknown}; known: {sorted(SCANNER_REGISTRY)}")
-        return [SCANNER_REGISTRY[name](settings) for name in enabled]
+    def scanners_for(self, asset_class: AssetClass | str) -> list[BaseScanner]:
+        """Build (once) the enabled layers for ``asset_class``."""
+        kind = AssetClass.coerce(asset_class)
+        if kind not in self._scanner_cache:
+            self._scanner_cache[kind] = build_scanners(
+                self.settings, kind, enabled=self._enabled_layers
+            )
+        return self._scanner_cache[kind]
 
     # -- collection ----------------------------------------------------------
     async def collect(self, token: TokenSnapshot) -> CollectedSnapshot:
@@ -215,26 +221,30 @@ class ScanPipeline:
         else:
             await self._collect_listed_market(snapshot, ctx)
 
-        # 4) Every enabled layer, concurrently.
-        signals = await asyncio.gather(*(scanner.run(snapshot, ctx) for scanner in self.scanners))
+        # 4) Every layer routed for this asset class, concurrently and isolated.
+        scanners = self.scanners_for(asset_class)
+        signals = await asyncio.gather(
+            *(run_isolated(scanner, snapshot, ctx) for scanner in scanners)
+        )
         for signal in signals:
             self.health.setdefault(signal.layer.value, ScannerHealth(signal.layer.value)).record(signal)
         snapshot.signals = list(signals)
 
         for key, value in ctx.shared.items():
-            if not key.startswith("macro"):
-                continue
-            usable = crypto_backdrop_usable(value) if key == CRYPTO_CACHE_KEY else cross_asset_usable(value)
-            if usable:
+            if key == CROSS_ASSET_CACHE_KEY and cross_asset_usable(value):
                 self._macro_cache[key] = (time.monotonic(), value)
 
         prior = weighted_prior(snapshot.signals)
         duration = round((time.perf_counter() - started) * 1000.0, 1)
+        critical = snapshot.security.critical_flags()
         snapshot.meta.update(
             {
                 "prior_score": round(prior, 2),
                 "collection_ms": duration,
-                "security_critical_flags": snapshot.security.critical_flags(),
+                "security_critical_flags": critical,
+                # The hard veto is enforced by ``core.scoring.reconcile`` and the
+                # risk agent's short-circuit; this flag makes it visible to the UI.
+                "security_veto": bool(critical),
                 "wash_suspicion": snapshot.wash.suspicion_score if snapshot.wash.evaluated else None,
             }
         )
@@ -266,7 +276,7 @@ class ScanPipeline:
         snapshot thinner, never broken.
         """
         try:
-            snapshot.security = await self.security.scan(snapshot, ctx)
+            snapshot.security = await fetch_security_report(snapshot, ctx)
         except Exception as exc:  # noqa: BLE001 - scan() already degrades, belt and braces
             log.debug("security_stage_failed", extra={"token": snapshot.token_address, "error": str(exc)[:200]})
 
@@ -336,44 +346,45 @@ class ScanPipeline:
         )
 
     async def _prefetch_macro(self, tokens: Iterable[TokenSnapshot]) -> None:
-        """Fetch each market-wide read once per cycle, before the parallel fan-out.
+        """Fetch the cross-asset backdrop once per cycle, before the parallel fan-out.
 
         ``collect_many`` starts several collections concurrently; without this,
         every cache miss copies the same empty cache and the whole batch fires
-        duplicate CoinGecko/Yahoo requests.
+        duplicate vendor requests.
+
+        Only listed instruments read it. A crypto scan routes to the eight crypto
+        layers, none of which touch ``CROSS_ASSET_CACHE_KEY``, so a crypto-only
+        batch must not spend provider budget on a backdrop nobody consumes.
         """
-        needs: set[str] = set()
-        for token in tokens:
-            try:
-                asset_class = AssetClass.coerce(token.asset_class)
-            except Exception:  # noqa: BLE001 - unknown class -> let the scanner skip it
-                continue
-            needs.add("crypto" if asset_class.is_crypto else "cross_asset")
-        if not needs:
+        if not any(self._reads_cross_asset(token) for token in tokens):
             return
         async with self._macro_lock:
-            for kind in sorted(needs):
-                key = CRYPTO_CACHE_KEY if kind == "crypto" else CROSS_ASSET_CACHE_KEY
-                cached = self._macro_cache.get(key)
-                if cached is not None and (time.monotonic() - cached[0]) <= MACRO_CACHE_TTL_SECONDS:
-                    continue
-                try:
-                    if kind == "crypto":
-                        value = await fetch_crypto_backdrop(self.session)
-                        usable = crypto_backdrop_usable(value)
-                    else:
-                        value = await fetch_cross_asset_backdrop(self.session)
-                        usable = cross_asset_usable(value)
-                except Exception as exc:  # noqa: BLE001 - the layer degrades to UNAVAILABLE
-                    log.warning(
-                        "macro_prefetch_failed",
-                        extra={"kind": kind, "error": f"{type(exc).__name__}: {str(exc)[:200]}"},
-                    )
-                    continue
-                if usable:
-                    self._macro_cache[key] = (time.monotonic(), value)
-                else:
-                    log.warning("macro_prefetch_unusable", extra={"kind": kind})
+            cached = self._macro_cache.get(CROSS_ASSET_CACHE_KEY)
+            if cached is not None and (time.monotonic() - cached[0]) <= MACRO_CACHE_TTL_SECONDS:
+                return
+            try:
+                value = await fetch_cross_asset_backdrop(
+                    self.session, endpoints=self.settings.endpoints
+                )
+                usable = cross_asset_usable(value)
+            except Exception as exc:  # noqa: BLE001 - the layer degrades to UNAVAILABLE
+                log.warning(
+                    "macro_prefetch_failed",
+                    extra={"kind": "cross_asset", "error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+                )
+                return
+            if usable:
+                self._macro_cache[CROSS_ASSET_CACHE_KEY] = (time.monotonic(), value)
+            else:
+                log.warning("macro_prefetch_unusable", extra={"kind": "cross_asset"})
+
+    @staticmethod
+    def _reads_cross_asset(token: TokenSnapshot) -> bool:
+        """True when this instrument's route includes the listed macro layer."""
+        try:
+            return not AssetClass.coerce(token.asset_class).is_crypto
+        except Exception:  # noqa: BLE001 - unknown class -> let the scanner skip it
+            return False
 
     async def collect_many(
         self,

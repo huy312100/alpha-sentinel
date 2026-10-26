@@ -22,10 +22,12 @@ with pure arithmetic, so a verdict is reproducible and testable without an API k
 config/watchlists.yaml   (crypto contracts + listed symbols)
         │
         ▼
-┌───────────────────┐   9 layers, asset-class aware, each isolated + timeout-bounded
-│ scanners.pipeline │──▶ onchain · derivatives · social · dex · market
-│                   │    fundamentals · airdrop · macro · technicals
-└─────────┬─────────┘
+┌───────────────────┐   one manifest per asset class, every layer isolated
+│ scanners.pipeline │──▶ crypto: onchain · derivatives · social · dex ·
+│ scanners.registry │           ecosystem · tokenomics · technicals · security
+└─────────┬─────────┘   listed: market · fundamentals · macro · technicals
+          │                     (+ a routed stub per market: etf_flows,
+          │                      index_breadth, fx_carry, …)
           │ TokenSnapshot + confidence-weighted prior
           ▼
 ┌───────────────────────────┐
@@ -51,6 +53,21 @@ Failure isolation is a hard rule: one dead provider degrades a layer, not the cy
 one dead instrument does not abort the run; a Parquet or Telegram hiccup is logged
 and the loop keeps going. `--dry-run` collects and audits but persists and sends
 nothing.
+
+`scanners.registry` owns the routing table (`ASSET_LAYER_MAP`). A layer never runs
+because the pipeline knows its name — it runs because the instrument's `asset_class`
+has a manifest entry for it. Three consequences worth knowing:
+
+* **Crypto is eight dedicated layers** under `scanners/crypto/`, one module each.
+  Nothing is shared between them except the HTTP client and the indicator maths.
+* **Every other market is routed today**, even where its dedicated data is not
+  built yet: `etf_flows`, `index_breadth`, `fx_carry`, `commodity_inventory`,
+  `equity_ownership` and `rates_curve` are stubs that return `SKIPPED` with zero
+  weight, so a real collector can land without touching the pipeline.
+* **A failing layer is skipped, never neutral.** An exception, a timeout or an
+  `UNAVAILABLE` provider becomes `SKIPPED` with weight 0, so a dead API cannot drag
+  a score toward 50. Layer 8 (security) is `always_on` and a critical flag there
+  vetoes the verdict regardless of every other score.
 
 ---
 
@@ -130,8 +147,8 @@ watchlists:
 ```
 
 Listed-instrument data comes from the keyless Yahoo Finance chart endpoint
-(`scanners/market_data.py`); crypto keeps DexScreener + GeckoTerminal. One fetch
-feeds both the `market` layer and `technicals` within a collection.
+(`scanners/shared/market_data.py`); crypto keeps DexScreener + GeckoTerminal.
+One fetch feeds both the `market` layer and `technicals` within a collection.
 
 **Fundamentals are opt-in.** Set `SEC_USER_AGENT="AlphaSentinel you@example.com"`
 to enable SEC EDGAR lookups — the SEC's fair-access policy requires a contact.
@@ -272,12 +289,43 @@ the groups that change behaviour:
 | Storage | `DATA_DIR`, `HOT_DB_PATH`, `PARQUET_ROOT`, `PARQUET_COMPRESSION`, retention windows | one SQLite file + one Parquet lake |
 | R2 | `R2_ENABLED`, `R2_ENDPOINT_URL`, `R2_BUCKET`, keys, prefix | optional mirror of the cold lake |
 | Scanners | `GOPLUS_APP_KEY/SECRET`, `ETHERSCAN_API_KEY`, `LUNARCRUSH_API_KEY`, `X_BEARER_TOKEN`, `SEC_USER_AGENT`, timeouts | a missing key degrades that layer to `SKIPPED`, it does not fail the cycle |
-| Layers | `ENABLED_LAYERS` (default: all nine) | remove a layer globally; per-market applicability is decided per instrument |
+| Endpoints | `ENDPOINTS_FILE`, `<VENDOR>_BASE_URL`, `<VENDOR>_<NAME>_URL` | every outbound URL (host **and** path) lives in `config/endpoints.yaml`; mount that shape as a ConfigMap via `ENDPOINTS_FILE` to replace entries in bulk, or move one vendor/one endpoint from `.env`. No scanner contains a URL |
+| Explorers | `BLOCKSCOUT_EXPLORER_BASE_URL`, `BLOCKSCOUT_BASE_URL_<CHAIN>` | per-chain override for holder/transfer reads; the template covers the rest |
+| Layers | `ENABLED_LAYERS` (default: every layer routed for the instrument's asset class) | narrow globally; crypto and listed markets each keep their own manifest, and `security` cannot be switched off |
 | Alerting | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ALERT_MIN_SCORE`, `ALERT_ON_VETO` | empty credentials = alerts silently disabled |
 | Loop | `SCAN_INTERVAL_SECONDS`, `TOKEN_CONCURRENCY`, `MAINTENANCE_INTERVAL_SECONDS` | |
 
 `Settings.missing_critical()` names the keys that would make a non-demo run unusable,
 and the bot prints them instead of burning API credits on a half-configured stack.
+
+### Vendor endpoints are data
+
+Every outbound URL — host *and* path — lives in [`config/endpoints.yaml`](config/endpoints.yaml),
+one entry per vendor resource (`coingecko.contract`, `geckoterminal.pool_ohlcv`,
+`sec.company_facts`, ...). Scanner code asks for a name and never sees a URL:
+
+```python
+url = ctx.settings.endpoints.url("coingecko.contract", platform=platform, address=token.token_address)
+```
+
+A deployment can therefore redirect traffic without touching Python:
+
+```yaml
+# /etc/alphasentinel/endpoints.yaml - mounted, merged over the bundled catalogue
+coingecko:
+  base: https://coingecko-proxy.internal/api/v3
+```
+
+```bash
+ENDPOINTS_FILE=/etc/alphasentinel/endpoints.yaml   # or, for one vendor:
+COINGECKO_BASE_URL=https://coingecko-proxy.internal/api/v3
+COINGECKO_CONTRACT_URL=https://other-gateway.internal/coins/{platform}/{address}
+```
+
+Boot fails loudly (`ConfigError`) if an entry is missing its scheme/host, uses an
+unknown placeholder, or if the effective catalogue cannot satisfy a name the code
+calls (`REQUIRED_ENDPOINTS`). A test also asserts that no file under `scanners/`
+contains an `http(s)://` literal, so a hardcoded URL cannot creep back in.
 
 ---
 
@@ -322,7 +370,7 @@ writes to the repo — which is why CI can run it on every push.
 
 | File | Covers |
 | --- | --- |
-| `test_settings.py` | provider presets, `LLM_*` parsing, legacy `DEEPSEEK_*` aliases, fail-fast validation |
+| `test_settings.py` | provider presets, `LLM_*` parsing, legacy `DEEPSEEK_*` aliases, fail-fast validation, the endpoint catalogue (overrides, missing entries, no URL literals left in scanners) |
 | `test_llm_client.py` | request shaping per provider, JSON-mode/`max_tokens`/`temperature` adaptation, cost ledger, error paths |
 | `test_instruments.py` | asset classes, symbol normalisation, provider-symbol mapping, identity/venue rules |
 | `test_market_data.py` | Yahoo chart parsing (null bars, halted sessions), quote metrics, series intervals, caching |
@@ -392,9 +440,19 @@ docker compose down
 ```
 ai_engine/    LLM client (any OpenAI-compatible API), prompts, parsers, dual-agent flow, demo client
 bot/          watchlist loader (crypto + listed markets), scan engine, Telegram alerter, CLI
-config/       settings (env-driven dataclasses), watchlists.yaml
+config/       settings (env-driven dataclasses), endpoints.yaml (every vendor URL),
+              watchlists.yaml
 core/         instrument identity, models, deterministic scoring, HTTP + logging helpers
-scanners/     nine layer scanners (incl. market + fundamentals), market data, pipeline
+scanners/     framework only at the root: __init__, base (layer contract),
+              registry (asset_class -> layer routing), pipeline, __main__
+  crypto/       eight self-contained layers (layer1_onchain .. layer8_security);
+                each layer owns the vendor clients it scores (DexScreener,
+                GeckoTerminal, GoPlus, Coinglass, LunarCrush, ...)
+  shared/       http_client (retry + per-host limit), technicals/ (analysis
+                library split into primitives, snapshot, scoring, flags),
+                market_data + series (quote/candle transport), listed/ (generic
+                non-crypto layers the market packages compose)
+  equities/ etfs/ indices/ forex/ commodities/ rates/   routed market manifests
 storage/      SQLite hot store, Parquet lake (+ optional R2)
 dashboard/    Streamlit read-only UI
 tests/        hermetic pytest suite

@@ -22,13 +22,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from config.endpoints import (
+    BLOCKSCOUT_CHAINS,
+    REQUIRED_ENDPOINTS,
+    EndpointSettings,
+    load_endpoint_settings,
+)
+from config.errors import ConfigError
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ENV_TRUE = {"1", "true", "yes", "y", "on"}
 _ENV_FALSE = {"0", "false", "no", "n", "off", ""}
-
-
-class ConfigError(RuntimeError):
-    """Raised when the environment cannot be parsed into a valid configuration."""
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +152,24 @@ DEFAULT_ENABLED_LAYERS: tuple[str, ...] = (
     "derivatives",
     "social",
     "dex",
+    "ecosystem",
+    "tokenomics",
     "market",
     "fundamentals",
-    "airdrop",
     "macro",
     "technicals",
+    "security",
 )
+
+#: Layer slugs that older ``.env`` files may still use. ``scanners.registry``
+#: resolves them onto the module that owns the data now:
+#:   * ``airdrop``  -> ``ecosystem`` (DeFiLlama / GrowThePie ecosystem metrics)
+#:   * ``macro``    -> both the listed-market macro backdrop and, for crypto,
+#:                     the tokenomics/event layer that replaced it
+LEGACY_LAYER_ALIASES: dict[str, str] = {
+    "airdrop": "ecosystem",
+    "macro": "tokenomics",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,7 +294,8 @@ class StorageSettings:
 
 @dataclass(frozen=True, slots=True)
 class GoPlusSettings:
-    base_url: str = "https://api.gopluslabs.io"
+    """GoPlus credentials; its endpoint URL lives in the endpoint catalogue."""
+
     app_key: SecretStr = SecretStr()
     app_secret: SecretStr = SecretStr()
     timeout_seconds: float = 15.0
@@ -301,6 +318,43 @@ class SocialSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderSettings:
+    """Optional data-vendor credentials for the crypto layer stack.
+
+    Every field is optional: a layer whose providers are unconfigured returns
+    ``SKIPPED`` (zero weight) instead of inventing a neutral reading. Keys are
+    ``SecretStr`` so they can never be printed by an accidental ``repr``/log.
+    """
+
+    arkham_api_key: SecretStr = SecretStr()
+    nansen_api_key: SecretStr = SecretStr()
+    dune_api_key: SecretStr = SecretStr()
+    #: A saved Dune query id returning one row with ``net_flow_usd`` per token.
+    #: ``0`` disables the provider (Dune has no generic "token netflow" endpoint).
+    dune_smart_money_query_id: int = 0
+    coinglass_api_key: SecretStr = SecretStr()
+    cryptopanic_token: SecretStr = SecretStr()
+    #: Optional JSON calendar for unlock/vesting/mainnet-upgrade events. Teams can
+    #: point this at TokenUnlocks, an internal sheet export or their own service.
+    tokenomics_calendar_url: str = ""
+
+    def configured_sources(self) -> tuple[str, ...]:
+        """Names only - never values - for boot logs and ``/status``."""
+        sources: list[str] = []
+        if self.arkham_api_key.is_configured():
+            sources.append("arkham")
+        if self.nansen_api_key.is_configured():
+            sources.append("nansen")
+        if self.dune_api_key.is_configured() and self.dune_smart_money_query_id > 0:
+            sources.append("dune")
+        if self.coinglass_api_key.is_configured():
+            sources.append("coinglass")
+        if self.cryptopanic_token.is_configured():
+            sources.append("cryptopanic")
+        return tuple(sources)
+
+
+@dataclass(frozen=True, slots=True)
 class TelegramSettings:
     bot_token: SecretStr = SecretStr()
     chat_id: str = ""
@@ -309,10 +363,6 @@ class TelegramSettings:
 
     def is_configured(self) -> bool:
         return self.bot_token.is_configured() and bool(self.chat_id)
-
-    @property
-    def api_base(self) -> str:
-        return f"https://api.telegram.org/bot{self.bot_token.get_secret_value()}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +400,8 @@ class Settings:
     storage: StorageSettings = StorageSettings()
     goplus: GoPlusSettings = GoPlusSettings()
     social: SocialSettings = SocialSettings()
+    providers: ProviderSettings = ProviderSettings()
+    endpoints: EndpointSettings = EndpointSettings()
     telegram: TelegramSettings = TelegramSettings()
     scanners: ScannerSettings = ScannerSettings()
     thresholds: ThresholdSettings = ThresholdSettings()
@@ -372,12 +424,23 @@ class Settings:
             problems.append(f"unsupported PARQUET_COMPRESSION: {self.storage.compression}")
         if self.telegram.bot_token.is_configured() and not self.telegram.chat_id:
             problems.append("TELEGRAM_BOT_TOKEN is set but TELEGRAM_CHAT_ID is empty")
-        unknown_layers = [name for name in self.scanners.enabled_layers if name not in DEFAULT_ENABLED_LAYERS]
+        unknown_layers = [
+            name
+            for name in self.scanners.enabled_layers
+            if name not in DEFAULT_ENABLED_LAYERS and name not in LEGACY_LAYER_ALIASES
+        ]
         if unknown_layers:
             problems.append(
                 "unknown ENABLED_LAYERS slug(s): "
                 + ", ".join(sorted(unknown_layers))
                 + f"; expected one of: {', '.join(DEFAULT_ENABLED_LAYERS)}"
+            )
+        missing_endpoints = [name for name in REQUIRED_ENDPOINTS if not self.endpoints.has(name)]
+        if missing_endpoints:
+            problems.append(
+                "endpoint catalogue is missing: "
+                + ", ".join(missing_endpoints)
+                + " (add them to config/endpoints.yaml or the file mounted at ENDPOINTS_FILE)"
             )
         return problems
 
@@ -402,6 +465,7 @@ class Settings:
             "r2_enabled": self.storage.r2.enabled,
             "r2_configured": self.storage.r2.is_configured(),
             "goplus_configured": self.goplus.app_key.is_configured(),
+            "provider_sources": list(self.providers.configured_sources()),
             "telegram_configured": self.telegram.is_configured(),
             "scan_interval_seconds": self.scanners.scan_interval_seconds,
             "layers": list(self.scanners.enabled_layers),
@@ -471,7 +535,6 @@ class Settings:
         )
 
         goplus = GoPlusSettings(
-            base_url=_env_str(env, "GOPLUS_BASE_URL", "https://api.gopluslabs.io").rstrip("/"),
             app_key=_env_secret(env, "GOPLUS_APP_KEY"),
             app_secret=_env_secret(env, "GOPLUS_APP_SECRET"),
         )
@@ -480,6 +543,18 @@ class Settings:
             lunarcrush_api_key=_env_secret(env, "LUNARCRUSH_API_KEY"),
             x_bearer_token=_env_secret(env, "X_BEARER_TOKEN"),
         )
+
+        providers = ProviderSettings(
+            arkham_api_key=_env_secret(env, "ARKHAM_API_KEY"),
+            nansen_api_key=_env_secret(env, "NANSEN_API_KEY"),
+            dune_api_key=_env_secret(env, "DUNE_API_KEY"),
+            dune_smart_money_query_id=_env_int(env, "DUNE_SMART_MONEY_QUERY_ID", 0, minimum=0),
+            coinglass_api_key=_env_secret(env, "COINGLASS_API_KEY"),
+            cryptopanic_token=_env_secret(env, "CRYPTOPANIC_TOKEN"),
+            tokenomics_calendar_url=_env_str(env, "TOKENOMICS_CALENDAR_URL", ""),
+        )
+
+        endpoints = load_endpoint_settings(env, default_chain=runtime.default_chain)
 
         telegram = TelegramSettings(
             bot_token=_env_secret(env, "TELEGRAM_BOT_TOKEN"),
@@ -511,6 +586,8 @@ class Settings:
             storage=storage,
             goplus=goplus,
             social=social,
+            providers=providers,
+            endpoints=endpoints,
             telegram=telegram,
             scanners=scanners,
             thresholds=thresholds,
@@ -531,9 +608,18 @@ class Settings:
             self.goplus.app_secret,
             self.social.lunarcrush_api_key,
             self.social.x_bearer_token,
+            self.providers.arkham_api_key,
+            self.providers.nansen_api_key,
+            self.providers.dune_api_key,
+            self.providers.coinglass_api_key,
+            self.providers.cryptopanic_token,
             self.telegram.bot_token,
         ):
             register_secret(secret.get_secret_value())
+        #: A calendar URL is a plain string, and a self-hosted feed may carry its key
+        #: in the query string; ``register_secret`` ignores values that are too short
+        #: or empty, so an unset calendar is a no-op.
+        register_secret(self.providers.tokenomics_calendar_url)
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +713,11 @@ def iter_secret_values(settings: Settings) -> Iterable[str]:
         settings.goplus.app_secret,
         settings.social.lunarcrush_api_key,
         settings.social.x_bearer_token,
+        settings.providers.arkham_api_key,
+        settings.providers.nansen_api_key,
+        settings.providers.dune_api_key,
+        settings.providers.coinglass_api_key,
+        settings.providers.cryptopanic_token,
         settings.telegram.bot_token,
     ):
         if secret.is_configured():
@@ -634,13 +725,17 @@ def iter_secret_values(settings: Settings) -> Iterable[str]:
 
 
 __all__ = [
+    "BLOCKSCOUT_CHAINS",
     "ConfigError",
     "DEFAULT_LLM_PROVIDER",
+    "EndpointSettings",
     "GoPlusSettings",
+    "LEGACY_LAYER_ALIASES",
     "LLM_PROVIDER_PRESETS",
     "LLMSettings",
     "PROJECT_ROOT",
     "ProviderPreset",
+    "ProviderSettings",
     "R2Settings",
     "RuntimeSettings",
     "ScannerSettings",
