@@ -26,6 +26,7 @@ from typing import Sequence
 from bot.alerts import TelegramAlerter
 from bot.engine import ScanEngine, ScanReport
 from bot.watchlist import WatchToken, WatchlistBundle, WatchlistError, WatchlistLoader
+from config.errors import ConfigError
 from config.settings import Settings
 from core.logging import configure_logging, get_logger
 from storage.hot_store import HotStore
@@ -207,10 +208,31 @@ def _install_signal_handlers(engine: ScanEngine) -> None:
                 log.warning("signal_handler_unavailable", extra={"signal": sig})
 
 
+def _refuse_invalid_config(settings: Settings, *, status_only: bool) -> bool:
+    """Stop the process when the environment cannot be trusted.
+
+    A misconfigured deploy must die before it writes a verdict, not on its first
+    audit: an unset ``LLM_API_KEY``, production-with-``DEMO_MODE``, a broken
+    endpoint catalogue or an unknown layer name are operator errors. ``--status``
+    is exempt because the container healthcheck runs exactly that command.
+    """
+    if status_only:
+        return False
+    try:
+        settings.validate_or_raise()
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return True
+    return False
+
+
 async def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_logging(level=args.log_level, json_output=args.json_logs)
     settings = Settings.load()
+
+    if _refuse_invalid_config(settings, status_only=args.status):
+        return EXIT_USAGE
 
     loader = WatchlistLoader(
         settings.scanners.watchlist_path, default_chain=settings.runtime.default_chain
