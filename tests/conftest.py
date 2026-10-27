@@ -7,6 +7,7 @@ Anything that talks to a provider is either mocked or driven by ``DEMO_MODE``.
 from __future__ import annotations
 
 import sys
+from itertools import chain
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:  # allows `pytest` without `python -m`
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from config import endpoints as endpoints_module  # noqa: E402
+from config import settings as settings_module  # noqa: E402
 from config.settings import Settings  # noqa: E402
 from core.models import (  # noqa: E402
     AlphaAssessment,
@@ -61,6 +64,49 @@ watchlists:
         chain: solana
         tags: [meme, solana]
 """
+
+
+def settings_env_keys() -> frozenset[str]:
+    """Every environment variable ``Settings.load`` can read, discovered from it.
+
+    The CLI reads ``os.environ``, so anything a developer shell or a CI runner
+    exports decides what a test sees: an ``ENDPOINTS_FILE`` overlay that does not
+    exist makes ``Settings.load()`` raise, a provider preset changes the wiring, a
+    numeric override can fail parsing.
+
+    Clearing a hand-written list does not hold: the first version missed
+    ``DEEPSEEK_INPUT_USD_PER_MTOK`` and the rest of the legacy ``DEEPSEEK_*``
+    aliases - plus ~100 endpoint overrides - so a stray export still failed
+    unrelated tests. The set is derived by watching the loader parse instead:
+    every key goes through ``_get``, so an added setting is covered without
+    anyone updating a list.
+    """
+    seen: set[str] = set()
+
+    def _recording(original):
+        def _get(*args, **kwargs):
+            seen.add(args[1])
+            return original(*args, **kwargs)
+
+        return _get
+
+    patched = [(module, module._get) for module in (settings_module, endpoints_module)]
+    try:
+        for module, original in patched:
+            module._get = _recording(original)
+        Settings.load({}, load_dotenv_file=False)
+    finally:
+        for module, original in patched:
+            module._get = original
+    # ``_expand_legacy_llm_env`` maps the old names with ``dict.get`` rather than
+    # ``_get``, so the aliases it accepts never show up in ``seen``.
+    return frozenset(seen | set(chain.from_iterable(settings_module._LEGACY_LLM_ENV.values())))
+
+
+def clear_inherited_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Delete every setting the loader would otherwise inherit from the host."""
+    for key in settings_env_keys():
+        monkeypatch.delenv(key, raising=False)
 
 
 @pytest.fixture()

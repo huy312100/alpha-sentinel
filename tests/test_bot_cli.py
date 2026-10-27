@@ -9,49 +9,16 @@ healthcheck) keeps answering.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
 
 import bot.main as bot_main
 from bot.engine import ScanReport
-from tests.conftest import WATCHLIST_YAML
-
-#: ``bot.main`` reads settings straight from ``os.environ``, so anything a
-#: developer shell exports would otherwise decide the outcome: an ``ENDPOINTS_FILE``
-#: overlay that does not exist makes ``Settings.load()`` raise, a provider preset
-#: changes the wiring, a numeric override can fail parsing. Cleared before every
-#: test; each test then sets only what it means to exercise.
-_AMBIENT_SETTINGS = (
-    "ALPHA_MODEL",
-    "APP_ENV",
-    "DATA_DIR",
-    "DEEPSEEK_API_KEY",
-    "DEFAULT_CHAIN",
-    "DEMO_MODE",
-    "ENABLED_LAYERS",
-    "ENDPOINTS_FILE",
-    "HOT_DB_PATH",
-    "LLM_API_KEY",
-    "LLM_BASE_URL",
-    "LLM_MAX_CONCURRENCY",
-    "LLM_MAX_RETRIES",
-    "LLM_PROVIDER",
-    "LLM_TIMEOUT_SECONDS",
-    "LOG_JSON",
-    "LOG_LEVEL",
-    "PARQUET_ROOT",
-    "R2_ACCESS_KEY_ID",
-    "R2_BUCKET",
-    "R2_ENABLED",
-    "R2_ENDPOINT_URL",
-    "R2_SECRET_ACCESS_KEY",
-    "RISK_MODEL",
-    "SCAN_INTERVAL_SECONDS",
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
-    "WATCHLIST_PATH",
-)
+from config.errors import ConfigError
+from config.settings import Settings
+from tests.conftest import WATCHLIST_YAML, clear_inherited_settings, settings_env_keys
 
 
 @pytest.fixture()
@@ -59,15 +26,14 @@ def environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Build a hermetic environment rooted in ``tmp_path``.
 
     ``_maybe_load_dotenv`` is stubbed out so a developer's local ``.env`` cannot
-    make a test pass by accident, and the settings keys the host may have
-    exported are cleared so only this fixture decides what the CLI reads.
+    make a test pass by accident, and every setting the loader parses is cleared
+    so only this fixture decides what the CLI reads.
     """
     watchlist = tmp_path / "watchlists.yaml"
     watchlist.write_text(WATCHLIST_YAML, encoding="utf-8")
     hot_dir = tmp_path / "data" / "hot"
     hot_dir.mkdir(parents=True)
-    for key in _AMBIENT_SETTINGS:
-        monkeypatch.delenv(key, raising=False)
+    clear_inherited_settings(monkeypatch)
     monkeypatch.setattr("config.settings._maybe_load_dotenv", lambda: None)
     monkeypatch.setenv("LOG_JSON", "false")
     monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
@@ -187,3 +153,36 @@ def test_demo_mode_still_needs_no_key(environment, monkeypatch, capsys):
     assert LocalEngine.cycle_kwargs["dry_run"] is True
     assert LocalEngine.cycle_kwargs["limit"] == 1
     assert "run demo-cycle (dry-run)" in capsys.readouterr().out
+
+
+def test_the_cleared_set_tracks_the_loader():
+    """Guard the discovery: a renamed parse helper must not empty the clear list.
+
+    If ``Settings.load`` stopped routing keys through ``_get``, the derived set
+    would collapse to the legacy aliases and the fixture would go back to leaking
+    - green on a clean CI runner, red on any machine that exports a setting.
+    """
+    keys = settings_env_keys()
+
+    assert {"ENDPOINTS_FILE", "LLM_PROVIDER", "R2_REGION", "DEEPSEEK_INPUT_USD_PER_MTOK"} <= keys
+    # A collapse to just the seven aliases is the failure this guards against.
+    assert len(keys) >= 100
+
+
+def test_a_setting_inherited_from_the_host_is_cleared(monkeypatch):
+    """Regression: a legacy alias exported by the host used to fail the demo run.
+
+    ``DEEPSEEK_INPUT_USD_PER_MTOK=invalid`` is mapped onto ``LLM_INPUT_USD_PER_MTOK``
+    by ``Settings.load()``, which then cannot parse it: the CLI would exit 2 before
+    demo mode was ever reached.
+    """
+    monkeypatch.setenv("DEEPSEEK_INPUT_USD_PER_MTOK", "not-a-number")
+    monkeypatch.setenv("ENDPOINTS_FILE", "/nonexistent/endpoints.yaml")
+    with pytest.raises(ConfigError):
+        Settings.load(load_dotenv_file=False)
+
+    clear_inherited_settings(monkeypatch)
+
+    assert "DEEPSEEK_INPUT_USD_PER_MTOK" not in os.environ
+    assert "ENDPOINTS_FILE" not in os.environ
+    assert Settings.load(load_dotenv_file=False).llm.input_usd_per_mtok > 0
