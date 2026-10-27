@@ -10,7 +10,8 @@ Usage::
     python -m bot --maintenance              # retention + stale-run cleanup
 
 Exit codes are meaningful for cron/CI: ``0`` success, ``1`` the cycle hit errors,
-``2`` bad usage (unknown watchlist, unknown instrument).
+``2`` bad usage (unknown watchlist, unknown instrument) or an environment that
+cannot be trusted, so the process refuses to boot instead of scanning half blind.
 """
 
 from __future__ import annotations
@@ -208,8 +209,14 @@ def _install_signal_handlers(engine: ScanEngine) -> None:
                 log.warning("signal_handler_unavailable", extra={"signal": sig})
 
 
-def _refuse_invalid_config(settings: Settings, *, status_only: bool) -> bool:
-    """Stop the process when the environment cannot be trusted.
+def _report_config_error(exc: ConfigError) -> int:
+    """Print an operator-facing diagnostic and return the usage exit code."""
+    print(str(exc), file=sys.stderr)
+    return EXIT_USAGE
+
+
+def _refuse_invalid_config(settings: Settings, *, status_only: bool) -> int | None:
+    """Return the exit code that must stop this process, or ``None`` to boot.
 
     A misconfigured deploy must die before it writes a verdict, not on its first
     audit: an unset ``LLM_API_KEY``, production-with-``DEMO_MODE``, a broken
@@ -217,23 +224,39 @@ def _refuse_invalid_config(settings: Settings, *, status_only: bool) -> bool:
     is exempt because the container healthcheck runs exactly that command.
     """
     if status_only:
-        return False
+        return None
     try:
         settings.validate_or_raise()
     except ConfigError as exc:
-        print(str(exc), file=sys.stderr)
-        return True
-    return False
+        return _report_config_error(exc)
+    return None
 
 
 async def main(argv: list[str] | None = None) -> int:
+    """Load the environment, refuse a bad one, then run, report or maintain."""
     args = build_parser().parse_args(argv)
     configure_logging(level=args.log_level, json_output=args.json_logs)
-    settings = Settings.load()
+    try:
+        settings = Settings.load()
+    except ConfigError as exc:
+        # Settings.load() parses strictly, so it can fail before validate() ever
+        # runs: an unknown LLM_PROVIDER, a malformed integer or an unreadable
+        # ENDPOINTS_FILE used to escape as a traceback with EXIT_ERROR.
+        # --status gets no exemption here: without settings there is no store
+        # path to read, and inventing defaults would report - and create - the
+        # wrong database. A live container always has a loadable environment,
+        # because the daemon refuses to boot otherwise.
+        return _report_config_error(exc)
 
-    if _refuse_invalid_config(settings, status_only=args.status):
-        return EXIT_USAGE
+    refusal = _refuse_invalid_config(settings, status_only=args.status)
+    if refusal is not None:
+        return refusal
 
+    return await _run(args, settings)
+
+
+async def _run(args: argparse.Namespace, settings: Settings) -> int:
+    """Execute the requested mode against a validated environment and one store."""
     loader = WatchlistLoader(
         settings.scanners.watchlist_path, default_chain=settings.runtime.default_chain
     )
@@ -270,19 +293,7 @@ async def main(argv: list[str] | None = None) -> int:
 
             single_cycle = bool(args.once or args.dry_run or args.max_cycles == 1)
             if single_cycle:
-                report = await engine.run_cycle(
-                    watchlists=args.watchlist,
-                    limit=args.limit,
-                    force=args.force,
-                    dry_run=args.dry_run,
-                    tokens=tokens,
-                )
-                payload = json.dumps(report.to_dict(), indent=2, default=str) if args.json else format_report(report)
-                print(payload)
-                # A cycle with any error is not a success: cron and CI must see it.
-                if report.errors or not (report.verdicts or report.skipped):
-                    return EXIT_ERROR
-                return EXIT_OK
+                return await _run_single_cycle(args, engine, tokens)
 
             cycles = await engine.run_forever(
                 watchlists=args.watchlist,
@@ -294,6 +305,25 @@ async def main(argv: list[str] | None = None) -> int:
             return EXIT_OK
     finally:
         store.close()
+
+
+async def _run_single_cycle(
+    args: argparse.Namespace, engine: ScanEngine, tokens: list[WatchToken] | None
+) -> int:
+    """Print one cycle's report and translate it into the exit code cron sees."""
+    report = await engine.run_cycle(
+        watchlists=args.watchlist,
+        limit=args.limit,
+        force=args.force,
+        dry_run=args.dry_run,
+        tokens=tokens,
+    )
+    payload = json.dumps(report.to_dict(), indent=2, default=str) if args.json else format_report(report)
+    print(payload)
+    # A cycle with any error is not a success: cron and CI must see it.
+    if report.errors or not (report.verdicts or report.skipped):
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 if __name__ == "__main__":  # pragma: no cover - module entry point
