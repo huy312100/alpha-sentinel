@@ -13,10 +13,15 @@ executors:
 commands:
   install-deps:
     steps:
+      # Cache the *wheel* cache, never the virtualenv. The cimg tag is mutable,
+      # so a restored .venv can outlive the interpreter it was built with and
+      # leave .venv/bin/python dangling: on 2026-10-27 that killed "Install
+      # pinned dependencies" (exit 1, "No such file or directory") in both the
+      # lint and test jobs while the cache itself restored "successfully".
       - restore_cache:
           keys:
-            - v1-deps-{{ arch }}-{{ checksum "requirements.txt" }}
-            - v1-deps-{{ arch }}-
+            - v2-pip-{{ arch }}-{{ checksum "requirements.txt" }}
+            - v2-pip-{{ arch }}-
       - run:
           name: Install pinned dependencies
           command: |
@@ -24,9 +29,9 @@ commands:
             .venv/bin/python -m pip install --upgrade pip
             .venv/bin/python -m pip install -r requirements.txt
       - save_cache:
-          key: v1-deps-{{ arch }}-{{ checksum "requirements.txt" }}
+          key: v2-pip-{{ arch }}-{{ checksum "requirements.txt" }}
           paths:
-            - .venv
+            - ~/.cache/pip
 
 jobs:
   lint:
@@ -48,13 +53,21 @@ jobs:
       - install-deps
       - run:
           name: pytest (hermetic, DEMO_MODE)
+          # Record the status instead of failing here: a non-zero exit would stop
+          # the job before the JUnit report is stored, leaving a red build with
+          # no clue which test died. The last step re-raises the status.
           command: |
             mkdir -p test-results
+            set +e
             .venv/bin/python -m pytest tests/ -q --junitxml=test-results/junit.xml
+            echo $? > /tmp/pytest.exit
       - store_test_results:
           path: test-results
       - store_artifacts:
           path: test-results
+      - run:
+          name: Propagate the pytest status
+          command: exit $(cat /tmp/pytest.exit)
 
   docker-build:
     executor: py311
@@ -73,6 +86,20 @@ jobs:
               -e TELEGRAM_BOT_TOKEN= \
               -e TELEGRAM_CHAT_ID= \
               alpha-sentinel:${CIRCLE_SHA1:0:7} python -m bot.main --status
+      - run:
+          name: The image refuses to boot on an invalid configuration (exit 2)
+          # The boot gate is the point of the image: a production container with
+          # no LLM key must die during start-up, not serve half a cycle.
+          command: |
+            set +e
+            timeout 120 docker run --rm \
+              -e APP_ENV=production \
+              -e DEMO_MODE=false \
+              -e LLM_API_KEY= \
+              alpha-sentinel:${CIRCLE_SHA1:0:7} python -m bot.main --once --limit 1
+            status=$?
+            echo "boot gate exit status: ${status}"
+            test "${status}" -eq 2
 
 workflows:
   ci:
