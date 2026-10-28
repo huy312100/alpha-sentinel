@@ -65,17 +65,19 @@ env:
   # The model's window must clear the budget PR-Agent is willing to send, or the
   # excess is dropped silently and the review describes a diff it never saw.
   # Ollama sizes its context from available VRAM, i.e. 4k on a CPU-only runner,
-  # which is why this is explicit.
-  OLLAMA_CONTEXT_LENGTH: "16384"
+  # which is why this is explicit. 24k at ~56 KB of KV cache per token is ~1.4 GB
+  # on top of the 4.7 GB of weights - comfortable inside 16 GB.
+  OLLAMA_CONTEXT_LENGTH: "24576"
   # Pinned: the review text is parsed as structured JSON, so a silent upstream
   # format change would degrade into "no findings" rather than an error.
   PR_AGENT_VERSION: "0.49.0"
-  # Diff budget, sized from the measured prefill rate rather than taste: this
-  # model on a 4 vCPU runner reads a prompt at ~13.7 tokens/second, so a
-  # full-budget prompt costs ~12 minutes before the first output token. 16384
-  # (15 minutes of prefill) timed out; 8192 silently dropped the very files the
-  # PR changed. Past the budget PR-Agent names the files it dropped.
-  PR_AGENT_MAX_TOKENS: "10240"
+  # Diff budget, sized from measured throughput: this model prefills at ~13.7
+  # tokens/second on a 4 vCPU runner, so 16384 buys ~20 minutes before the first
+  # output token. Cheaper budgets were tried and are worse: 8192 dropped both
+  # files this PR changed, and 10240 still dropped the workflow file - while the
+  # comment went on to report "no major issues detected". Coverage is worth the
+  # wait; past the budget PR-Agent still names whatever it had to drop.
+  PR_AGENT_MAX_TOKENS: "16384"
 
 jobs:
   local-review:
@@ -95,8 +97,8 @@ jobs:
     # A cold run pulls ~4.7 GB of weights, and a full-budget diff spends ~12
     # minutes in prefill alone at the measured 13.7 tokens/second. The inner
     # ceiling is CONFIG__AI_TIMEOUT below; this outer one leaves room for the
-    # download and for one retry.
-    timeout-minutes: 60
+    # weight download and for one full retry.
+    timeout-minutes: 75
     permissions:
       contents: read
       issues: write
@@ -285,7 +287,7 @@ jobs:
           # needs ~12 minutes before it emits a token - so the default produced
           # "Failed to review PR" after two silent timeouts, with a green check
           # on the job.
-          CONFIG__AI_TIMEOUT: "1500"
+          CONFIG__AI_TIMEOUT: "1800"
           # ... and because a failed review still exits 0 by default, surface it
           # as a failed job instead of a comment nobody notices.
           CONFIG__PROPAGATE_TOOL_ERRORS: "true"
