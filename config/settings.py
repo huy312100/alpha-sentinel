@@ -140,7 +140,7 @@ def _env_path(env: Mapping[str, str], key: str, default: str) -> Path:
     raw = _get(env, key, default) or default
     try:
         path = Path(raw).expanduser()
-        return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+        return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
     except (OSError, RuntimeError) as exc:
         # A relative setting is resolved against the repository root, and that can
         # fail on the machine rather than in the value: ``Path.resolve()`` raises

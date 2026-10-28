@@ -160,8 +160,8 @@ def test_unknown_enabled_layer_is_a_boot_problem():
 def test_a_path_that_cannot_be_resolved_is_a_boot_problem(tmp_path):
     """A symlink loop must be a ``ConfigError``, not a traceback with exit 1.
 
-    ``_env_path`` anchors a relative setting to the repository root, and
-    ``Path.resolve()`` raises ``RuntimeError`` when the path loops through itself.
+    ``_env_path`` resolves both absolute and repository-relative settings, and
+    ``Path.resolve()`` raises when the path loops through itself.
     That used to escape ``Settings.load()``, so the CLI printed a traceback and
     exited 1 - the one failure mode this gate exists to prevent.
     """
@@ -171,6 +171,9 @@ def test_a_path_that_cannot_be_resolved_is_a_boot_problem(tmp_path):
 
     with pytest.raises(ConfigError, match="DATA_DIR cannot be resolved to a path"):
         load(DATA_DIR=relative)
+
+    with pytest.raises(ConfigError, match="HOT_DB_PATH cannot be resolved to a path"):
+        load(HOT_DB_PATH=str(tmp_path / "a"))
 
 
 def test_env_example_does_not_override_presets():
