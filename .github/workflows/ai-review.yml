@@ -92,8 +92,10 @@ jobs:
         startsWith(github.event.comment.body, '/improve') ||
         startsWith(github.event.comment.body, '/ask')))
     runs-on: ubuntu-latest
-    # A cold run pulls ~4.7 GB of weights, then reviews on CPU.
-    timeout-minutes: 30
+    # A cold run pulls ~4.7 GB of weights, then reviews on CPU. A full-budget
+    # diff also has to survive CONFIG__AI_TIMEOUT below, so the two ceilings are
+    # kept apart on purpose: 15 min per model call inside a 40 min job.
+    timeout-minutes: 40
     permissions:
       contents: read
       issues: write
@@ -277,7 +279,14 @@ jobs:
           CONFIG__FALLBACK_MODELS: "[]"
           OLLAMA_API_BASE: ${{ env.OLLAMA_URL }}
           OLLAMA_API_KEY: ollama
-          # Three findings is about all a 7B model can support without padding
+          # litellm gives up after 120s by default. Prefilling a full 16k-token
+          # prompt on four CPU cores takes longer than that, so the default
+          # produced "Failed to review PR" after two silent timeouts - with a
+          # green check on the job.
+          CONFIG__AI_TIMEOUT: "600"
+          # ... and because a failed review still exits 0 by default, surface it
+          # as a failed job instead of a comment nobody notices.
+          CONFIG__PROPAGATE_TOOL_ERRORS: "true"
           # the comment with restatements of the diff.
           PR_REVIEWER__NUM_MAX_FINDINGS: "3"
           PR_REVIEWER__EXTRA_INSTRUCTIONS: |
@@ -309,3 +318,11 @@ jobs:
       - name: Show the model server log on failure
         if: failure() && steps.gate.outputs.skip != 'true'
         run: docker logs --tail 100 ollama || true
+
+      # The container runs as root, and Ollama writes its manifests 0600, so the
+      # cache post-step - which runs as the runner user - would fail to read them
+      # ("Cannot open: Permission denied") and never save the 4.7 GB it just
+      # downloaded. This must stay the last step: post steps run after it.
+      - name: Make the model cache readable
+        if: always() && steps.gate.outputs.skip != 'true'
+        run: sudo chmod -R a+rX "$HOME/.ollama"

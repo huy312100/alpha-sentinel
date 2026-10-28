@@ -186,6 +186,9 @@ Each of these was a silent failure once, so each has a guard:
 | `PR_AGENT_VERSION` pinned | the review is parsed as structured JSON, so an upstream format change would degrade to "no findings" rather than an error |
 | Model weights cached by tag | `~/.ollama/models`, keyed on the model id; the weights never change for a tag |
 | `OLLAMA_NUM_PARALLEL=1`, `MAX_LOADED_MODELS=1` | keeps a 16 GB runner from loading two copies during a fast push/force-push pair |
+| `CONFIG__AI_TIMEOUT: "600"` | litellm times out at 120s, and preflighting a full-budget prompt on CPU takes longer; the default produced silent timeouts and a green check |
+| `CONFIG__PROPAGATE_TOOL_ERRORS: "true"` | PR-Agent exits 0 when a review fails, so without this a broken model leaves "Failed to review PR" as a comment and a green tick beside it |
+| `sudo chmod -R a+rX ~/.ollama` as the last step | the container runs as root and Ollama writes manifests `0600`, so the cache post-step (runner user) hit "Permission denied" and silently never saved the 4.7 GB |
 | `concurrency` keyed on event **and** sender type | a force-push cancels the previous push review, but bot chatter cannot cancel anything: CodeRabbit's comment and PR-Agent's own progress comment both arrive as `issue_comment`, and on PR #14 the first of them cancelled the running review |
 
 PR-Agent talks to GitHub over the API and works from the diff it fetches; this
@@ -203,6 +206,7 @@ CPU, and why a malicious PR cannot get its own code executed by the reviewer.
 | `ModuleNotFoundError: No module named 'github'` | installed as `pr-agent` instead of `pr-agent[github]` |
 | `requires-python >=3.12` at install | the job's Python pin was lost |
 | Review ignores the second half of a big PR | context window smaller than the diff: raise `OLLAMA_CONTEXT_LENGTH` (and keep it above `PR_AGENT_MAX_TOKENS`) |
-| Review takes the full 30 minutes and is killed | the model is too large for the runner, or a 14B on a busy runner — lower `AI_REVIEW_MODEL` |
+| Review takes the whole job timeout and is killed | the model is too large for the runner, or `CONFIG__AI_TIMEOUT` was raised without raising `timeout-minutes` |
+| `Failed to review PR` on the PR but the job is green | `CONFIG__PROPAGATE_TOOL_ERRORS` was dropped; the job now fails with the same message |
 | Comment posted but empty of findings | the model answered outside the JSON shape; try a stronger tag, and check the step log for a parse warning |
-| Every run re-downloads 4.7 GB | cache miss: cached weights live in `~/.ollama/models`, and the key includes the model id |
+| Every run re-downloads 4.7 GB | cache miss: cached weights live in `~/.ollama/models`, keyed on the model id, and the cache step needs the `chmod` step above to be able to read them |
