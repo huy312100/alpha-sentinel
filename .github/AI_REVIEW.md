@@ -23,7 +23,7 @@ comment is posted with the workflow's own `GITHUB_TOKEN`.
 | Key / secret | **none** |
 | Cost | **$0** — runner minutes are free for public repositories |
 | Runs on | `ubuntu-latest` (4 vCPU / 16 GB), Docker + Python 3.12 |
-| Time per review | ~7–9 min cold (weights download included), ~4–7 min once cached |
+| Time per review | ~13–16 min for a full-budget diff, less for small ones (see *the two numbers*) |
 
 Nothing here is a required status check: the reviewer advises, and
 `Lint + hermetic tests`, CodeQL and CircleCI still decide whether a PR can merge.
@@ -68,13 +68,14 @@ Measured against the standard 4 vCPU runner:
 
 | Tag | Disk | Review time | Notes |
 | --- | --- | --- | --- |
-| `qwen2.5-coder:7b-instruct-q4_K_M` | 4.7 GB | ~4–6 min | default; best balance here |
-| `qwen2.5-coder:3b-instruct-q4_K_M` | 1.9 GB | ~2–3 min | faster, noticeably shallower |
-| `qwen2.5-coder:14b-instruct-q4_K_M` | 9.0 GB | ~10–14 min | better, but close to the 16 GB limit |
+| `qwen2.5-coder:7b-instruct-q4_K_M` | 4.7 GB | ~12–15 min | default; best balance here |
+| `qwen2.5-coder:3b-instruct-q4_K_M` | 1.9 GB | ~6–8 min | roughly twice the prefill speed, noticeably shallower |
+| `qwen2.5-coder:14b-instruct-q4_K_M` | 9.0 GB | ~25 min+ | better, but close to the 16 GB limit and to the job timeout |
 | `gpt-oss:20b` | 13 GB | — | needs more than 16 GB RAM; it will thrash or be OOM-killed |
 
-Timings are the whole job on a standard runner with the weights already cached;
-a full 16k-token diff sits at the top of each range, a small one at the bottom.
+Timings are the whole job on a standard runner with the weights already cached and
+a full 10240-token budget. Small PRs are much faster — the cost is dominated by
+prompt length divided by prefill speed, not by the number of findings.
 
 Two constraints worth knowing before switching:
 
@@ -90,22 +91,30 @@ the download again.
 
 Both live in the workflow's `env:` block and they are a pair:
 
-* `PR_AGENT_MAX_TOKENS: 16384` — the budget PR-Agent is willing to send. A local
+* `PR_AGENT_MAX_TOKENS: 10240` — the budget PR-Agent is willing to send. A local
   model is not in PR-Agent's own token table, so the run aborts unless
   `CONFIG__CUSTOM_MODEL_MAX_TOKENS` is set. Past the budget, PR-Agent prunes the
   diff to the hunks it thinks matter most **and names the files it dropped** at
   the bottom of the comment — read that line.
-* `OLLAMA_CONTEXT_LENGTH: 24576` — the model's actual window. Ollama sizes its
+* `OLLAMA_CONTEXT_LENGTH: 16384` — the model's actual window. Ollama sizes its
   default from available VRAM, which on a CPU-only runner means **4k**. A prompt
   longer than the window is truncated *silently*: the model then reviews the tail
   of the diff and reports confidently on the rest.
 
-The window must clear the send budget, not merely the size of the diff. The
-first cut of this workflow had these at 8192 and 16384, and on the PR that
-introduced it the diff (9,543 tokens) lost the two files it was about to change:
-the comment said "no major issues detected" and, three lines lower, that the
-reviewed files had not been included. If reviews start missing half of a large
-PR, this pairing is the first thing to check.
+The window must clear the send budget, not merely the size of the diff.
+
+Why 10240 and not more: **this model reads a prompt at ~13.7 tokens/second on a
+4 vCPU runner** (measured — Ollama's own `prompt eval time`, 73 ms/token). A
+budget of 10240 is therefore ~12 minutes of prefill before the first output
+token, and `CONFIG__AI_TIMEOUT` is set to 1500s to sit above it. 16384 of budget
+(≈20 minutes of prefill) timed out in practice; 8192 was fast and, on the PR that
+introduced this workflow, pruned away both files the PR changed while still
+reporting "no major issues detected".
+
+If you raise `PR_AGENT_MAX_TOKENS`, raise `OLLAMA_CONTEXT_LENGTH` above it, raise
+`CONFIG__AI_TIMEOUT` above the new prefill time, and check that
+`timeout-minutes: 60` still leaves room for a retry. The arithmetic is
+`budget / 13.7` seconds; a bigger runner moves the 13.7, not the budget.
 
 ## On demand
 

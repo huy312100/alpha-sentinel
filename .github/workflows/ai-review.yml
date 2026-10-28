@@ -65,17 +65,17 @@ env:
   # The model's window must clear the budget PR-Agent is willing to send, or the
   # excess is dropped silently and the review describes a diff it never saw.
   # Ollama sizes its context from available VRAM, i.e. 4k on a CPU-only runner,
-  # which is why this is explicit. 24k at ~56 KB of KV cache per token is about
-  # 1.4 GB on top of the 4.7 GB of weights - comfortable inside 16 GB.
-  OLLAMA_CONTEXT_LENGTH: "24576"
+  # which is why this is explicit.
+  OLLAMA_CONTEXT_LENGTH: "16384"
   # Pinned: the review text is parsed as structured JSON, so a silent upstream
   # format change would degrade into "no findings" rather than an error.
   PR_AGENT_VERSION: "0.49.0"
-  # Diff budget. At 8192 this PR's own diff (9543 tokens) lost the two files it
-  # was about to change, and the review still reported "no major issues" - which
-  # is why this is 16384 and why the pairing with OLLAMA_CONTEXT_LENGTH matters.
-  # Past the budget PR-Agent names the files it dropped in the comment.
-  PR_AGENT_MAX_TOKENS: "16384"
+  # Diff budget, sized from the measured prefill rate rather than taste: this
+  # model on a 4 vCPU runner reads a prompt at ~13.7 tokens/second, so a
+  # full-budget prompt costs ~12 minutes before the first output token. 16384
+  # (15 minutes of prefill) timed out; 8192 silently dropped the very files the
+  # PR changed. Past the budget PR-Agent names the files it dropped.
+  PR_AGENT_MAX_TOKENS: "10240"
 
 jobs:
   local-review:
@@ -92,10 +92,11 @@ jobs:
         startsWith(github.event.comment.body, '/improve') ||
         startsWith(github.event.comment.body, '/ask')))
     runs-on: ubuntu-latest
-    # A cold run pulls ~4.7 GB of weights, then reviews on CPU. A full-budget
-    # diff also has to survive CONFIG__AI_TIMEOUT below, so the two ceilings are
-    # kept apart on purpose: 15 min per model call inside a 40 min job.
-    timeout-minutes: 40
+    # A cold run pulls ~4.7 GB of weights, and a full-budget diff spends ~12
+    # minutes in prefill alone at the measured 13.7 tokens/second. The inner
+    # ceiling is CONFIG__AI_TIMEOUT below; this outer one leaves room for the
+    # download and for one retry.
+    timeout-minutes: 60
     permissions:
       contents: read
       issues: write
@@ -279,11 +280,12 @@ jobs:
           CONFIG__FALLBACK_MODELS: "[]"
           OLLAMA_API_BASE: ${{ env.OLLAMA_URL }}
           OLLAMA_API_KEY: ollama
-          # litellm gives up after 120s by default. Prefilling a full 16k-token
-          # prompt on four CPU cores takes longer than that, so the default
-          # produced "Failed to review PR" after two silent timeouts - with a
-          # green check on the job.
-          CONFIG__AI_TIMEOUT: "600"
+          # litellm gives up after 120s by default. At the measured ~13.7
+          # tokens/second of prefill on a 4 vCPU runner, a full-budget prompt
+          # needs ~12 minutes before it emits a token - so the default produced
+          # "Failed to review PR" after two silent timeouts, with a green check
+          # on the job.
+          CONFIG__AI_TIMEOUT: "1500"
           # ... and because a failed review still exits 0 by default, surface it
           # as a failed job instead of a comment nobody notices.
           CONFIG__PROPAGATE_TOOL_ERRORS: "true"
