@@ -284,13 +284,14 @@ jobs:
           OLLAMA_API_KEY: ollama
           # litellm gives up after 120s by default. At the measured ~13.7
           # tokens/second of prefill on a 4 vCPU runner, a full-budget prompt
-          # needs ~12 minutes before it emits a token - so the default produced
+          # needs ~20 minutes before it emits a token - so the default produced
           # "Failed to review PR" after two silent timeouts, with a green check
           # on the job.
           CONFIG__AI_TIMEOUT: "1800"
           # ... and because a failed review still exits 0 by default, surface it
           # as a failed job instead of a comment nobody notices.
           CONFIG__PROPAGATE_TOOL_ERRORS: "true"
+          # Three findings is about all a 7B model can support without padding
           # the comment with restatements of the diff.
           PR_REVIEWER__NUM_MAX_FINDINGS: "3"
           PR_REVIEWER__EXTRA_INSTRUCTIONS: |

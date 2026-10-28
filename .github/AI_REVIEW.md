@@ -23,7 +23,7 @@ comment is posted with the workflow's own `GITHUB_TOKEN`.
 | Key / secret | **none** |
 | Cost | **$0** — runner minutes are free for public repositories |
 | Runs on | `ubuntu-latest` (4 vCPU / 16 GB), Docker + Python 3.12 |
-| Time per review | ~18–22 min for a full-budget diff, seconds-to-minutes for a small one (see *the two numbers*) |
+| Time per review | up to ~27 min for a full-budget diff, seconds-to-minutes for a small one (see *the two numbers*) |
 
 Nothing here is a required status check: the reviewer advises, and
 `Lint + hermetic tests`, CodeQL and CircleCI still decide whether a PR can merge.
@@ -68,9 +68,9 @@ Measured against the standard 4 vCPU runner:
 
 | Tag | Disk | Review time | Notes |
 | --- | --- | --- | --- |
-| `qwen2.5-coder:7b-instruct-q4_K_M` | 4.7 GB | ~18–22 min | default; best balance here |
-| `qwen2.5-coder:3b-instruct-q4_K_M` | 1.9 GB | ~9–12 min | roughly twice the prefill speed, noticeably shallower |
-| `qwen2.5-coder:14b-instruct-q4_K_M` | 9.0 GB | ~35 min+ | better, but close to the 16 GB limit and near the job timeout |
+| `qwen2.5-coder:7b-instruct-q4_K_M` | 4.7 GB | ~20–27 min | default; best balance here |
+| `qwen2.5-coder:3b-instruct-q4_K_M` | 1.9 GB | ~10–14 min | roughly twice the prefill speed, noticeably shallower |
+| `qwen2.5-coder:14b-instruct-q4_K_M` | 9.0 GB | ~40 min+ | better, but close to the 16 GB limit and near the job timeout |
 | `gpt-oss:20b` | 13 GB | — | needs more than 16 GB RAM; it will thrash or be OOM-killed |
 
 Timings are the whole job on a standard runner with the weights already cached and
@@ -112,7 +112,9 @@ were measured too, and they are not a cheap trade: at 8192 the review dropped
 *both* files the introducing PR changed, and at 10240 it still dropped the one
 that mattered — each time while reporting "no major issues detected". A review
 that silently skips the changed file is worse than no review, so coverage wins
-over latency.
+over latency. Measured end to end on the 13k-token PR that introduced this
+workflow: a 24-minute review step and 26.5 minutes for the job, with the weights
+restored from cache.
 
 If you raise `PR_AGENT_MAX_TOKENS`, raise `OLLAMA_CONTEXT_LENGTH` above it, raise
 `CONFIG__AI_TIMEOUT` above the new prefill time, and check that
