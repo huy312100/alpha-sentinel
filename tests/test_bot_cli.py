@@ -16,6 +16,7 @@ import pytest
 
 import bot.main as bot_main
 from bot.engine import ScanReport
+from config.endpoints import bundled_endpoints
 from config.errors import ConfigError
 from config.settings import Settings
 from tests.conftest import WATCHLIST_YAML, clear_inherited_settings, settings_env_keys
@@ -174,15 +175,34 @@ def test_a_setting_inherited_from_the_host_is_cleared(monkeypatch):
 
     ``DEEPSEEK_INPUT_USD_PER_MTOK=invalid`` is mapped onto ``LLM_INPUT_USD_PER_MTOK``
     by ``Settings.load()``, which then cannot parse it: the CLI would exit 2 before
-    demo mode was ever reached.
+    demo mode was ever reached. The alias is the only setting this test adds, and
+    the assertion names the diagnostic it produces, so any other load failure -
+    a host ``ENDPOINTS_FILE``, an unparseable provider - cannot stand in for it.
     """
+    clear_inherited_settings(monkeypatch)
     monkeypatch.setenv("DEEPSEEK_INPUT_USD_PER_MTOK", "not-a-number")
-    monkeypatch.setenv("ENDPOINTS_FILE", "/nonexistent/endpoints.yaml")
-    with pytest.raises(ConfigError):
+
+    with pytest.raises(ConfigError, match="LLM_INPUT_USD_PER_MTOK must be a float, got 'not-a-number'"):
         Settings.load(load_dotenv_file=False)
 
     clear_inherited_settings(monkeypatch)
 
     assert "DEEPSEEK_INPUT_USD_PER_MTOK" not in os.environ
-    assert "ENDPOINTS_FILE" not in os.environ
     assert Settings.load(load_dotenv_file=False).llm.input_usd_per_mtok > 0
+
+
+def test_an_endpoint_overlay_inherited_from_the_host_is_cleared(monkeypatch, tmp_path):
+    """The same leak through ``ENDPOINTS_FILE``: a dead host overlay must not be read.
+
+    Kept apart from the alias test so neither diagnostic can satisfy the other.
+    """
+    clear_inherited_settings(monkeypatch)
+    monkeypatch.setenv("ENDPOINTS_FILE", str(tmp_path / "absent-endpoints.yaml"))
+
+    with pytest.raises(ConfigError, match="cannot read endpoint catalogue"):
+        Settings.load(load_dotenv_file=False)
+
+    clear_inherited_settings(monkeypatch)
+
+    assert "ENDPOINTS_FILE" not in os.environ
+    assert Settings.load(load_dotenv_file=False).endpoints.paths == bundled_endpoints().paths

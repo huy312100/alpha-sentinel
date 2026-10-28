@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 from string import Formatter
@@ -12,6 +13,7 @@ from config.endpoints import EndpointSettings, REQUIRED_ENDPOINTS
 from config.settings import (
     DEFAULT_LLM_PROVIDER,
     LLM_PROVIDER_PRESETS,
+    PROJECT_ROOT,
     ConfigError,
     Settings,
     iter_secret_values,
@@ -155,9 +157,24 @@ def test_unknown_enabled_layer_is_a_boot_problem():
     assert any("ENABLED_LAYERS" in problem and "technical" in problem for problem in problems)
 
 
+def test_a_path_that_cannot_be_resolved_is_a_boot_problem(tmp_path):
+    """A symlink loop must be a ``ConfigError``, not a traceback with exit 1.
+
+    ``_env_path`` anchors a relative setting to the repository root, and
+    ``Path.resolve()`` raises ``RuntimeError`` when the path loops through itself.
+    That used to escape ``Settings.load()``, so the CLI printed a traceback and
+    exited 1 - the one failure mode this gate exists to prevent.
+    """
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    relative = os.path.relpath(tmp_path / "a", PROJECT_ROOT)
+
+    with pytest.raises(ConfigError, match="DATA_DIR cannot be resolved to a path"):
+        load(DATA_DIR=relative)
+
+
 def test_env_example_does_not_override_presets():
     """Copying the template must not send model ids like ``model`` to a provider."""
-    from config.settings import PROJECT_ROOT
 
     active = [
         line.strip()

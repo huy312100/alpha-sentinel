@@ -138,8 +138,18 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
 
 def _env_path(env: Mapping[str, str], key: str, default: str) -> Path:
     raw = _get(env, key, default) or default
-    path = Path(raw).expanduser()
-    return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+    try:
+        path = Path(raw).expanduser()
+        return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+    except (OSError, RuntimeError) as exc:
+        # A relative setting is resolved against the repository root, and that can
+        # fail on the machine rather than in the value: ``Path.resolve()`` raises
+        # ``RuntimeError`` on a symlink loop, ``expanduser()`` when HOME is gone and
+        # a stat raises ``OSError``. All three are deploy mistakes, so report them
+        # like any other bad setting - escaping ``Settings.load()`` uncaught would
+        # print a traceback and exit 1 instead of the diagnostic and exit 2.
+        # Deliberately narrow: an unrelated programming error must still escape.
+        raise ConfigError(f"{key} cannot be resolved to a path: {raw!r} ({exc})") from exc
 
 
 # ---------------------------------------------------------------------------
