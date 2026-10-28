@@ -47,10 +47,14 @@ permissions:
   contents: read
 
 concurrency:
-  # One review per PR: a force-push mid-review must not leave two comments
-  # quoting two different diffs. Cancelling the stale run also frees the CPU
-  # that was about to be spent on a diff nobody will read.
-  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  # A force-push mid-review must not leave two comments quoting two different
+  # diffs, so each push review cancels the previous one. The group also carries
+  # the event name and the sender type, and it has to: CodeRabbit commenting on
+  # the PR - and PR-Agent posting its own progress comment mid-run - both arrive
+  # as `issue_comment`. With a single per-PR group, that bot chatter cancelled
+  # the review that was running (observed on PR #14) and would have made every
+  # /review cancel itself.
+  group: ai-review-${{ github.event_name }}-${{ github.event.sender.type }}-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 env:
@@ -72,6 +76,17 @@ env:
 jobs:
   local-review:
     name: Local review (Ollama)
+    # Cheap early exit: a comment that is not a review command, or one written by
+    # a bot, never needs a runner at all. The gate below re-checks every case and
+    # is what emits a human-readable notice.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request != null &&
+       github.event.sender.type != 'Bot' &&
+       (startsWith(github.event.comment.body, '/review') ||
+        startsWith(github.event.comment.body, '/describe') ||
+        startsWith(github.event.comment.body, '/improve') ||
+        startsWith(github.event.comment.body, '/ask')))
     runs-on: ubuntu-latest
     # A cold run pulls ~4.7 GB of weights, then reviews on CPU.
     timeout-minutes: 30

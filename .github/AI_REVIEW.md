@@ -173,7 +173,7 @@ Each of these was a silent failure once, so each has a guard:
 | `PR_AGENT_VERSION` pinned | the review is parsed as structured JSON, so an upstream format change would degrade to "no findings" rather than an error |
 | Model weights cached by tag | `~/.ollama/models`, keyed on the model id; the weights never change for a tag |
 | `OLLAMA_NUM_PARALLEL=1`, `MAX_LOADED_MODELS=1` | keeps a 16 GB runner from loading two copies during a fast push/force-push pair |
-| `concurrency` per PR | a force-push cancels the in-flight review, so two comments never quote two different diffs |
+| `concurrency` keyed on event **and** sender type | a force-push cancels the previous push review, but bot chatter cannot cancel anything: CodeRabbit's comment and PR-Agent's own progress comment both arrive as `issue_comment`, and on PR #14 the first of them cancelled the running review |
 
 PR-Agent talks to GitHub over the API and works from the diff it fetches; this
 job does not check out the PR tree at all. That is why the wall-clock cost is
