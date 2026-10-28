@@ -172,6 +172,7 @@ def test_a_path_that_cannot_be_resolved_is_a_boot_problem(tmp_path):
     with pytest.raises(ConfigError, match="DATA_DIR cannot be resolved to a path"):
         load(DATA_DIR=relative)
 
+    # An absolute setting is resolved too, so it cannot smuggle a loop past boot.
     with pytest.raises(ConfigError, match="HOT_DB_PATH cannot be resolved to a path"):
         load(HOT_DB_PATH=str(tmp_path / "a"))
 
