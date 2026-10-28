@@ -41,3 +41,7 @@ data/
 .idea/
 .vscode/
 *.swp
+
+# AI review scratch (Gemini CLI writes .gemini/settings.json in the runner)
+.gemini/
+gha-creds-*.json

@@ -1,0 +1,432 @@
+# =============================================================================
+# AI code review - four independent reviewers, every one bring-your-own-key.
+#
+# CodeRabbit is quota-bound and stops reviewing mid-quarter. These jobs run on
+# GitHub's own runners against keys this repository owns, so the only ceiling is
+# the provider's rate limit and our spend. Nothing here is a required status
+# check, and every job self-skips with a notice when its key is absent - the
+# workflow is green before a single secret exists, and stays green on forks.
+#
+# Secrets (Settings > Secrets and variables > Actions > New repository secret):
+#   DEEPSEEK_API_KEY    PR-Agent      default model deepseek/deepseek-chat
+#   ANTHROPIC_API_KEY   Claude Code   on open / ready_for_review / @claude
+#   GEMINI_API_KEY      Gemini CLI    Google AI Studio free tier
+#   OPENAI_API_KEY      Codex         opt-in, see ENABLE_CODEX_REVIEW below
+#   OPENROUTER_API_KEY  PR-Agent      only when PR_AGENT_MODEL is openrouter/*
+#
+# Repository variables (Settings > Secrets and variables > Actions > Variables):
+#   PR_AGENT_MODEL       LiteLLM model id (default deepseek/deepseek-chat)
+#   ENABLE_CODEX_REVIEW  'true' arms the Codex job; anything else leaves it off
+#
+# Fork PRs are deliberately unreviewed: on `pull_request` GitHub withholds
+# secrets from forks, and every job below skips instead of failing. Do not
+# switch this file to `pull_request_target` - Claude, Gemini and Codex check out
+# and read the PR tree, and that combination executes untrusted code with our
+# keys in scope. Setup notes and provider switching live in .github/AI_REVIEW.md
+# =============================================================================
+name: AlphaSentinel AI review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review, synchronize]
+    # Same filters as .coderabbit.yaml: artifacts and scratch data are not code.
+    paths-ignore:
+      - "data/**"
+      - "tmp/**"
+      - "**/*.parquet"
+      - "**/*.db"
+  # Slash commands (/review, /improve, /ask) and @claude mentions arrive here.
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One review pass per PR: a force-push while a reviewer is mid-flight must not
+  # leave two bots quoting two different diffs. Cancelling the stale run also
+  # stops us paying for tokens on a diff nobody will read.
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # PR-Agent: the direct CodeRabbit replacement (summary + line review + slash
+  # commands). Model-agnostic through LiteLLM, so it runs on whatever provider
+  # we can afford; DeepSeek is the default because this service already pays for
+  # it in production and it is far cheaper per token than a frontier model.
+  # ---------------------------------------------------------------------------
+  pr-agent:
+    name: PR-Agent (${{ vars.PR_AGENT_MODEL || 'deepseek/deepseek-chat' }})
+    if: >-
+      github.event.sender.type != 'Bot' &&
+      (github.event_name == 'pull_request' ||
+       (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      # The Action takes one provider key, under that provider's own env name,
+      # and litellm refuses to identify a model when that name is empty. So
+      # resolve model -> key here and export exactly one variable, rather than
+      # passing four secrets through and hoping the unused ones are harmless.
+      - name: Resolve model and provider key
+        id: gate
+        env:
+          MODEL: ${{ vars.PR_AGENT_MODEL || 'deepseek/deepseek-chat' }}
+          DEEPSEEK_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          case "$MODEL" in
+            deepseek/*)      ENV_NAME=DEEPSEEK__KEY;   KEY=${DEEPSEEK_KEY:-} ;;
+            anthropic/*)     ENV_NAME=ANTHROPIC__KEY;  KEY=${ANTHROPIC_KEY:-} ;;
+            openai/*|gpt-*)  ENV_NAME=OPENAI__KEY;     KEY=${OPENAI_KEY:-} ;;
+            openrouter/*)    ENV_NAME=OPENROUTER__KEY; KEY=${OPENROUTER_KEY:-} ;;
+            *)               ENV_NAME=;                KEY= ;;
+          esac
+          if [ -z "${ENV_NAME}" ] || [ -z "${KEY}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=PR-Agent skipped::No key for model '${MODEL}'. Add the matching secret - see .github/AI_REVIEW.md."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "CONFIG__MODEL=${MODEL}"
+            # No cross-provider fallback: the shipped default is an OpenAI model,
+            # so a DeepSeek outage would silently spend GPT tokens (or hard-fail
+            # on a missing key). One model, one bill.
+            echo "CONFIG__FALLBACK_MODELS=[]"
+            echo "${ENV_NAME}=${KEY}"
+          } >> "$GITHUB_ENV"
+
+      - name: Run PR-Agent
+        if: steps.gate.outputs.enabled == 'true'
+        uses: the-pr-agent/pr-agent@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # These are read through dynaconf dotted lookups
+          # (get_settings().get("github_action_config.auto_review")), so the nested
+          # `SECTION__KEY` spelling is what always resolves - and it is the only
+          # spelling that casts a JSON list (`PUSH_COMMANDS`) back into a list.
+          GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
+          GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "true"
+          # `synchronize` is not part of pr_actions - it is gated separately by
+          # handle_push_trigger, and does nothing unless push_commands is set.
+          # /review only: the summary from the PR's first push still stands.
+          GITHUB_ACTION_CONFIG__HANDLE_PUSH_TRIGGER: "true"
+          GITHUB_ACTION_CONFIG__PUSH_COMMANDS: '["/review"]'
+          # The same path priorities .coderabbit.yaml enforced, so swapping the
+          # reviewer does not quietly lower the bar.
+          PR_REVIEWER__EXTRA_INSTRUCTIONS: >-
+            This service trades real money against third-party APIs: prioritise
+            correctness, failure isolation and secret handling over style.
+            ai_engine/ prompts and parsers are a trust boundary - LLM output is
+            untrusted, so flag every path where malformed JSON, a missing field
+            or a prompt-injection string could raise, silently change a verdict
+            or leak the API key, and keep watchdog timeouts and degraded-mode
+            accounting intact. In core/scoring.py veto precedence is
+            contractual: a hard risk flag or risk_score above the ceiling vetoes
+            regardless of alpha, and size must stay monotonic in the blended
+            score. In bot/ one token failure must never abort a cycle, no
+            storage error may escape into the loop, dry runs persist and send
+            nothing, and Telegram sends stay deduplicated. In storage/ schema
+            changes need a migration path and a version bump, SQL must be
+            parameterised, Parquet writes idempotent under dedupe keys. In
+            tests/ forbid network access, real credentials and writes outside
+            tmp_path, and reject tests that only assert truthiness of a mock.
+            Flag secrets and over-broad permissions in .github/.
+
+  # ---------------------------------------------------------------------------
+  # Claude Code: the second opinion, aimed at reasoning depth rather than
+  # coverage. Runs on open/ready_for_review and on @claude mentions rather than
+  # on every push - it is the expensive reviewer, and an amend nobody has
+  # reshaped yet does not deserve a fresh read.
+  # ---------------------------------------------------------------------------
+  claude:
+    name: Claude review
+    if: >-
+      github.event.sender.type != 'Bot' &&
+      ((github.event_name == 'pull_request' &&
+        contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action)) ||
+       (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Check for an Anthropic key
+        id: gate
+        env:
+          ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_KEY:-}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Claude review skipped::ANTHROPIC_API_KEY is not set - see .github/AI_REVIEW.md."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Claude review
+        if: steps.gate.outputs.enabled == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+
+            You are reviewing a Python service that trades a small book against
+            third-party APIs. Review only what this PR changes: do not re-review
+            untouched code, do not restate the diff, do not praise.
+
+            If the triggering comment asks a specific question, answer it first,
+            then run the review.
+
+            Non-negotiables, in priority order:
+            1. ai_engine/** - prompts and parsers are a trust boundary. LLM
+               output is untrusted: malformed JSON, a missing field or a
+               prompt-injection string must not raise, silently change a verdict
+               or leak the API key. Watchdog timeouts and degraded-mode
+               accounting must survive any edit.
+            2. core/scoring.py - veto precedence is contractual: a hard risk
+               flag or risk_score above the ceiling vetoes regardless of alpha,
+               and position sizing must stay monotonic in the blended score.
+            3. bot/** - one token failure must never abort a cycle, no storage
+               error may escape into the loop, dry runs persist and send
+               nothing, Telegram sends stay deduplicated.
+            4. storage/** - schema changes need a migration path and a version
+               bump; SQL parameterised; Parquet writes idempotent under dedupe.
+            5. tests/** - hermetic: no network, no real credentials, no writes
+               outside tmp_path. A test that only asserts a mock is truthy is a
+               defect, not coverage.
+            6. .github/** - no secrets in workflow files, no over-broad
+               permissions.
+
+            Report only defects you can point at a specific line, each tagged
+            CRITICAL / HIGH / MEDIUM / NIT. Eight findings maximum; if the diff
+            is clean, say so in one line. Do not propose refactors the diff does
+            not require.
+
+            Use mcp__github_inline_comment__create_inline_comment with
+            confirmed: true for line-level findings, and `gh pr comment` once for
+            a top-level summary of ten lines or fewer. Post GitHub comments only.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
+
+
+  # ---------------------------------------------------------------------------
+  # Gemini CLI: the free-tier reviewer (Google AI Studio quota), a different
+  # model family from the other two. Uses Google's official PR-review recipe -
+  # the code-review extension plus the GitHub MCP server, which is how this
+  # reviewer posts its own inline comments without shell access to our token.
+  # ---------------------------------------------------------------------------
+  gemini:
+    name: Gemini review
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.sender.type != 'Bot' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Check for a Gemini key
+        id: gate
+        env:
+          GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "${GEMINI_KEY:-}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Gemini review skipped::GEMINI_API_KEY is not set - see .github/AI_REVIEW.md."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The extension reads this instead of parsing event JSON, and it keeps the
+      # PR number out of the prompt string (no expression injection into text).
+      - name: Write the review context
+        if: steps.gate.outputs.enabled == 'true'
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p .gemini
+          jq -n \
+            --arg repo "$REPOSITORY" \
+            --arg pr "$PULL_REQUEST_NUMBER" \
+            '{repository: $repo, pull_request_number: $pr}' > .gemini/context.json
+
+      - name: Run Gemini pull request review
+        if: steps.gate.outputs.enabled == 'true'
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          GEMINI_CLI_TRUST_WORKSPACE: "true"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          workflow_name: alpha-sentinel-ai-review
+          settings: |
+            {
+              "model": { "maxSessionTurns": 25 },
+              "mcpServers": {
+                "github": {
+                  "command": "docker",
+                  "args": [
+                    "run", "-i", "--rm",
+                    "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+                    "ghcr.io/github/github-mcp-server:v0.27.0"
+                  ],
+                  "includeTools": [
+                    "add_comment_to_pending_review",
+                    "pull_request_read",
+                    "pull_request_review_write"
+                  ],
+                  "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}" }
+                }
+              },
+              "tools": { "core": [] }
+            }
+          extensions: |
+            ["https://github.com/gemini-cli-extensions/code-review"]
+          prompt: "/pr-code-review"
+
+
+  # ---------------------------------------------------------------------------
+  # Codex: off unless a maintainer sets the repository variable
+  # ENABLE_CODEX_REVIEW=true. Four bots on every PR is noise; this one is here
+  # so a fourth opinion costs a variable flip, not a new workflow. It reviews the
+  # PR merge commit, then posts Codex's final message as one comment.
+  # ---------------------------------------------------------------------------
+  codex:
+    name: Codex review (opt-in)
+    if: >-
+      vars.ENABLE_CODEX_REVIEW == 'true' &&
+      github.event_name == 'pull_request' &&
+      github.event.sender.type != 'Bot' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Check for an OpenAI key
+        id: gate
+        env:
+          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_KEY:-}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Codex review skipped::ENABLE_CODEX_REVIEW is on but OPENAI_API_KEY is not set."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the PR merge commit
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          persist-credentials: false
+
+      # Codex diffs locally, so both ends of the comparison must exist in the
+      # clone: the merge ref only brings the merge commit with it.
+      - name: Fetch base and head
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags origin "$PR_BASE_REF" "+refs/pull/$PR_NUMBER/head"
+
+      - name: Run Codex
+        id: run_codex
+        if: steps.gate.outputs.enabled == 'true'
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # Sandbox: left at the action's default (`workspace-write`). Codex only
+          # needs to read the working tree here, and the default keeps it from
+          # touching anything outside it.
+          prompt: |
+            Review ONLY the changes introduced by this PR:
+              git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+
+            This is a Python service that trades real money against third-party
+            APIs, so rank findings by blast radius, not by style. Check, in
+            priority order:
+              1. ai_engine/** - LLM output is untrusted. Malformed JSON, a
+                 missing field or a prompt-injection string must not raise,
+                 silently change a verdict or leak the API key.
+              2. core/scoring.py - veto precedence is contractual; size must
+                 stay monotonic in the blended score.
+              3. bot/** - one token failure must never abort a cycle; dry runs
+                 persist and send nothing.
+              4. storage/** - schema change needs a migration and version bump;
+                 SQL parameterised; Parquet writes idempotent.
+              5. tests/** - hermetic: no network, no real credentials, no writes
+                 outside tmp_path.
+              6. .github/** - no secrets, no over-broad permissions.
+
+            Output GitHub-flavoured Markdown: one `### <severity>: <file>:<line>`
+            heading per finding (CRITICAL/HIGH/MEDIUM/NIT), one sentence on the
+            risk and one on the fix. Eight findings maximum. If the diff is
+            clean, output a single line saying so. No praise, no summary of what
+            the diff already says.
+
+      - name: Post the review
+        if: steps.gate.outputs.enabled == 'true' && steps.run_codex.outputs.final-message != ''
+        uses: actions/github-script@v7
+        env:
+          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
+        with:
+          script: |
+            const body = (process.env.CODEX_FINAL_MESSAGE || '').trim();
+            if (!body) {
+              core.info('Codex returned an empty message; nothing to post.');
+              return;
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## Codex review\n\n${body}`,
+            });
+
