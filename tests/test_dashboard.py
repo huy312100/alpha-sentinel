@@ -6,7 +6,7 @@ from streamlit.testing.v1 import AppTest
 
 from core.models import VerdictStatus
 from storage.hot_store import HotStore
-from tests.conftest import PROJECT_ROOT, WATCHLIST_YAML
+from tests.conftest import PROJECT_ROOT, WATCHLIST_YAML, clear_inherited_settings
 
 
 def _point_env_at(monkeypatch, tmp_path):
@@ -16,7 +16,8 @@ def _point_env_at(monkeypatch, tmp_path):
     watchlist = tmp_path / "watchlists.yaml"
     watchlist.write_text(WATCHLIST_YAML, encoding="utf-8")
 
-    # Hermetic: a developer's .env must never inject real credentials into a test.
+    # Hermetic: a developer's .env or an exported setting must never leak in.
+    clear_inherited_settings(monkeypatch)
     monkeypatch.setattr("config.settings._maybe_load_dotenv", lambda: None)
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("DEMO_MODE", "true")

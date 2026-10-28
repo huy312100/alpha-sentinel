@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 from string import Formatter
@@ -12,6 +13,7 @@ from config.endpoints import EndpointSettings, REQUIRED_ENDPOINTS
 from config.settings import (
     DEFAULT_LLM_PROVIDER,
     LLM_PROVIDER_PRESETS,
+    PROJECT_ROOT,
     ConfigError,
     Settings,
     iter_secret_values,
@@ -155,9 +157,49 @@ def test_unknown_enabled_layer_is_a_boot_problem():
     assert any("ENABLED_LAYERS" in problem and "technical" in problem for problem in problems)
 
 
+def test_a_path_that_cannot_be_resolved_is_a_boot_problem(tmp_path):
+    """A symlink loop must be a ``ConfigError``, not a traceback with exit 1.
+
+    ``_env_path`` resolves both absolute and repository-relative settings, and
+    ``Path.resolve()`` raises when the path loops through itself.
+    That used to escape ``Settings.load()``, so the CLI printed a traceback and
+    exited 1 - the one failure mode this gate exists to prevent.
+    """
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    relative = os.path.relpath(tmp_path / "a", PROJECT_ROOT)
+
+    with pytest.raises(ConfigError, match="DATA_DIR cannot be resolved to a path"):
+        load(DATA_DIR=relative)
+
+    # An absolute setting is resolved too, so it cannot smuggle a loop past boot.
+    with pytest.raises(ConfigError, match="HOT_DB_PATH cannot be resolved to a path"):
+        load(HOT_DB_PATH=str(tmp_path / "a"))
+
+    # ``..`` normalises the loop away and leaves a sibling of it, so the check has
+    # to survive a path that walks back out of the loop.
+    with pytest.raises(ConfigError, match="PARQUET_ROOT cannot be resolved to a path"):
+        load(PARQUET_ROOT=str(tmp_path / "a" / ".." / "cold"))
+
+
+def test_a_path_that_does_not_exist_yet_still_loads(tmp_path):
+    """The stores create their paths on first boot, so absence is not an error.
+
+    Only the longest existing prefix is resolved strictly and the missing tail is
+    re-attached, which is what keeps a fresh deploy bootable while the loop check
+    stays on.
+    """
+    hot_db = tmp_path / "data" / "hot" / "alpha_sentinel.db"
+    cold = tmp_path / "data" / "cold"
+
+    settings = load(HOT_DB_PATH=str(hot_db), PARQUET_ROOT=str(cold))
+
+    assert settings.storage.hot_db_path == hot_db.resolve()
+    assert settings.storage.parquet_root == cold.resolve()
+
+
 def test_env_example_does_not_override_presets():
     """Copying the template must not send model ids like ``model`` to a provider."""
-    from config.settings import PROJECT_ROOT
 
     active = [
         line.strip()
