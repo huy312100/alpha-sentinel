@@ -1,9 +1,14 @@
 # AI code review
 
-CodeRabbit is a hosted reviewer with a monthly quota: when it runs dry, PRs go
-unreviewed and the quota does not come back until the billing cycle turns over.
-The usual fix is another hosted reviewer, which trades that quota for a per-token
-bill and an API key to provision, rotate and keep out of a public repo.
+CodeRabbit is a hosted reviewer behind gates this repo does not control. A
+monthly quota that runs out mid-quarter and does not return until the billing
+cycle turns over — that is what happened on PR #13. And an open-source
+eligibility rule: on PR #14 it declined with *"This repository does not receive
+automatic reviews because it has fewer than 10 stars"*, leaving only a
+"trigger review" checkbox.
+
+The usual fix is another hosted reviewer, which trades those gates for a
+per-token bill and an API key to provision, rotate and keep out of a public repo.
 
 This repo does the opposite. `local-review` in `.github/workflows/ai-review.yml`
 runs [PR-Agent](https://github.com/qodo-ai/pr-agent) against a small language
@@ -18,7 +23,7 @@ comment is posted with the workflow's own `GITHUB_TOKEN`.
 | Key / secret | **none** |
 | Cost | **$0** — runner minutes are free for public repositories |
 | Runs on | `ubuntu-latest` (4 vCPU / 16 GB), Docker + Python 3.12 |
-| Time per review | ~8–10 min cold, ~4–6 min once the weights are cached |
+| Time per review | ~7–9 min cold (weights download included), ~4–7 min once cached |
 
 Nothing here is a required status check: the reviewer advises, and
 `Lint + hermetic tests`, CodeQL and CircleCI still decide whether a PR can merge.
@@ -68,6 +73,9 @@ Measured against the standard 4 vCPU runner:
 | `qwen2.5-coder:14b-instruct-q4_K_M` | 9.0 GB | ~10–14 min | better, but close to the 16 GB limit |
 | `gpt-oss:20b` | 13 GB | — | needs more than 16 GB RAM; it will thrash or be OOM-killed |
 
+Timings are the whole job on a standard runner with the weights already cached;
+a full 16k-token diff sits at the top of each range, a small one at the bottom.
+
 Two constraints worth knowing before switching:
 
 * **RAM.** Model plus KV cache has to fit in 16 GB alongside the OS. The 7B Q4
@@ -82,17 +90,22 @@ the download again.
 
 Both live in the workflow's `env:` block and they are a pair:
 
-* `PR_AGENT_MAX_TOKENS: 8192` — the budget PR-Agent is willing to send. A local
+* `PR_AGENT_MAX_TOKENS: 16384` — the budget PR-Agent is willing to send. A local
   model is not in PR-Agent's own token table, so the run aborts unless
-  `CONFIG__CUSTOM_MODEL_MAX_TOKENS` is set; past that budget PR-Agent prunes the
-  diff down to the hunks it thinks matter most.
-* `OLLAMA_CONTEXT_LENGTH: 16384` — the model's actual window. Ollama sizes its
+  `CONFIG__CUSTOM_MODEL_MAX_TOKENS` is set. Past the budget, PR-Agent prunes the
+  diff to the hunks it thinks matter most **and names the files it dropped** at
+  the bottom of the comment — read that line.
+* `OLLAMA_CONTEXT_LENGTH: 24576` — the model's actual window. Ollama sizes its
   default from available VRAM, which on a CPU-only runner means **4k**. A prompt
-  that exceeds the window is truncated *silently*: the model then reviews the
-  tail of the diff and reports confidently on the rest. If reviews start missing
-  half of a large PR, this pairing is the first thing to check.
+  longer than the window is truncated *silently*: the model then reviews the tail
+  of the diff and reports confidently on the rest.
 
-The window must clear the send budget, not merely the size of the diff.
+The window must clear the send budget, not merely the size of the diff. The
+first cut of this workflow had these at 8192 and 16384, and on the PR that
+introduced it the diff (9,543 tokens) lost the two files it was about to change:
+the comment said "no major issues detected" and, three lines lower, that the
+reviewed files had not been included. If reviews start missing half of a large
+PR, this pairing is the first thing to check.
 
 ## On demand
 

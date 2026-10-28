@@ -62,16 +62,20 @@ env:
   # slower; .github/AI_REVIEW.md lists the sizes that fit a standard runner.
   OLLAMA_MODEL: ${{ vars.AI_REVIEW_MODEL || 'qwen2.5-coder:7b-instruct-q4_K_M' }}
   OLLAMA_URL: http://127.0.0.1:11434
-  # Ollama sizes its context from available VRAM, which is 4k on a CPU-only
-  # runner - and anything longer than the window is truncated silently, after
-  # which the model reviews the tail of the diff and reports confidently on the
-  # rest. The window must clear the budget PR-Agent is willing to send
-  # (PR_AGENT_MAX_TOKENS below), not merely the size of the diff.
-  OLLAMA_CONTEXT_LENGTH: "16384"
+  # The model's window must clear the budget PR-Agent is willing to send, or the
+  # excess is dropped silently and the review describes a diff it never saw.
+  # Ollama sizes its context from available VRAM, i.e. 4k on a CPU-only runner,
+  # which is why this is explicit. 24k at ~56 KB of KV cache per token is about
+  # 1.4 GB on top of the 4.7 GB of weights - comfortable inside 16 GB.
+  OLLAMA_CONTEXT_LENGTH: "24576"
   # Pinned: the review text is parsed as structured JSON, so a silent upstream
   # format change would degrade into "no findings" rather than an error.
   PR_AGENT_VERSION: "0.49.0"
-  PR_AGENT_MAX_TOKENS: "8192"
+  # Diff budget. At 8192 this PR's own diff (9543 tokens) lost the two files it
+  # was about to change, and the review still reported "no major issues" - which
+  # is why this is 16384 and why the pairing with OLLAMA_CONTEXT_LENGTH matters.
+  # Past the budget PR-Agent names the files it dropped in the comment.
+  PR_AGENT_MAX_TOKENS: "16384"
 
 jobs:
   local-review:
