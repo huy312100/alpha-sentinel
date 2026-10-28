@@ -136,11 +136,35 @@ def _env_bool(env: Mapping[str, str], key: str, default: bool) -> bool:
     raise ConfigError(f"{key} must be a boolean (true/false), got {raw!r}")
 
 
+def _resolve_existing_prefix(target: Path) -> Path:
+    """Resolve ``target`` without letting ``..`` normalise a symlink loop away.
+
+    ``Path.resolve()`` is non-strict by default and normalises ``..`` before it
+    follows the component it points at, so ``loop/../hot.db`` comes back as a
+    sibling of the loop instead of raising: the gate would pass and the store
+    would create its database somewhere the operator never configured.
+
+    Strict resolution stops at the first missing component - ``HOT_DB_PATH``,
+    ``PARQUET_ROOT`` and the watchlist are routinely created on first boot - so
+    only the longest existing prefix is resolved strictly and the rest is
+    re-attached. A loop anywhere in that prefix still raises.
+    """
+    probe, tail = target, []
+    while True:
+        try:
+            return probe.resolve(strict=True).joinpath(*reversed(tail))
+        except FileNotFoundError:
+            if probe == probe.parent:
+                raise
+            tail.append(probe.name)
+            probe = probe.parent
+
+
 def _env_path(env: Mapping[str, str], key: str, default: str) -> Path:
     raw = _get(env, key, default) or default
     try:
         path = Path(raw).expanduser()
-        return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
+        return _resolve_existing_prefix(path if path.is_absolute() else PROJECT_ROOT / path)
     except (OSError, RuntimeError) as exc:
         # Every setting is resolved here - a relative one against the repository
         # root, an absolute one for the target it points at - and that reaches the
