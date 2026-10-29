@@ -320,6 +320,25 @@ jobs:
           fi
           pr-agent --pr_url="$PR_URL" "${args[@]}"
 
+      # A failed review leaves a bare "Failed to review PR" comment behind, and
+      # a later successful run replaces the guide but not that line - so a green
+      # PR keeps carrying a stale failure notice. Delete it once the review has
+      # actually succeeded. No status function in `if:`, so it is still gated on
+      # the review step having passed.
+      - name: Drop a stale failure comment
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.gate.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          pr="${PR_URL##*/}"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and .body == "Failed to review PR") | .id' |
+            while read -r id; do
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$id"
+            done
+
       - name: Show the model server log on failure
         if: failure() && steps.gate.outputs.skip != 'true'
         run: docker logs --tail 100 ollama || true

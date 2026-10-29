@@ -222,5 +222,6 @@ CPU, and why a malicious PR cannot get its own code executed by the reviewer.
 | Review ignores the second half of a big PR | context window smaller than the diff: raise `OLLAMA_CONTEXT_LENGTH` (and keep it above `PR_AGENT_MAX_TOKENS`) |
 | Review takes the whole job timeout and is killed | the model is too large for the runner, or `CONFIG__AI_TIMEOUT` was raised without raising `timeout-minutes` |
 | `Failed to review PR` on the PR but the job is green | `CONFIG__PROPAGATE_TOOL_ERRORS` was dropped; the job now fails with the same message |
+| `Failed to review PR` still on a PR that is now green | a failed run posted it and a later run replaces only the guide, not that line; the workflow deletes it after a successful review, so this means the deletion step failed too |
 | Comment posted but empty of findings | the model answered outside the JSON shape; try a stronger tag, and check the step log for a parse warning |
 | Every run re-downloads 4.7 GB | cache miss: cached weights live in `~/.ollama/models`, keyed on the model id, and the cache step needs the `chmod` step above to be able to read them |
