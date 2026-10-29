@@ -24,14 +24,11 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import pandas as pd
 
-from core.logging import get_logger
 from core.models import utcnow
 from ml.dataset import TRAINING_DATASET, load_training_rows, store_from_settings
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from storage.parquet_store import ParquetStore
-
-log = get_logger(__name__)
 
 #: Below this many paired rows an agreement figure is noise, not evidence.
 MIN_PAIRED_ROWS = 200
