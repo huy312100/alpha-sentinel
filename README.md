@@ -367,6 +367,7 @@ rows are counted as measured rather than escalated.
 Training rows outlive the operational lake: `TRAINING_RETENTION_DAYS` (default 1095)
 keeps them while `LOCAL_RETENTION_DAYS` (default 90) turns over everything else.
 Without that split, next quarter's training set is deleted by routine maintenance.
+Setting any of the three to `0` keeps that window open forever.
 
 ---
 
