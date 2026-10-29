@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
+import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pandas as pd
 
-import ml.dataset as dataset
 from core.models import AlphaAssessment, Layer, LayerSignal, SecurityReport, TokenSnapshot, WashTradingReport
+from ml import dataset
 from ml.dataset import (
     LABEL_COLUMNS,
     TRAINING_DATASET,
@@ -194,6 +195,25 @@ def test_the_baseline_tolerates_a_frame_without_labels():
 
 def test_the_baseline_tolerates_an_empty_frame():
     assert baseline_report(pd.DataFrame())["rows"] == 0
+
+
+def test_the_baseline_never_needs_scipy(monkeypatch):
+    """The export runs on requirements.txt alone; scipy is a training-only extra.
+
+    pandas' ``method="spearman"`` imports scipy under the hood, which broke CI
+    while passing locally in a venv where scikit-learn had pulled scipy in.
+    """
+    monkeypatch.setitem(sys.modules, "scipy", None)
+    monkeypatch.setitem(sys.modules, "scipy.stats", None)
+    frame = pd.DataFrame(
+        {"prior_score": [60.0, 70.0, 40.0, 30.0], "llm_alpha_score": [62.0, 68.0, 41.0, 33.0]}
+    )
+
+    report = baseline_report(frame)
+
+    # Same order, different values: rank correlation is exactly 1, Pearson is not.
+    assert report["spearman_r"] == 1.0
+    assert report["pearson_r"] < 1.0
 
 
 def test_export_writes_a_parquet_file(tmp_path):

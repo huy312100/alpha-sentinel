@@ -82,7 +82,8 @@ class AlphaPredictor(Protocol):
 
     model_id: str
 
-    def predict(self, snapshot: TokenSnapshot) -> Prediction | None: ...
+    def predict(self, snapshot: TokenSnapshot) -> Prediction | None:
+        raise NotImplementedError
 
 
 class PriorPredictor:
@@ -185,7 +186,7 @@ class ModelPredictor:
 def escalation_reason(
     prediction: Prediction | None,
     *,
-    thresholds: "ThresholdSettings",
+    thresholds: ThresholdSettings,
     margin: float,
     min_confidence: float,
 ) -> str | None:
@@ -203,7 +204,7 @@ def escalation_reason(
     return None
 
 
-def build_predictor(settings: "Settings") -> tuple[AlphaPredictor | None, str]:
+def build_predictor(settings: Settings) -> tuple[AlphaPredictor | None, str]:
     """Resolve ``settings.ml.alpha_predictor`` into a predictor (or ``None`` for LLM-only).
 
     A missing or corrupt artefact degrades to the LLM path with a loud log line

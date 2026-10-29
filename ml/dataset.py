@@ -23,17 +23,17 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Protocol, Sequence
 
 import pandas as pd
 
 from core.logging import get_logger
+from core.models import AlphaAssessment, FinalVerdict, RiskAudit
 from ml import FEATURE_SCHEMA_VERSION
 from ml.features import flatten
 from storage.parquet_store import ParquetStore, StorageError
 
-if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
-    from ai_engine.dual_audit_flow import AuditOutcome
+if TYPE_CHECKING:  # pragma: no cover - typing only
     from config.settings import Settings
     from scanners.pipeline import CollectedSnapshot
 
@@ -81,6 +81,26 @@ PROVENANCE_COLUMNS: tuple[str, ...] = (
 NON_FEATURE_COLUMNS: frozenset[str] = frozenset(META_COLUMNS + LABEL_COLUMNS + PROVENANCE_COLUMNS)
 
 
+class AuditRecord(Protocol):
+    """The slice of ``AuditOutcome`` this module reads.
+
+    Declared structurally on purpose. Importing the real class - even under
+    ``TYPE_CHECKING`` - makes ``ml`` depend on the engine that depends on ``ml``,
+    which is a genuine import cycle and a static-analysis error, not a typing
+    nicety. ``AuditOutcome`` satisfies this shape, so callers need no change.
+    """
+
+    prior_score: float
+    alpha: AlphaAssessment
+    risk: RiskAudit
+    verdict: FinalVerdict
+    degraded: bool
+    prompt_version: str
+    alpha_source: str
+    model_alpha_score: float | None
+    escalation_reason: str | None
+
+
 def store_from_settings(settings: "Settings") -> ParquetStore:
     """Build the lake handle the same way :class:`bot.engine.ScanEngine` does."""
     storage = settings.storage
@@ -94,7 +114,7 @@ def store_from_settings(settings: "Settings") -> ParquetStore:
     )
 
 
-def training_row(collected: "CollectedSnapshot", outcome: "AuditOutcome") -> dict[str, Any]:
+def training_row(collected: "CollectedSnapshot", outcome: AuditRecord) -> dict[str, Any]:
     """Features + labels + provenance for one completed audit."""
     snapshot = collected.snapshot
     prior = float(outcome.prior_score)
@@ -180,9 +200,13 @@ def _correlations(prior: pd.Series, truth: pd.Series) -> dict[str, float | None]
     """
     if len(prior) < 3 or prior.nunique() < 2 or truth.nunique() < 2:
         return {"pearson_r": None, "spearman_r": None}
+    # Spearman is Pearson on ranks. Asking pandas for ``method="spearman"``
+    # reaches for scipy, which is a training-only dependency - and would make the
+    # export CLI crash on any machine that installed just requirements.txt.
+    ranked = prior.rank()
     return {
-        "pearson_r": round(float(prior.corr(truth, method="pearson")), 3),
-        "spearman_r": round(float(prior.corr(truth, method="spearman")), 3),
+        "pearson_r": round(float(prior.corr(truth)), 3),
+        "spearman_r": round(float(ranked.corr(truth.rank())), 3),
     }
 
 
