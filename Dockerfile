@@ -14,11 +14,6 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# curl is only here for the container healthcheck.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
-
 # Dependencies first: this layer is cached until requirements.txt changes.
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
@@ -31,8 +26,11 @@ RUN useradd --create-home --uid 10001 sentinel \
     && chown -R sentinel:sentinel /app/data
 USER sentinel
 
+# The healthcheck asks a different question than --status: is the scan loop still
+# producing cycles? It reads the newest run row only, so it stays cheap and cannot
+# report healthy while the bot is alive but blind. Exit 1 -> unhealthy -> restart.
 HEALTHCHECK --interval=60s --timeout=15s --start-period=30s --retries=3 \
-    CMD python -m bot.main --status > /dev/null || exit 1
+    CMD python -m bot.main --health
 
 # Default: the long-running scanner loop. The dashboard overrides this command.
 CMD ["python", "-m", "bot.main"]

@@ -86,6 +86,7 @@ DeepSeek — optionally `GOPLUS_APP_KEY`, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID
 
 ```bash
 make status                  # what the hot store knows right now
+make health                  # is the scan loop still turning? (exit 1 if not)
 make dry-run                 # one cycle, nothing persisted
 make once                    # one real cycle
 make bot                     # the daemon loop (SCAN_INTERVAL_SECONDS)
@@ -208,6 +209,14 @@ Two things make this portable without per-vendor branches in the code:
   `ai_engine/parsing.py`.
 * **Cost ledger is an estimate.** `LLM_INPUT_USD_PER_MTOK` / `LLM_OUTPUT_USD_PER_MTOK`
   default to the preset's price for the *risk* model; set them to your contract rates.
+* **Spend ceilings.** `LLM_MAX_USD_PER_CYCLE` / `LLM_MAX_USD_PER_DAY` bound what an
+  unattended daemon can bill (`0`/unset = no ceiling). The client refuses a request
+  that would cross one and the cycle stops with an explicit `llm_budget_exhausted`
+  error on the instruments still queued — no verdict is fabricated and no alert fires,
+  because a budget stop is an operator decision, not a provider failure. The daily
+  total is persisted per UTC day in the hot store (`llm_spend_usd:<date>`), so a
+  restart does not reset today's bill; `--status` prints it. A ceiling configured
+  without prices is a boot error, since nothing would be measurable.
 
 Legacy `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` and `DEEPSEEK_*` tuning variables are
 still read whenever the matching `LLM_*` name is absent, so old `.env` files boot
@@ -222,6 +231,7 @@ unchanged.
 | Flag | Effect |
 | --- | --- |
 | `--status` | print settings, watchlist and hot-store counts, then exit |
+| `--health` | cycle-freshness verdict for the container healthcheck; exit `1` when the loop stopped |
 | `--once` | single cycle, then exit |
 | `--daemon` | loop forever (default) |
 | `--maintenance` | run retention/pruning once and exit |
@@ -236,7 +246,8 @@ unchanged.
 | `--json` | machine-readable report |
 | `--json-logs` | structured logs |
 
-Exit codes: `0` ok, `1` cycle produced nothing, `2` usage/config error.
+Exit codes: `0` ok, `1` cycle produced nothing (or, for `--health`, the loop is
+stalled), `2` usage/config error.
 
 ### Other entrypoints
 
@@ -285,7 +296,7 @@ the groups that change behaviour:
 | Group | Keys | Notes |
 | --- | --- | --- |
 | Runtime | `APP_ENV`, `LOG_LEVEL`, `LOG_JSON`, `DEMO_MODE`, `DEFAULT_CHAIN` | `DEMO_MODE=true` swaps in scripted agents; no outbound LLM traffic |
-| Agents | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_BASE_URL`, `ALPHA_MODEL`, `RISK_MODEL`, timeouts, retries, concurrency, per-MTok prices | any OpenAI-compatible endpoint; `RISK_MODEL` is the reasoner with veto power |
+| Agents | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_BASE_URL`, `ALPHA_MODEL`, `RISK_MODEL`, timeouts, retries, concurrency, per-MTok prices, `LLM_MAX_USD_PER_CYCLE`/`LLM_MAX_USD_PER_DAY` | any OpenAI-compatible endpoint; `RISK_MODEL` is the reasoner with veto power; the spend ceilings need prices to bind |
 | Storage | `DATA_DIR`, `HOT_DB_PATH`, `PARQUET_ROOT`, `PARQUET_COMPRESSION`, retention windows | one SQLite file + one Parquet lake |
 | R2 | `R2_ENABLED`, `R2_ENDPOINT_URL`, `R2_BUCKET`, keys, prefix | optional mirror of the cold lake |
 | Scanners | `GOPLUS_APP_KEY/SECRET`, `ETHERSCAN_API_KEY`, `LUNARCRUSH_API_KEY`, `X_BEARER_TOKEN`, `SEC_USER_AGENT`, timeouts | a missing key degrades that layer to `SKIPPED`, it does not fail the cycle |
@@ -293,7 +304,7 @@ the groups that change behaviour:
 | Explorers | `BLOCKSCOUT_EXPLORER_BASE_URL`, `BLOCKSCOUT_BASE_URL_<CHAIN>` | per-chain override for holder/transfer reads; the template covers the rest |
 | Layers | `ENABLED_LAYERS` (default: every layer routed for the instrument's asset class) | narrow globally; crypto and listed markets each keep their own manifest, and `security` cannot be switched off |
 | Alerting | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ALERT_MIN_SCORE`, `ALERT_ON_VETO` | empty credentials = alerts silently disabled |
-| Loop | `SCAN_INTERVAL_SECONDS`, `TOKEN_CONCURRENCY`, `MAINTENANCE_INTERVAL_SECONDS` | |
+| Loop | `SCAN_INTERVAL_SECONDS`, `TOKEN_CONCURRENCY`, `MAINTENANCE_INTERVAL_SECONDS`, `HEALTH_MAX_STALE_SECONDS` | `HEALTH_MAX_STALE_SECONDS` tunes the `--health` window (0 = 3× the interval, min 30 min) |
 
 `Settings.missing_critical()` names the keys that would make a non-demo run unusable,
 and the bot prints them instead of burning API credits on a half-configured stack.
@@ -358,7 +369,7 @@ mirrored to R2. `engine.maintenance()` prunes both stores on
 ## Tests
 
 ```bash
-make test                                   # 402 tests, <2s
+make test                                   # 538 tests, <2s
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
@@ -400,7 +411,10 @@ docker compose logs -f bot
 docker compose down
 ```
 
-* The image runs as an unprivileged user (`uid 10001`) with a `--status` healthcheck.
+* The image runs as an unprivileged user (`uid 10001`); its healthcheck is
+  `python -m bot.main --health`, which fails when no cycle has finished inside the
+  freshness window (`HEALTH_MAX_STALE_SECONDS`, or 3× `SCAN_INTERVAL_SECONDS`, min
+  30 min) instead of merely proving the process can print a status page.
 * `./data` is bind-mounted: the lake survives container rebuilds.
 * `config/watchlists.yaml` is mounted read-only; edit it on the host and the next
   cycle picks it up (the loader caches by mtime).
@@ -413,7 +427,7 @@ docker compose down
 
 | Artifact | Purpose |
 | --- | --- |
-| `.circleci/config.yml` | `lint` (flake8 + byte-compile), `test` (pytest with JUnit artifacts), `docker-build` (image + `--status` smoke) |
+| `.circleci/config.yml` | `lint` (flake8 + byte-compile), `test` (pytest with JUnit artifacts), `docker-build` (image + `--status`/`--health` smoke, plus the boot-gate check) |
 | `.github/workflows/codeql.yml` | CodeQL `security-and-quality` on push/PR/weekly |
 | `.github/dependabot.yml` | weekly grouped pip PRs, monthly actions PRs, major bumps of numpy/pandas/pyarrow ignored |
 | `.coderabbit.yaml` | review rules per path (prompt boundary, veto precedence, hermetic tests, secrets) |

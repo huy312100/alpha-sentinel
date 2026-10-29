@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ai_engine.llm_client import LLMClient
+from ai_engine.llm_client import LLMBudgetExceeded, LLMClient
 from ai_engine.parsing import (
     ResponseParseError,
     extract_json,
@@ -116,6 +116,21 @@ class DualAuditFlow:
     @property
     def stats(self) -> dict[str, float | int]:
         return self._client.stats if self._client is not None else {}
+
+    # -- spend metering ----------------------------------------------------
+    def start_cycle(self, *, day_spend_usd: float = 0.0) -> None:
+        """Reset the spend meter for a new cycle and seed today's total.
+
+        ``day_spend_usd`` comes from the hot store, so restarting the process
+        mid-day does not hand the daemon a fresh allowance.
+        """
+        starter = getattr(self._client, "start_cycle", None)
+        if starter is not None:
+            starter(day_spend_usd=day_spend_usd)
+
+    @property
+    def cycle_spend_usd(self) -> float:
+        return float(getattr(self._client, "cycle_spend_usd", 0.0) or 0.0)
 
     # -- public API --------------------------------------------------------
     async def audit_detailed(self, snapshot: TokenSnapshot) -> AuditOutcome:
@@ -220,6 +235,11 @@ class DualAuditFlow:
                 errors=errors,
             )
             return parse_alpha(payload, model=result.model, usage=result.usage, latency_ms=result.latency_ms)
+        except LLMBudgetExceeded:
+            # Not a provider failure: a ceiling must surface as "we chose to stop
+            # spending", never as an unavailable analyst (which is score-neutral)
+            # and never as the fail-closed veto below.
+            raise
         except Exception as exc:  # noqa: BLE001 - the pipeline must never die on one token
             message = f"alpha agent failed: {type(exc).__name__}: {str(exc)[:200]}"
             errors.append(message)
@@ -280,6 +300,11 @@ class DualAuditFlow:
                 validate=require_risk_payload,
             )
             return parse_risk(payload, model=result.model, usage=result.usage, latency_ms=result.latency_ms)
+        except LLMBudgetExceeded:
+            # Fail-closed is for an auditor that *cannot* answer. Here the answer
+            # was never requested, so a CRITICAL veto would be fabricated - and
+            # ALERT_ON_VETO would page for an operator setting, not a finding.
+            raise
         except Exception as exc:  # noqa: BLE001 - fail closed, never fail open
             message = f"risk agent failed: {type(exc).__name__}: {str(exc)[:200]}"
             errors.append(message)

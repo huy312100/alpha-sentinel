@@ -46,7 +46,20 @@ class DemoLLMClient:
             "completion_tokens": self._requests * 260,
             "cost_usd": 0.0,
             "avg_latency_ms": self._latency_ms,
+            "usage_missing": 0,
         }
+
+    # -- spend metering (parity with LLMClient; demo calls are free) ---------
+    def start_cycle(self, *, day_spend_usd: float = 0.0) -> None:
+        return None
+
+    @property
+    def cycle_spend_usd(self) -> float:
+        return 0.0
+
+    @property
+    def day_spend_usd(self) -> float:
+        return 0.0
 
     async def chat_json(
         self,

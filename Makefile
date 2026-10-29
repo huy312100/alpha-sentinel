@@ -1,4 +1,4 @@
-.PHONY: help install lint test audit ci demo honeypot smoke status once dry-run scanners bot dashboard \
+.PHONY: help install lint test audit ci demo honeypot smoke status health once dry-run scanners bot dashboard \
         probe docker-build docker-up docker-down docker-logs clean
 
 PY ?= python3
@@ -31,14 +31,20 @@ demo: ## Run the dual-agent flow offline (no API key needed)
 honeypot: ## Demo run that trips the risk agent's veto
 	DEMO_MODE=true $(BIN)/python -m ai_engine.dual_audit_flow --demo --honeypot
 
-smoke: ## Offline smoke: status, dry-run cycle, scanner probe, demo agents
+smoke: ## Offline smoke: status, health, dry-run cycle, scanner probe, demo agents
 	$(BIN)/python -m bot.main --status
+	@# Health runs against a scratch store on purpose: the real one may hold a run
+	@# from last week, and a smoke step must not depend on the dev machine's history.
+	@scratch=$$(mktemp -d); HOT_DB_PATH=$$scratch/hot.db DEMO_MODE=true $(BIN)/python -m bot.main --health
 	DEMO_MODE=true $(BIN)/python -m bot.main --once --dry-run --no-alerts --limit 1
 	DEMO_MODE=true $(BIN)/python -m scanners --token 0x0000000000000000000000000000000000000001 --chain ethereum
 	DEMO_MODE=true $(BIN)/python -m ai_engine.dual_audit_flow --demo
 
 status: ## Print hot-store status
 	$(BIN)/python -m bot.main --status
+
+health: ## Cycle-freshness check on the configured store (same command as the container)
+	$(BIN)/python -m bot.main --health
 
 once: ## One real cycle, then exit
 	$(BIN)/python -m bot.main --once

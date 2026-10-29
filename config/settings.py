@@ -270,6 +270,12 @@ class LLMSettings:
     risk_max_tokens: int = 4_096
     input_usd_per_mtok: float = 0.27
     output_usd_per_mtok: float = 1.10
+    #: Hard spend ceilings in USD; ``0`` disables the ceiling. The client refuses
+    #: a request that would cross one, so an unattended daemon cannot run up an
+    #: open-ended bill. A ceiling without prices is a boot problem (see
+    #: :meth:`Settings.validate`): nothing would be measurable.
+    max_usd_per_cycle: float = 0.0
+    max_usd_per_day: float = 0.0
 
     def assert_configured(self) -> None:
         if not self.api_key.is_configured():
@@ -409,6 +415,9 @@ class ScannerSettings:
     http_timeout_seconds: float = 25.0
     maintenance_interval_seconds: int = 3_600
     trades_lookback: int = 500
+    #: ``--health`` calls a cycle stale after this long; ``0`` derives it from
+    #: ``scan_interval_seconds`` with a floor (see :mod:`bot.health`).
+    health_max_stale_seconds: int = 0
     enabled_layers: tuple[str, ...] = DEFAULT_ENABLED_LAYERS
     #: SEC EDGAR's fair-access policy requires a contact in the User-Agent.
     #: Empty -> the fundamentals layer reports SKIPPED instead of calling out.
@@ -459,6 +468,16 @@ class Settings:
             problems.append(f"unsupported PARQUET_COMPRESSION: {self.storage.compression}")
         if self.telegram.bot_token.is_configured() and not self.telegram.chat_id:
             problems.append("TELEGRAM_BOT_TOKEN is set but TELEGRAM_CHAT_ID is empty")
+        if (self.llm.max_usd_per_cycle or self.llm.max_usd_per_day) and not (
+            self.llm.input_usd_per_mtok or self.llm.output_usd_per_mtok
+        ):
+            problems.append(
+                "LLM_MAX_USD_PER_CYCLE/LLM_MAX_USD_PER_DAY are set but "
+                "LLM_INPUT_USD_PER_MTOK and LLM_OUTPUT_USD_PER_MTOK are both 0: "
+                "spend cannot be measured, so the ceiling would never bind"
+            )
+        if 0 < self.scanners.health_max_stale_seconds < 60:
+            problems.append("HEALTH_MAX_STALE_SECONDS must be 0 (auto) or >= 60")
         unknown_layers = [
             name
             for name in self.scanners.enabled_layers
@@ -503,6 +522,9 @@ class Settings:
             "provider_sources": list(self.providers.configured_sources()),
             "telegram_configured": self.telegram.is_configured(),
             "scan_interval_seconds": self.scanners.scan_interval_seconds,
+            "health_max_stale_seconds": self.scanners.health_max_stale_seconds,
+            "llm_max_usd_per_cycle": self.llm.max_usd_per_cycle,
+            "llm_max_usd_per_day": self.llm.max_usd_per_day,
             "layers": list(self.scanners.enabled_layers),
             "sec_user_agent_configured": bool(self.scanners.sec_user_agent),
         }
@@ -545,6 +567,8 @@ class Settings:
             output_usd_per_mtok=_env_float(
                 env, "LLM_OUTPUT_USD_PER_MTOK", preset.output_usd_per_mtok, minimum=0.0
             ),
+            max_usd_per_cycle=_env_float(env, "LLM_MAX_USD_PER_CYCLE", 0.0, minimum=0.0),
+            max_usd_per_day=_env_float(env, "LLM_MAX_USD_PER_DAY", 0.0, minimum=0.0),
         )
         _check_llm_wiring(llm)
 
@@ -605,6 +629,7 @@ class Settings:
             layer_timeout_seconds=_env_float(env, "LAYER_TIMEOUT_SECONDS", 20.0, minimum=1.0),
             http_timeout_seconds=_env_float(env, "HTTP_TIMEOUT_SECONDS", 25.0, minimum=1.0),
             maintenance_interval_seconds=_env_int(env, "MAINTENANCE_INTERVAL_SECONDS", 3_600, minimum=60),
+            health_max_stale_seconds=_env_int(env, "HEALTH_MAX_STALE_SECONDS", 0, minimum=0),
             enabled_layers=_parse_csv(_env_str(env, "ENABLED_LAYERS", ",".join(DEFAULT_ENABLED_LAYERS))),
             sec_user_agent=_env_str(env, "SEC_USER_AGENT", "").strip(),
         )
