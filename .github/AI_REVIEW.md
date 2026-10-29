@@ -230,4 +230,5 @@ CPU, and why a malicious PR cannot get its own code executed by the reviewer.
 | `Failed to review PR` on the PR but the job is green | `CONFIG__PROPAGATE_TOOL_ERRORS` was dropped; the job now fails with the same message |
 | `Failed to review PR` still on a PR that is now green | a failed run posted it and a later run replaces only the guide, not that line; the workflow deletes it after a successful review, so this means the deletion step failed too |
 | Comment posted but empty of findings | the model answered outside the JSON shape; try a stronger tag, and check the step log for a parse warning |
+| `/review` does nothing on a branch | `issue_comment` runs the copy of the workflow on the **default branch**, not the one in the PR, so slash commands only work after this file is merged; until then a comment on a PR triggers whatever the default branch has |
 | Every run re-downloads 4.7 GB | cache miss: cached weights live in `~/.ollama/models`, keyed on the server version and the model id, and the cache step needs the `chmod` step above to be able to read them |
