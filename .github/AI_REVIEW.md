@@ -86,7 +86,8 @@ Two constraints worth knowing before switching:
   ~20 of them for prefill alone (`budget / 13.7` seconds).
 
 Changing the model changes the cache key, so the first run after a switch pays
-the download again.
+the download again. So does bumping `OLLAMA_VERSION`: the key is
+`ollama-<server version>-<model id>`.
 
 ## The two numbers that decide whether the review is honest
 
@@ -130,14 +131,17 @@ The `issue_comment` trigger re-runs a review without a new push:
 | `/review` | line-level review of the current diff |
 | `/describe` | regenerate the PR title and summary |
 | `/improve` | concrete code suggestions |
-| `/ask <question>` | question about the PR; the question must be on one line |
+| `/ask <question>` | question about the PR; the question must be on one line, and it is passed to the model verbatim — including a leading `--` |
 
 All four are restricted to `OWNER` / `MEMBER` / `COLLABORATOR` commenters.
 Without that gate anyone could drive a review by commenting on a public PR,
 spending runner minutes on someone else's behalf.
 
 Arguments after the command are ignored — the workflow maps `/review` to
-`review`, not to a free-form PR-Agent argument string. To change review settings,
+`review`, not to a free-form PR-Agent argument string. `/ask` is the one
+exception, and only its question text reaches PR-Agent: it is percent-encoded
+behind `__pr_agent_encoded_text__:` so that PR-Agent's settings-override parser
+cannot eat a leading `--` or apply it as a setting. To change review settings,
 edit the workflow.
 
 ## Drafts, forks and other skips
@@ -198,12 +202,14 @@ Each of these was a silent failure once, so each has a guard:
 | `CONFIG__FALLBACK_MODELS: "[]"` | PR-Agent's shipped fallback is a hosted OpenAI model, which would bill us or fail on a key we do not have |
 | `GITHUB__USER_TOKEN: ${{ github.token }}` | PR-Agent reads its token from settings (`envvar_prefix=False`, so `SECTION__KEY` works); the CLI has no implicit `GITHUB_TOKEN` fallback |
 | `PR_AGENT_VERSION` pinned | the review is parsed as structured JSON, so an upstream format change would degrade to "no findings" rather than an error |
-| Model weights cached by tag | `~/.ollama/models`, keyed on the model id; the weights never change for a tag |
+| `OLLAMA_VERSION` pinned | the server decides the context size, the `/api/show` probe and the on-disk manifest format, so `latest` could change the review with no diff to point at |
+| Model weights cached by server version **and** model id | `~/.ollama/models`, keyed on both; the weights never change for a tag, but a manifest written by one Ollama release is not guaranteed to load in another, so a version bump refetches instead of restoring |
 | `OLLAMA_NUM_PARALLEL=1`, `MAX_LOADED_MODELS=1` | keeps a 16 GB runner from loading two copies during a fast push/force-push pair |
-| `CONFIG__AI_TIMEOUT: "600"` | litellm times out at 120s, and preflighting a full-budget prompt on CPU takes longer; the default produced silent timeouts and a green check |
+| `CONFIG__AI_TIMEOUT: "1800"` | litellm gives up after 120s by default, and prefilling a full 16384-token prompt on CPU takes ~20 minutes; the default produced silent timeouts and a green check |
 | `CONFIG__PROPAGATE_TOOL_ERRORS: "true"` | PR-Agent exits 0 when a review fails, so without this a broken model leaves "Failed to review PR" as a comment and a green tick beside it |
 | `sudo chmod -R a+rX ~/.ollama` as the last step | the container runs as root and Ollama writes manifests `0600`, so the cache post-step (runner user) hit "Permission denied" and silently never saved the 4.7 GB |
-| `concurrency` keyed on event **and** sender type | a force-push cancels the previous push review, but bot chatter cannot cancel anything: CodeRabbit's comment and PR-Agent's own progress comment both arrive as `issue_comment`, and on PR #14 the first of them cancelled the running review |
+| the `/ask` question is passed as `__pr_agent_encoded_text__:<percent-encoded>` | PR-Agent reads any argument starting with `--` as a settings override and strips the hyphens, so `/ask --why …` would reach the model as `why …`; the prefix is PR-Agent's own wire format for user text and decodes back verbatim |
+| `concurrency` keyed on event, sender type **and** command-vs-noise | GitHub matches the group before the job's `if:` runs: bot chatter (CodeRabbit's review, PR-Agent's own progress comment) and a human "LGTM" each cancelled a running 25-minute review, and the run that replaced it then skipped and posted nothing |
 
 PR-Agent talks to GitHub over the API and works from the diff it fetches; this
 job does not check out the PR tree at all. That is why the wall-clock cost is
@@ -224,4 +230,4 @@ CPU, and why a malicious PR cannot get its own code executed by the reviewer.
 | `Failed to review PR` on the PR but the job is green | `CONFIG__PROPAGATE_TOOL_ERRORS` was dropped; the job now fails with the same message |
 | `Failed to review PR` still on a PR that is now green | a failed run posted it and a later run replaces only the guide, not that line; the workflow deletes it after a successful review, so this means the deletion step failed too |
 | Comment posted but empty of findings | the model answered outside the JSON shape; try a stronger tag, and check the step log for a parse warning |
-| Every run re-downloads 4.7 GB | cache miss: cached weights live in `~/.ollama/models`, keyed on the model id, and the cache step needs the `chmod` step above to be able to read them |
+| Every run re-downloads 4.7 GB | cache miss: cached weights live in `~/.ollama/models`, keyed on the server version and the model id, and the cache step needs the `chmod` step above to be able to read them |

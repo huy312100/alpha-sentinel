@@ -48,13 +48,26 @@ permissions:
 
 concurrency:
   # A force-push mid-review must not leave two comments quoting two different
-  # diffs, so each push review cancels the previous one. The group also carries
-  # the event name and the sender type, and it has to: CodeRabbit commenting on
-  # the PR - and PR-Agent posting its own progress comment mid-run - both arrive
-  # as `issue_comment`. With a single per-PR group, that bot chatter cancelled
-  # the review that was running (observed on PR #14) and would have made every
-  # /review cancel itself.
-  group: ai-review-${{ github.event_name }}-${{ github.event.sender.type }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  # diffs, so each push review cancels the previous one. The group carries two
+  # extra discriminators, and it has to. GitHub matches the group when the run is
+  # created, before the job-level `if:` below runs:
+  #   1. the event name and the sender type, because CodeRabbit commenting on the
+  #      PR and PR-Agent posting its own progress comment mid-run both arrive as
+  #      `issue_comment`; with a single per-PR group that bot chatter cancelled
+  #      the review that was running (observed on PR #14);
+  #   2. whether an `issue_comment` is actually a command, because a comment like
+  #      "LGTM" would otherwise cancel a 25-minute /review - and the run that
+  #      replaced it then skips on the `if:` and posts nothing at all.
+  # Command comments keep the plain group, so a push still cancels an in-flight
+  # review and two commands still supersede each other.
+  group: >-
+    ai-review-${{ github.event_name }}-${{ github.event.sender.type }}${{
+    (github.event_name == 'issue_comment' &&
+    !(startsWith(github.event.comment.body, '/review') ||
+    startsWith(github.event.comment.body, '/describe') ||
+    startsWith(github.event.comment.body, '/improve') ||
+    startsWith(github.event.comment.body, '/ask'))) && '-noise' || '' }}-${{
+    github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 env:
@@ -62,6 +75,11 @@ env:
   # slower; .github/AI_REVIEW.md lists the sizes that fit a standard runner.
   OLLAMA_MODEL: ${{ vars.AI_REVIEW_MODEL || 'qwen2.5-coder:7b-instruct-q4_K_M' }}
   OLLAMA_URL: http://127.0.0.1:11434
+  # Pinned like PR_AGENT_VERSION: the review depends on the server's behaviour
+  # (context sizing, the `/api/show` readiness probe, the manifest format under
+  # ~/.ollama), and `latest` would change all three without a diff to point at.
+  # Bumping this also refetches the weights, because the cache key includes it.
+  OLLAMA_VERSION: "0.40.13"
   # The model's window must clear the budget PR-Agent is willing to send, or the
   # excess is dropped silently and the review describes a diff it never saw.
   # Ollama sizes its context from available VRAM, i.e. 4k on a CPU-only runner,
@@ -192,7 +210,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ollama/models
-          key: ollama-${{ env.OLLAMA_MODEL }}
+          # The server version is part of the key: a manifest written by one
+          # Ollama release is not guaranteed to load in another.
+          key: ollama-${{ env.OLLAMA_VERSION }}-${{ env.OLLAMA_MODEL }}
 
       - name: Start Ollama
         if: steps.gate.outputs.skip != 'true'
@@ -205,7 +225,7 @@ jobs:
             -e OLLAMA_NUM_PARALLEL=1 \
             -e OLLAMA_MAX_LOADED_MODELS=1 \
             -e OLLAMA_KEEP_ALIVE=15m \
-            ollama/ollama:latest
+            ollama/ollama:"${OLLAMA_VERSION}"
           for _ in $(seq 1 60); do
             if curl -fsS "$OLLAMA_URL/api/tags" > /dev/null; then
               echo "Ollama is serving on $OLLAMA_URL"
@@ -316,7 +336,14 @@ jobs:
           set -euo pipefail
           args=("$COMMAND")
           if [ "$COMMAND" = "ask" ] && [ -n "$QUESTION" ]; then
-            args=(ask "$QUESTION")
+            # PR-Agent treats any argument starting with `--` as a settings
+            # override, strips the hyphens and applies the rest as
+            # `key=value` - so `/ask --why is scoring wrong?` would reach the
+            # model as `why is scoring wrong?`. Its own wire format for user
+            # text is this prefix plus percent-encoding, which PRQuestions
+            # decodes back verbatim before the prompt is built.
+            encoded="$(QUESTION="$QUESTION" python -c 'import os, urllib.parse; print("__pr_agent_encoded_text__:" + urllib.parse.quote(os.environ["QUESTION"], safe=""))')"
+            args=(ask "$encoded")
           fi
           pr-agent --pr_url="$PR_URL" "${args[@]}"
 
