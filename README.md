@@ -417,8 +417,8 @@ docker compose down
 | `.github/workflows/codeql.yml` | CodeQL `security-and-quality` on push/PR/weekly |
 | `.github/dependabot.yml` | weekly grouped pip PRs, monthly actions PRs, major bumps of numpy/pandas/pyarrow ignored |
 | `.coderabbit.yaml` | review rules per path (prompt boundary, veto precedence, hermetic tests, secrets) |
-| `.github/workflows/ai-review.yml` | four self-hosted AI reviewers (PR-Agent/DeepSeek, Claude, Gemini, Codex) on every PR; each self-skips when its API key is absent — see `.github/AI_REVIEW.md` |
-| `.github/AI_REVIEW.md` | keys, cost, model switching and the fork-PR policy for those reviewers |
+| `.github/workflows/ai-review.yml` | free AI code review on every PR: PR-Agent against a local Ollama model on the runner, so there is no API key and no per-token bill — see `.github/AI_REVIEW.md` |
+| `.github/AI_REVIEW.md` | model sizes, runtime, slash commands and the fork-PR policy for that reviewer |
 | `Makefile` | `make ci` = lint + tests + compileall + offline smoke, the same gate CI runs |
 
 ---

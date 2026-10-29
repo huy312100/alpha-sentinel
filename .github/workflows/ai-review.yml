@@ -1,28 +1,31 @@
 # =============================================================================
-# AI code review - four independent reviewers, every one bring-your-own-key.
+# AI code review that costs nothing and needs no account.
 #
-# CodeRabbit is quota-bound and stops reviewing mid-quarter. These jobs run on
-# GitHub's own runners against keys this repository owns, so the only ceiling is
-# the provider's rate limit and our spend. Nothing here is a required status
-# check, and every job self-skips with a notice when its key is absent - the
-# workflow is green before a single secret exists, and stays green on forks.
+# CodeRabbit is quota-bound: when the monthly allowance runs out, PRs go
+# unreviewed until the cycle turns over. Every hosted alternative trades that
+# quota for a per-token bill or an API key we would have to provision, rotate
+# and keep out of a public repo. So this workflow brings its own model instead:
+# PR-Agent reviews the diff against a small language model served by Ollama on
+# the runner itself. No key, no secret, no invoice - and on a public repository
+# the runner minutes are free as well.
 #
-# Secrets (Settings > Secrets and variables > Actions > New repository secret):
-#   DEEPSEEK_API_KEY    PR-Agent      default model deepseek/deepseek-chat
-#   ANTHROPIC_API_KEY   Claude Code   on open / ready_for_review / @claude
-#   GEMINI_API_KEY      Gemini CLI    Google AI Studio free tier
-#   OPENAI_API_KEY      Codex         opt-in, see ENABLE_CODEX_REVIEW below
-#   OPENROUTER_API_KEY  PR-Agent      only when PR_AGENT_MODEL is openrouter/*
+# The trade is quality and latency, and it is real. A 7B model on four CPU cores
+# reads a diff less carefully than a frontier model over the network, and a
+# review takes minutes instead of seconds. Expect it to catch the mechanical
+# class of defect - unvalidated input, swallowed exceptions, secrets in logs,
+# tests that reach the network - and not to catch the subtle one. It advises;
+# `Lint + hermetic tests`, CodeQL and CircleCI still decide whether a PR merges.
 #
-# Repository variables (Settings > Secrets and variables > Actions > Variables):
-#   PR_AGENT_MODEL       LiteLLM model id (default deepseek/deepseek-chat)
-#   ENABLE_CODEX_REVIEW  'true' arms the Codex job; anything else leaves it off
+# Tunable from repository settings, no edit required:
+#   Settings > Secrets and variables > Actions > Variables
+#     AI_REVIEW_MODEL    any Ollama model id (default qwen2.5-coder:7b-instruct-q4_K_M)
+#     AI_REVIEW_ENABLED  'false' turns the workflow off; anything else leaves it on
 #
-# Fork PRs are deliberately unreviewed: on `pull_request` GitHub withholds
-# secrets from forks, and every job below skips instead of failing. Do not
-# switch this file to `pull_request_target` - Claude, Gemini and Codex check out
-# and read the PR tree, and that combination executes untrusted code with our
-# keys in scope. Setup notes and provider switching live in .github/AI_REVIEW.md
+# Fork PRs are skipped: on `pull_request` GitHub hands fork workflows a
+# read-only token, so a review could be computed but never posted. Do not switch
+# this file to `pull_request_target` to "fix" that - it would run against an
+# attacker-controlled tree with a write token in scope.
+# Setup, model choices and troubleshooting: .github/AI_REVIEW.md
 # =============================================================================
 name: AlphaSentinel AI review
 
@@ -36,7 +39,7 @@ on:
       - "tmp/**"
       - "**/*.parquet"
       - "**/*.db"
-  # Slash commands (/review, /improve, /ask) and @claude mentions arrive here.
+  # /review, /describe, /improve and /ask arrive here.
   issue_comment:
     types: [created]
 
@@ -44,389 +47,338 @@ permissions:
   contents: read
 
 concurrency:
-  # One review pass per PR: a force-push while a reviewer is mid-flight must not
-  # leave two bots quoting two different diffs. Cancelling the stale run also
-  # stops us paying for tokens on a diff nobody will read.
-  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  # A force-push mid-review must not leave two comments quoting two different
+  # diffs, so each push review cancels the previous one. The group carries two
+  # extra discriminators, and it has to. GitHub matches the group when the run is
+  # created, before the job-level `if:` below runs:
+  #   1. the event name and the sender type, because CodeRabbit commenting on the
+  #      PR and PR-Agent posting its own progress comment mid-run both arrive as
+  #      `issue_comment`; with a single per-PR group that bot chatter cancelled
+  #      the review that was running (observed on PR #14);
+  #   2. whether an `issue_comment` is actually a command, because a comment like
+  #      "LGTM" would otherwise cancel a 25-minute /review - and the run that
+  #      replaced it then skips on the `if:` and posts nothing at all.
+  # Command comments keep the plain group, so a push still cancels an in-flight
+  # review and two commands still supersede each other.
+  group: >-
+    ai-review-${{ github.event_name }}-${{ github.event.sender.type }}${{
+    (github.event_name == 'issue_comment' &&
+    !(startsWith(github.event.comment.body, '/review') ||
+    startsWith(github.event.comment.body, '/describe') ||
+    startsWith(github.event.comment.body, '/improve') ||
+    startsWith(github.event.comment.body, '/ask'))) && '-noise' || '' }}-${{
+    github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
+env:
+  # The model that does the reviewing. Larger models read diffs better and run
+  # slower; .github/AI_REVIEW.md lists the sizes that fit a standard runner.
+  OLLAMA_MODEL: ${{ vars.AI_REVIEW_MODEL || 'qwen2.5-coder:7b-instruct-q4_K_M' }}
+  OLLAMA_URL: http://127.0.0.1:11434
+  # Pinned like PR_AGENT_VERSION: the review depends on the server's behaviour
+  # (context sizing, the `/api/show` readiness probe, the manifest format under
+  # ~/.ollama), and `latest` would change all three without a diff to point at.
+  # Bumping this also refetches the weights, because the cache key includes it.
+  OLLAMA_VERSION: "0.40.13"
+  # The model's window must clear the budget PR-Agent is willing to send, or the
+  # excess is dropped silently and the review describes a diff it never saw.
+  # Ollama sizes its context from available VRAM, i.e. 4k on a CPU-only runner,
+  # which is why this is explicit. 24k at ~56 KB of KV cache per token is ~1.4 GB
+  # on top of the 4.7 GB of weights - comfortable inside 16 GB.
+  OLLAMA_CONTEXT_LENGTH: "24576"
+  # Pinned: the review text is parsed as structured JSON, so a silent upstream
+  # format change would degrade into "no findings" rather than an error.
+  PR_AGENT_VERSION: "0.49.0"
+  # Diff budget, sized from measured throughput: this model prefills at ~13.7
+  # tokens/second on a 4 vCPU runner, so 16384 buys ~20 minutes before the first
+  # output token. Cheaper budgets were tried and are worse: 8192 dropped both
+  # files this PR changed, and 10240 still dropped the workflow file - while the
+  # comment went on to report "no major issues detected". Coverage is worth the
+  # wait; past the budget PR-Agent still names whatever it had to drop.
+  PR_AGENT_MAX_TOKENS: "16384"
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # PR-Agent: the direct CodeRabbit replacement (summary + line review + slash
-  # commands). Model-agnostic through LiteLLM, so it runs on whatever provider
-  # we can afford; DeepSeek is the default because this service already pays for
-  # it in production and it is far cheaper per token than a frontier model.
-  # ---------------------------------------------------------------------------
-  pr-agent:
-    name: PR-Agent (${{ vars.PR_AGENT_MODEL || 'deepseek/deepseek-chat' }})
+  local-review:
+    name: Local review (Ollama)
+    # Cheap early exit: a comment that is not a review command, or one written by
+    # a bot, never needs a runner at all. The gate below re-checks every case and
+    # is what emits a human-readable notice.
     if: >-
-      github.event.sender.type != 'Bot' &&
-      (github.event_name == 'pull_request' ||
-       (github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request != null &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request != null &&
+       github.event.sender.type != 'Bot' &&
+       (startsWith(github.event.comment.body, '/review') ||
+        startsWith(github.event.comment.body, '/describe') ||
+        startsWith(github.event.comment.body, '/improve') ||
+        startsWith(github.event.comment.body, '/ask')))
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A cold run pulls ~4.7 GB of weights, and a full-budget diff spends ~12
+    # minutes in prefill alone at the measured 13.7 tokens/second. The inner
+    # ceiling is CONFIG__AI_TIMEOUT below; this outer one leaves room for the
+    # weight download and for one full retry.
+    timeout-minutes: 75
     permissions:
       contents: read
       issues: write
       pull-requests: write
 
     steps:
-      # The Action takes one provider key, under that provider's own env name,
-      # and litellm refuses to identify a model when that name is empty. So
-      # resolve model -> key here and export exactly one variable, rather than
-      # passing four secrets through and hoping the unused ones are harmless.
-      - name: Resolve model and provider key
+      - name: Decide whether this event is reviewable
         id: gate
         env:
-          MODEL: ${{ vars.PR_AGENT_MODEL || 'deepseek/deepseek-chat' }}
-          DEEPSEEK_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENROUTER_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+          AI_REVIEW_ENABLED: ${{ vars.AI_REVIEW_ENABLED }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          SKIPPED_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'skip-ai-review') }}
+          PR_HTML_URL: ${{ github.event.pull_request.html_url }}
+          ISSUE_HTML_URL: ${{ github.event.issue.html_url }}
+          ISSUE_IS_PR: ${{ github.event.issue.pull_request != null }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENTER_ASSOC: ${{ github.event.comment.author_association }}
         run: |
           set -euo pipefail
-          case "$MODEL" in
-            deepseek/*)      ENV_NAME=DEEPSEEK__KEY;   KEY=${DEEPSEEK_KEY:-} ;;
-            anthropic/*)     ENV_NAME=ANTHROPIC__KEY;  KEY=${ANTHROPIC_KEY:-} ;;
-            openai/*|gpt-*)  ENV_NAME=OPENAI__KEY;     KEY=${OPENAI_KEY:-} ;;
-            openrouter/*)    ENV_NAME=OPENROUTER__KEY; KEY=${OPENROUTER_KEY:-} ;;
-            *)               ENV_NAME=;                KEY= ;;
-          esac
-          if [ -z "${ENV_NAME}" ] || [ -z "${KEY}" ]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=PR-Agent skipped::No key for model '${MODEL}'. Add the matching secret - see .github/AI_REVIEW.md."
-            exit 0
-          fi
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
-          {
-            echo "CONFIG__MODEL=${MODEL}"
-            # No cross-provider fallback: the shipped default is an OpenAI model,
-            # so a DeepSeek outage would silently spend GPT tokens (or hard-fail
-            # on a missing key). One model, one bill.
-            echo "CONFIG__FALLBACK_MODELS=[]"
-            echo "${ENV_NAME}=${KEY}"
-          } >> "$GITHUB_ENV"
-
-      - name: Run PR-Agent
-        if: steps.gate.outputs.enabled == 'true'
-        uses: the-pr-agent/pr-agent@main
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # These are read through dynaconf dotted lookups
-          # (get_settings().get("github_action_config.auto_review")), so the nested
-          # `SECTION__KEY` spelling is what always resolves - and it is the only
-          # spelling that casts a JSON list (`PUSH_COMMANDS`) back into a list.
-          GITHUB_ACTION_CONFIG__AUTO_REVIEW: "true"
-          GITHUB_ACTION_CONFIG__AUTO_DESCRIBE: "true"
-          # `synchronize` is not part of pr_actions - it is gated separately by
-          # handle_push_trigger, and does nothing unless push_commands is set.
-          # /review only: the summary from the PR's first push still stands.
-          GITHUB_ACTION_CONFIG__HANDLE_PUSH_TRIGGER: "true"
-          GITHUB_ACTION_CONFIG__PUSH_COMMANDS: '["/review"]'
-          # The same path priorities .coderabbit.yaml enforced, so swapping the
-          # reviewer does not quietly lower the bar.
-          PR_REVIEWER__EXTRA_INSTRUCTIONS: >-
-            This service trades real money against third-party APIs: prioritise
-            correctness, failure isolation and secret handling over style.
-            ai_engine/ prompts and parsers are a trust boundary - LLM output is
-            untrusted, so flag every path where malformed JSON, a missing field
-            or a prompt-injection string could raise, silently change a verdict
-            or leak the API key, and keep watchdog timeouts and degraded-mode
-            accounting intact. In core/scoring.py veto precedence is
-            contractual: a hard risk flag or risk_score above the ceiling vetoes
-            regardless of alpha, and size must stay monotonic in the blended
-            score. In bot/ one token failure must never abort a cycle, no
-            storage error may escape into the loop, dry runs persist and send
-            nothing, and Telegram sends stay deduplicated. In storage/ schema
-            changes need a migration path and a version bump, SQL must be
-            parameterised, Parquet writes idempotent under dedupe keys. In
-            tests/ forbid network access, real credentials and writes outside
-            tmp_path, and reject tests that only assert truthiness of a mock.
-            Flag secrets and over-broad permissions in .github/.
-
-  # ---------------------------------------------------------------------------
-  # Claude Code: the second opinion, aimed at reasoning depth rather than
-  # coverage. Runs on open/ready_for_review and on @claude mentions rather than
-  # on every push - it is the expensive reviewer, and an amend nobody has
-  # reshaped yet does not deserve a fresh read.
-  # ---------------------------------------------------------------------------
-  claude:
-    name: Claude review
-    if: >-
-      github.event.sender.type != 'Bot' &&
-      ((github.event_name == 'pull_request' &&
-        contains(fromJSON('["opened","reopened","ready_for_review"]'), github.event.action)) ||
-       (github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request != null &&
-        contains(github.event.comment.body, '@claude') &&
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)))
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-      id-token: write
-
-    steps:
-      - name: Check for an Anthropic key
-        id: gate
-        env:
-          ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          if [ -z "${ANTHROPIC_KEY:-}" ]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Claude review skipped::ANTHROPIC_API_KEY is not set - see .github/AI_REVIEW.md."
-            exit 0
-          fi
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout
-        if: steps.gate.outputs.enabled == 'true'
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: Claude review
-        if: steps.gate.outputs.enabled == 'true'
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
-
-            You are reviewing a Python service that trades a small book against
-            third-party APIs. Review only what this PR changes: do not re-review
-            untouched code, do not restate the diff, do not praise.
-
-            If the triggering comment asks a specific question, answer it first,
-            then run the review.
-
-            Non-negotiables, in priority order:
-            1. ai_engine/** - prompts and parsers are a trust boundary. LLM
-               output is untrusted: malformed JSON, a missing field or a
-               prompt-injection string must not raise, silently change a verdict
-               or leak the API key. Watchdog timeouts and degraded-mode
-               accounting must survive any edit.
-            2. core/scoring.py - veto precedence is contractual: a hard risk
-               flag or risk_score above the ceiling vetoes regardless of alpha,
-               and position sizing must stay monotonic in the blended score.
-            3. bot/** - one token failure must never abort a cycle, no storage
-               error may escape into the loop, dry runs persist and send
-               nothing, Telegram sends stay deduplicated.
-            4. storage/** - schema changes need a migration path and a version
-               bump; SQL parameterised; Parquet writes idempotent under dedupe.
-            5. tests/** - hermetic: no network, no real credentials, no writes
-               outside tmp_path. A test that only asserts a mock is truthy is a
-               defect, not coverage.
-            6. .github/** - no secrets in workflow files, no over-broad
-               permissions.
-
-            Report only defects you can point at a specific line, each tagged
-            CRITICAL / HIGH / MEDIUM / NIT. Eight findings maximum; if the diff
-            is clean, say so in one line. Do not propose refactors the diff does
-            not require.
-
-            Use mcp__github_inline_comment__create_inline_comment with
-            confirmed: true for line-level findings, and `gh pr comment` once for
-            a top-level summary of ten lines or fewer. Post GitHub comments only.
-          claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Read,Grep,Glob"
-
-
-  # ---------------------------------------------------------------------------
-  # Gemini CLI: the free-tier reviewer (Google AI Studio quota), a different
-  # model family from the other two. Uses Google's official PR-review recipe -
-  # the code-review extension plus the GitHub MCP server, which is how this
-  # reviewer posts its own inline comments without shell access to our token.
-  # ---------------------------------------------------------------------------
-  gemini:
-    name: Gemini review
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.sender.type != 'Bot' &&
-      github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-
-    steps:
-      - name: Check for a Gemini key
-        id: gate
-        env:
-          GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          if [ -z "${GEMINI_KEY:-}" ]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Gemini review skipped::GEMINI_API_KEY is not set - see .github/AI_REVIEW.md."
-            exit 0
-          fi
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout
-        if: steps.gate.outputs.enabled == 'true'
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      # The extension reads this instead of parsing event JSON, and it keeps the
-      # PR number out of the prompt string (no expression injection into text).
-      - name: Write the review context
-        if: steps.gate.outputs.enabled == 'true'
-        shell: bash
-        env:
-          REPOSITORY: ${{ github.repository }}
-          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          mkdir -p .gemini
-          jq -n \
-            --arg repo "$REPOSITORY" \
-            --arg pr "$PULL_REQUEST_NUMBER" \
-            '{repository: $repo, pull_request_number: $pr}' > .gemini/context.json
-
-      - name: Run Gemini pull request review
-        if: steps.gate.outputs.enabled == 'true'
-        uses: google-github-actions/run-gemini-cli@v0
-        env:
-          GEMINI_CLI_TRUST_WORKSPACE: "true"
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          workflow_name: alpha-sentinel-ai-review
-          settings: |
+          # A reviewer that does not apply here must leave the job green: it is
+          # not a required check and must never be able to block a merge.
+          emit_skip() {
+            echo "::notice::$1"
             {
-              "model": { "maxSessionTurns": 25 },
-              "mcpServers": {
-                "github": {
-                  "command": "docker",
-                  "args": [
-                    "run", "-i", "--rm",
-                    "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
-                    "ghcr.io/github/github-mcp-server:v0.27.0"
-                  ],
-                  "includeTools": [
-                    "add_comment_to_pending_review",
-                    "pull_request_read",
-                    "pull_request_review_write"
-                  ],
-                  "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}" }
-                }
-              },
-              "tools": { "core": [] }
-            }
-          extensions: |
-            ["https://github.com/gemini-cli-extensions/code-review"]
-          prompt: "/pr-code-review"
+              echo "skip=true"
+              echo "pr_url="
+              echo "command=review"
+              echo "question="
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
 
+          if [ "${AI_REVIEW_ENABLED:-}" = "false" ]; then
+            emit_skip "AI review is disabled (vars.AI_REVIEW_ENABLED=false)."
+          fi
 
-  # ---------------------------------------------------------------------------
-  # Codex: off unless a maintainer sets the repository variable
-  # ENABLE_CODEX_REVIEW=true. Four bots on every PR is noise; this one is here
-  # so a fourth opinion costs a variable flip, not a new workflow. It reviews the
-  # PR merge commit, then posts Codex's final message as one comment.
-  # ---------------------------------------------------------------------------
-  codex:
-    name: Codex review (opt-in)
-    if: >-
-      vars.ENABLE_CODEX_REVIEW == 'true' &&
-      github.event_name == 'pull_request' &&
-      github.event.sender.type != 'Bot' &&
-      github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      pull-requests: write
+          command=review
+          question=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            # Not a secret problem: the model runs locally, but a fork gets a
+            # read-only GITHUB_TOKEN, so the review could not be posted.
+            if [ "${IS_FORK:-}" = "true" ]; then
+              emit_skip "Fork PR: GitHub issues a read-only token, so no review can be posted."
+            fi
+            if [ "${IS_DRAFT:-}" = "true" ]; then
+              emit_skip "Draft PR: review starts when it is marked ready."
+            fi
+            if [ "${SKIPPED_LABEL:-}" = "true" ]; then
+              emit_skip "PR carries the skip-ai-review label."
+            fi
+            pr_url="$PR_HTML_URL"
+          else
+            if [ "${ISSUE_IS_PR:-}" != "true" ]; then
+              emit_skip "Comment is not on a pull request."
+            fi
+            # Without this gate anyone could drive a review by commenting on a
+            # public PR, spending runner minutes on someone else's behalf.
+            case " OWNER MEMBER COLLABORATOR " in
+              *" ${COMMENTER_ASSOC:-none} "*) ;;
+              *) emit_skip "Only OWNER/MEMBER/COLLABORATOR commenters can trigger a review." ;;
+            esac
+            first_line="${COMMENT_BODY%%$'\n'*}"
+            word="${first_line%% *}"
+            case "$word" in
+              /review*) command=review ;;
+              /describe*) command=describe ;;
+              /improve*) command=improve ;;
+              /ask*)
+                command=ask
+                question="${first_line#"$word"}"
+                question="${question# }"
+                ;;
+              *) emit_skip "Not a review command (expected /review, /describe, /improve or /ask)." ;;
+            esac
+            pr_url="$ISSUE_HTML_URL"
+          fi
 
-    steps:
-      - name: Check for an OpenAI key
-        id: gate
-        env:
-          OPENAI_KEY: ${{ secrets.OPENAI_API_KEY }}
+          {
+            echo "skip=false"
+            echo "pr_url=$pr_url"
+            echo "command=$command"
+            echo "question=$question"
+          } >> "$GITHUB_OUTPUT"
+
+      # Weights are the slow part of a cold run and never change for a given
+      # tag, so they survive between runs. Caches are free for public repos.
+      - name: Restore the model cache
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          # The server version is part of the key: a manifest written by one
+          # Ollama release is not guaranteed to load in another.
+          key: ollama-${{ env.OLLAMA_VERSION }}-${{ env.OLLAMA_MODEL }}
+
+      - name: Start Ollama
+        if: steps.gate.outputs.skip != 'true'
         run: |
-          if [ -z "${OPENAI_KEY:-}" ]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Codex review skipped::ENABLE_CODEX_REVIEW is on but OPENAI_API_KEY is not set."
+          set -euo pipefail
+          docker run -d --name ollama \
+            -p 127.0.0.1:11434:11434 \
+            -v "$HOME/.ollama:/root/.ollama" \
+            -e OLLAMA_CONTEXT_LENGTH="$OLLAMA_CONTEXT_LENGTH" \
+            -e OLLAMA_NUM_PARALLEL=1 \
+            -e OLLAMA_MAX_LOADED_MODELS=1 \
+            -e OLLAMA_KEEP_ALIVE=15m \
+            ollama/ollama:"${OLLAMA_VERSION}"
+          for _ in $(seq 1 60); do
+            if curl -fsS "$OLLAMA_URL/api/tags" > /dev/null; then
+              echo "Ollama is serving on $OLLAMA_URL"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Ollama did not become ready within 120s"
+          docker logs ollama || true
+          exit 1
+
+      - name: Ensure the model is on disk
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          if curl -fsS "$OLLAMA_URL/api/show" -d "{\"name\":\"$OLLAMA_MODEL\"}" > /dev/null 2>&1; then
+            echo "::notice::$OLLAMA_MODEL restored from cache"
             exit 0
           fi
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "Pulling $OLLAMA_MODEL (first run only; later runs restore it from cache)"
+          curl -fsS --max-time 1200 "$OLLAMA_URL/api/pull" \
+            -d "{\"model\":\"$OLLAMA_MODEL\",\"stream\":false}" > /dev/null
 
-      - name: Checkout the PR merge commit
-        if: steps.gate.outputs.enabled == 'true'
-        uses: actions/checkout@v4
+      # pr-agent 0.49.0 declares requires-python >=3.12, while the app itself
+      # still runs on 3.11 - so this job pins its own interpreter.
+      - name: Set up Python
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/setup-python@v5
         with:
-          ref: refs/pull/${{ github.event.pull_request.number }}/merge
-          persist-credentials: false
+          python-version: "3.12"
 
-      # Codex diffs locally, so both ends of the comparison must exist in the
-      # clone: the merge ref only brings the merge commit with it.
-      - name: Fetch base and head
-        if: steps.gate.outputs.enabled == 'true'
+      - name: Cache pip wheels
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-pr-agent-${{ env.PR_AGENT_VERSION }}
+
+      # The `github` extra is not in the base wheel: without it the provider
+      # cannot import PyGithub and no comment can be posted.
+      - name: Install PR-Agent
+        if: steps.gate.outputs.skip != 'true'
+        run: python -m pip install --no-input "pr-agent[github]==$PR_AGENT_VERSION"
+
+      # Fail on a broken model in seconds instead of after a full CPU review.
+      # `pr-agent doctor` passes only if the model id resolves, the provider key
+      # check passes and a one-token completion comes back.
+      - name: Check the model answers
+        if: steps.gate.outputs.skip != 'true'
         env:
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          git fetch --no-tags origin "$PR_BASE_REF" "+refs/pull/$PR_NUMBER/head"
+          CONFIG__MODEL: ollama/${{ env.OLLAMA_MODEL }}
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ env.PR_AGENT_MAX_TOKENS }}
+          OLLAMA_API_BASE: ${{ env.OLLAMA_URL }}
+          # Ollama has no authentication. PR-Agent only insists that the value
+          # exists, so this literal satisfies the check; it is not a credential.
+          OLLAMA_API_KEY: ollama
+        run: pr-agent doctor
 
-      - name: Run Codex
-        id: run_codex
-        if: steps.gate.outputs.enabled == 'true'
-        uses: openai/codex-action@v1
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          # Sandbox: left at the action's default (`workspace-write`). Codex only
-          # needs to read the working tree here, and the default keeps it from
-          # touching anything outside it.
-          prompt: |
-            Review ONLY the changes introduced by this PR:
-              git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
-
+      - name: Review
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GITHUB__USER_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.gate.outputs.pr_url }}
+          COMMAND: ${{ steps.gate.outputs.command }}
+          QUESTION: ${{ steps.gate.outputs.question }}
+          CONFIG__MODEL: ollama/${{ env.OLLAMA_MODEL }}
+          # A local model is not in PR-Agent's token table, so it aborts unless
+          # this is set. It doubles as the diff budget: past it, PR-Agent prunes
+          # the diff to the most relevant hunks instead of overflowing the
+          # window that OLLAMA_CONTEXT_LENGTH defines above.
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: ${{ env.PR_AGENT_MAX_TOKENS }}
+          # Never fall back: PR-Agent's shipped fallback is a hosted OpenAI
+          # model, which would either bill us or fail on a key we do not have.
+          CONFIG__FALLBACK_MODELS: "[]"
+          OLLAMA_API_BASE: ${{ env.OLLAMA_URL }}
+          OLLAMA_API_KEY: ollama
+          # litellm gives up after 120s by default. At the measured ~13.7
+          # tokens/second of prefill on a 4 vCPU runner, a full-budget prompt
+          # needs ~20 minutes before it emits a token - so the default produced
+          # "Failed to review PR" after two silent timeouts, with a green check
+          # on the job.
+          CONFIG__AI_TIMEOUT: "1800"
+          # ... and because a failed review still exits 0 by default, surface it
+          # as a failed job instead of a comment nobody notices.
+          CONFIG__PROPAGATE_TOOL_ERRORS: "true"
+          # Three findings is about all a 7B model can support without padding
+          # the comment with restatements of the diff.
+          PR_REVIEWER__NUM_MAX_FINDINGS: "3"
+          PR_REVIEWER__EXTRA_INSTRUCTIONS: |
             This is a Python service that trades real money against third-party
-            APIs, so rank findings by blast radius, not by style. Check, in
-            priority order:
-              1. ai_engine/** - LLM output is untrusted. Malformed JSON, a
+            APIs. Rank findings by blast radius, not by style, and check in this
+            order:
+              1. ai_engine/** - model output is untrusted. Malformed JSON, a
                  missing field or a prompt-injection string must not raise,
-                 silently change a verdict or leak the API key.
-              2. core/scoring.py - veto precedence is contractual; size must
-                 stay monotonic in the blended score.
-              3. bot/** - one token failure must never abort a cycle; dry runs
-                 persist and send nothing.
-              4. storage/** - schema change needs a migration and version bump;
-                 SQL parameterised; Parquet writes idempotent.
+                 silently change a verdict, or leak the API key.
+              2. core/scoring.py - veto precedence is contractual; size stays
+                 monotonic in the blended score.
+              3. bot/** - one token failure must never abort a cycle; a dry run
+                 persists and sends nothing.
+              4. storage/** - schema changes need a migration and version bump;
+                 SQL is parameterised; Parquet writes are idempotent.
               5. tests/** - hermetic: no network, no real credentials, no writes
                  outside tmp_path.
               6. .github/** - no secrets, no over-broad permissions.
+            Report only defects you can point at in the diff. No praise, and no
+            summary of what the diff already says.
+        run: |
+          set -euo pipefail
+          args=("$COMMAND")
+          if [ "$COMMAND" = "ask" ] && [ -n "$QUESTION" ]; then
+            # PR-Agent treats any argument starting with `--` as a settings
+            # override, strips the hyphens and applies the rest as
+            # `key=value` - so `/ask --why is scoring wrong?` would reach the
+            # model as `why is scoring wrong?`. Its own wire format for user
+            # text is this prefix plus percent-encoding, which PRQuestions
+            # decodes back verbatim before the prompt is built.
+            encoded="$(QUESTION="$QUESTION" python -c 'import os, urllib.parse; print("__pr_agent_encoded_text__:" + urllib.parse.quote(os.environ["QUESTION"], safe=""))')"
+            args=(ask "$encoded")
+          fi
+          pr-agent --pr_url="$PR_URL" "${args[@]}"
 
-            Output GitHub-flavoured Markdown: one `### <severity>: <file>:<line>`
-            heading per finding (CRITICAL/HIGH/MEDIUM/NIT), one sentence on the
-            risk and one on the fix. Eight findings maximum. If the diff is
-            clean, output a single line saying so. No praise, no summary of what
-            the diff already says.
-
-      - name: Post the review
-        if: steps.gate.outputs.enabled == 'true' && steps.run_codex.outputs.final-message != ''
-        uses: actions/github-script@v7
+      # A failed review leaves a bare "Failed to review PR" comment behind, and
+      # a later successful run replaces the guide but not that line - so a green
+      # PR keeps carrying a stale failure notice. The same is true of PR-Agent's
+      # temporary "Preparing review..." comment when a run is cancelled mid-way,
+      # which is exactly what a push during a 25-minute review does. Delete both
+      # kinds once the review has actually succeeded. No status function in
+      # `if:`, so it is still gated on the review step having passed.
+      - name: Drop stale bot comments
+        if: steps.gate.outputs.skip != 'true'
         env:
-          CODEX_FINAL_MESSAGE: ${{ steps.run_codex.outputs.final-message }}
-        with:
-          script: |
-            const body = (process.env.CODEX_FINAL_MESSAGE || '').trim();
-            if (!body) {
-              core.info('Codex returned an empty message; nothing to post.');
-              return;
-            }
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body: `## Codex review\n\n${body}`,
-            });
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ steps.gate.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          pr="${PR_URL##*/}"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]"
+                    and (.body == "Failed to review PR"
+                         or (.body | startswith("Preparing review"))
+                         or (.body | startswith("Preparing answer")))) | .id' |
+            while read -r id; do
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$id"
+            done
 
+      - name: Show the model server log on failure
+        if: failure() && steps.gate.outputs.skip != 'true'
+        run: docker logs --tail 100 ollama || true
+
+      # The container runs as root, and Ollama writes its manifests 0600, so the
+      # cache post-step - which runs as the runner user - would fail to read them
+      # ("Cannot open: Permission denied") and never save the 4.7 GB it just
+      # downloaded. This must stay the last step: post steps run after it.
+      - name: Make the model cache readable
+        if: always() && steps.gate.outputs.skip != 'true'
+        run: sudo chmod -R a+rX "$HOME/.ollama"
