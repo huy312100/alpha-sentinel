@@ -111,6 +111,7 @@ def store_from_settings(settings: "Settings") -> ParquetStore:
         row_group_size=storage.row_group_size,
         local_retention_days=storage.local_retention_days,
         remote_retention_days=storage.remote_retention_days,
+        dataset_retention_days=storage.dataset_retention(),
     )
 
 

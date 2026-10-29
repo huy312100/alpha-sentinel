@@ -331,7 +331,19 @@ class StorageSettings:
     row_group_size: int = 262_144
     local_retention_days: int = 90
     remote_retention_days: int = 365
+    #: Retention for datasets that exist to train models. Deliberately far
+    #: longer than the operational window: deleting the training corpus is not
+    #: recoverable, and nobody notices until the next training run.
+    training_retention_days: int = 1095
     r2: R2Settings = R2Settings()
+
+    def dataset_retention(self) -> dict[str, int]:
+        """Per-dataset retention overrides handed to the lake.
+
+        ``training_rows`` is the one dataset whose value grows with time instead
+        of decaying, so it is kept on its own clock.
+        """
+        return {"training_rows": self.training_retention_days}
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -547,6 +559,7 @@ class Settings:
             "parquet_root": str(self.storage.parquet_root),
             "hot_db_path": str(self.storage.hot_db_path),
             "parquet_compression": self.storage.compression,
+            "training_retention_days": self.storage.training_retention_days,
             "r2_enabled": self.storage.r2.enabled,
             "r2_configured": self.storage.r2.is_configured(),
             "goplus_configured": self.goplus.app_key.is_configured(),
@@ -624,6 +637,7 @@ class Settings:
             row_group_size=_env_int(env, "PARQUET_ROW_GROUP_SIZE", 262_144, minimum=1_024),
             local_retention_days=_env_int(env, "LOCAL_RETENTION_DAYS", 90, minimum=1),
             remote_retention_days=_env_int(env, "REMOTE_RETENTION_DAYS", 365, minimum=1),
+            training_retention_days=_env_int(env, "TRAINING_RETENTION_DAYS", 1095, minimum=1),
             r2=r2,
         )
 

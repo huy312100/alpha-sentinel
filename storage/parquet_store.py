@@ -29,7 +29,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 import pyarrow as pa
@@ -44,6 +44,12 @@ log = get_logger(__name__)
 
 _DATASET_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 PARTITION_COLUMN = "dt"
+
+#: Datasets that exist to train models rather than to operate the bot. A model
+#: needs years of history; a dashboard needs weeks. Applying the operational
+#: window to these deletes the training corpus silently - nothing breaks until
+#: ``ml-train`` starts refusing rows, long after the data is gone.
+DEFAULT_DATASET_RETENTION_DAYS: dict[str, int] = {"training_rows": 1095}
 
 
 class StorageError(RuntimeError):
@@ -105,6 +111,7 @@ class ParquetStore:
         row_group_size: int = 262_144,
         local_retention_days: int = 90,
         remote_retention_days: int = 365,
+        dataset_retention_days: Mapping[str, int] | None = None,
         timestamp_column: str = "timestamp",
     ) -> None:
         self.root = Path(root).expanduser().resolve()
@@ -114,6 +121,10 @@ class ParquetStore:
         self.row_group_size = max(int(row_group_size), 1_024)
         self.local_retention_days = local_retention_days
         self.remote_retention_days = remote_retention_days
+        # Defaults always apply, so a caller that forgets the argument cannot
+        # shorten the ML window. Override a dataset by passing its key, or set
+        # it to ``0`` to keep that dataset forever.
+        self.dataset_retention_days = {**DEFAULT_DATASET_RETENTION_DAYS, **(dataset_retention_days or {})}
         self.timestamp_column = timestamp_column
         self.auto_upload = bool(r2 and r2.is_configured())
         self._s3: Any = None
@@ -522,18 +533,38 @@ class ParquetStore:
         directory.rmdir()
         return True
 
+    def retention_days(self, dataset: str, *, remote: bool = False) -> int:
+        """Retention window for one dataset, in days (``<= 0`` keeps it forever).
+
+        A per-dataset entry wins over the operational default and governs both
+        the local and the remote pass, so a mirrored lake cannot outlive - or be
+        outlived by - the copy the dashboard reads.
+        """
+        override = self.dataset_retention_days.get(dataset)
+        if override is not None:
+            return int(override)
+        return self.remote_retention_days if remote else self.local_retention_days
+
     def apply_local_retention(self, *, now: datetime | None = None) -> int:
-        """Drop local partitions older than ``local_retention_days``."""
+        """Drop local partitions older than each dataset's retention window.
+
+        ``local_retention_days <= 0`` disables the pass outright, overrides
+        included: "keep everything" has to mean everything.
+        """
         if self.local_retention_days <= 0:
             return 0
-        cutoff = ((now or utcnow()) - timedelta(days=self.local_retention_days)).date().isoformat()
+        moment = now or utcnow()
         removed = 0
         for dataset in self.list_datasets():
+            days = self.retention_days(dataset)
+            if days <= 0:
+                continue
+            cutoff = (moment - timedelta(days=days)).date().isoformat()
             for partition in self.partitions(dataset):
                 if partition < cutoff and self.delete_partition(dataset, partition):
                     removed += 1
         if removed:
-            log.info("local_retention_applied", extra={"partitions_removed": removed, "cutoff": cutoff})
+            log.info("local_retention_applied", extra={"partitions_removed": removed})
         return removed
 
     # -- Cloudflare R2 (any S3-compatible endpoint) -------------------------
@@ -697,8 +728,11 @@ class ParquetStore:
         if not prefix:
             log.error("remote_retention_refused", extra={"reason": "R2_PREFIX is empty"})
             return 0
-        cutoff = (now or utcnow()) - timedelta(days=self.remote_retention_days)
         client = self._client()
+        moment = now or utcnow()
+        # ``None`` is the "keep this dataset forever" sentinel; comparing against
+        # ``datetime.max`` would explode on the tz-aware timestamps S3 returns.
+        cutoffs: dict[str, datetime | None] = {}
         removed = 0
         for item in self.remote_listing():
             key = str(item.get("key") or "")
@@ -714,8 +748,15 @@ class ParquetStore:
                 date.fromisoformat(layout[2])
             except ValueError:
                 continue
+            dataset = layout[1]
+            if dataset not in cutoffs:
+                days = self.retention_days(dataset, remote=True)
+                cutoffs[dataset] = None if days <= 0 else moment - timedelta(days=days)
+            limit = cutoffs[dataset]
+            if limit is None:
+                continue
             modified = item.get("last_modified")
-            if modified is None or modified >= cutoff:
+            if modified is None or modified >= limit:
                 continue
             client.delete_object(Bucket=self.r2.bucket, Key=key)
             removed += 1

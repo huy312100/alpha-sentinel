@@ -349,7 +349,7 @@ the groups that change behaviour:
 | --- | --- | --- |
 | Runtime | `APP_ENV`, `LOG_LEVEL`, `LOG_JSON`, `DEMO_MODE`, `DEFAULT_CHAIN` | `DEMO_MODE=true` swaps in scripted agents; no outbound LLM traffic |
 | Agents | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_BASE_URL`, `ALPHA_MODEL`, `RISK_MODEL`, timeouts, retries, concurrency, per-MTok prices, `LLM_MAX_USD_PER_CYCLE`/`LLM_MAX_USD_PER_DAY` | any OpenAI-compatible endpoint; `RISK_MODEL` is the reasoner with veto power; the spend ceilings need prices to bind |
-| Storage | `DATA_DIR`, `HOT_DB_PATH`, `PARQUET_ROOT`, `PARQUET_COMPRESSION`, retention windows | one SQLite file + one Parquet lake |
+| Storage | `DATA_DIR`, `HOT_DB_PATH`, `PARQUET_ROOT`, `PARQUET_COMPRESSION`, retention windows | one SQLite file + one Parquet lake; `training_rows` keeps `TRAINING_RETENTION_DAYS` (default 1095) instead of `LOCAL_RETENTION_DAYS`, because a corpus has to outlive an ops log |
 | Learned alpha | `ALPHA_PREDICTOR`, `ALPHA_MODEL_PATH`, `ALPHA_SHADOW`, `ALPHA_ESCALATE_MARGIN`, `ALPHA_MIN_CONFIDENCE`, `ML_WRITE_TRAINING_ROWS` | optional model scorer; the default `llm` is the historical behaviour |
 | R2 | `R2_ENABLED`, `R2_ENDPOINT_URL`, `R2_BUCKET`, keys, prefix | optional mirror of the cold lake |
 | Scanners | `GOPLUS_APP_KEY/SECRET`, `ETHERSCAN_API_KEY`, `LUNARCRUSH_API_KEY`, `X_BEARER_TOKEN`, `SEC_USER_AGENT`, timeouts | a missing key degrades that layer to `SKIPPED`, it does not fail the cycle |
