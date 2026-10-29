@@ -48,6 +48,15 @@ from core.models import (
     clamp,
 )
 from core.scoring import Decision, deterministic_risk_score, reconcile, weighted_prior
+from ml.predictor import (
+    MODE_LLM,
+    MODE_MODEL,
+    MODE_PRIOR,
+    AlphaPredictor,
+    Prediction,
+    build_predictor,
+    escalation_reason,
+)
 
 log = get_logger(__name__)
 
@@ -66,10 +75,27 @@ class AuditOutcome:
     prompt_version: str = PROMPT_VERSION
     degraded: bool = False
     errors: list[str] = field(default_factory=list)
+    #: ``llm`` or the model id that actually produced ``alpha``. Persisted so the
+    #: audit trail cannot claim an LLM judgement that never happened.
+    alpha_source: str = MODE_LLM
+    #: Why the cheap path handed this token to the LLM (``None`` = it did not).
+    escalation_reason: str | None = None
+    #: The model's opinion even when the LLM decided - the shadow-mode pair.
+    model_alpha_score: float | None = None
 
     @property
     def veto_reasons(self) -> list[str]:
         return list(self.decision.veto_reasons)
+
+
+@dataclass(slots=True)
+class _AlphaRun:
+    """Internal: the assessment plus who produced it, so the caller can record it."""
+
+    assessment: AlphaAssessment
+    source: str = MODE_LLM
+    escalation_reason: str | None = None
+    model_alpha: float | None = None
 
 
 class DualAuditFlow:
@@ -81,11 +107,17 @@ class DualAuditFlow:
         *,
         client: LLMClient | None = None,
         short_circuit_hard_flags: bool = True,
+        predictor: AlphaPredictor | None = None,
     ) -> None:
         self._settings = settings
         self._client: Any = client
         self._owns_client = client is None
         self.short_circuit_hard_flags = short_circuit_hard_flags
+        # Resolved lazily: with the default configuration no model is loaded and
+        # no pandas work happens per token.
+        self._predictor = predictor
+        self._predictor_mode: str | None = None
+        self._predictor_resolved = False
 
     # -- lifecycle ---------------------------------------------------------
     async def __aenter__(self) -> "DualAuditFlow":
@@ -132,13 +164,25 @@ class DualAuditFlow:
     def cycle_spend_usd(self) -> float:
         return float(getattr(self._client, "cycle_spend_usd", 0.0) or 0.0)
 
+    def predictor(self) -> tuple[AlphaPredictor | None, str]:
+        """The learned scorer (if any) and which source is authoritative for alpha."""
+        if not self._predictor_resolved:
+            if self._predictor is not None:
+                # An injected predictor is authoritative unless shadow is on.
+                self._predictor_mode = MODE_LLM if self._settings.ml.shadow else MODE_MODEL
+            else:
+                self._predictor, self._predictor_mode = build_predictor(self._settings)
+            self._predictor_resolved = True
+        return self._predictor, self._predictor_mode or MODE_LLM
+
     # -- public API --------------------------------------------------------
     async def audit_detailed(self, snapshot: TokenSnapshot) -> AuditOutcome:
         started = time.perf_counter()
         prior = weighted_prior(snapshot.signals)
         errors: list[str] = []
 
-        alpha = await self._run_alpha(snapshot, prior, errors)
+        alpha_run = await self._run_alpha(snapshot, prior, errors)
+        alpha = alpha_run.assessment
         risk = await self._run_risk(snapshot, alpha, prior, errors)
         self._apply_deterministic_floor(snapshot, risk, errors)
 
@@ -175,6 +219,9 @@ class DualAuditFlow:
             prior_score=prior,
             degraded=bool(errors),
             errors=errors,
+            alpha_source=alpha_run.source,
+            escalation_reason=alpha_run.escalation_reason,
+            model_alpha_score=alpha_run.model_alpha,
         )
         log.info(
             "audit_completed",
@@ -222,7 +269,86 @@ class DualAuditFlow:
         return outcomes
 
     # -- agent 1 -----------------------------------------------------------
-    async def _run_alpha(self, snapshot: TokenSnapshot, prior: float, errors: list[str]) -> AlphaAssessment:
+    async def _run_alpha(self, snapshot: TokenSnapshot, prior: float, errors: list[str]) -> _AlphaRun:
+        """Model first, LLM only when the prediction is not safe to act on.
+
+        The escalation policy (see :mod:`ml.predictor`) is deliberately about the
+        *decision*, not about how sure the model claims to be: a prediction two
+        points away from the approval floor could flip the verdict, so it costs
+        an LLM call. Everything further out is taken at face value.
+        """
+        predictor, mode = self.predictor()
+        prediction: Prediction | None = None
+        if predictor is not None:
+            try:
+                prediction = predictor.predict(snapshot)
+            except Exception as exc:  # noqa: BLE001 - a broken model is not a broken audit
+                log.error(
+                    "alpha_predictor_failed",
+                    extra={"token": snapshot.token_address, "error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+                )
+                prediction = None
+        reason = self._escalation(prediction, mode)
+        shadow = self._settings.ml.shadow or mode == MODE_LLM
+
+        if prediction is not None and not shadow and reason is None:
+            assessment = AlphaAssessment(
+                alpha_score=prediction.alpha_score,
+                confidence=prediction.confidence,
+                thesis=(
+                    f"Learned scorer {prediction.model_id} predicted {prediction.alpha_score:.1f}/100 "
+                    f"(deterministic prior {prior:.1f}). No LLM call was needed."
+                ),
+                model=prediction.model_id,
+            )
+            log.info(
+                "alpha_from_model",
+                extra={
+                    "token": f"{snapshot.chain}:{snapshot.token_address}",
+                    "model": prediction.model_id,
+                    "alpha": prediction.alpha_score,
+                    "prior": round(prior, 2),
+                    "confidence": prediction.confidence,
+                },
+            )
+            return _AlphaRun(assessment=assessment, source=mode, model_alpha=prediction.alpha_score)
+
+        assessment = await self._alpha_from_llm(snapshot, prior, errors)
+        if prediction is not None:
+            log.info(
+                "alpha_shadow_compare",
+                extra={
+                    "token": f"{snapshot.chain}:{snapshot.token_address}",
+                    "model": prediction.model_id,
+                    "model_alpha": prediction.alpha_score,
+                    "llm_alpha": assessment.alpha_score,
+                    "delta": round(assessment.alpha_score - prediction.alpha_score, 2),
+                    "model_confidence": prediction.confidence,
+                    "escalation": reason or "shadow",
+                },
+            )
+            if reason is None:
+                reason = "shadow"
+        return _AlphaRun(
+            assessment=assessment,
+            source=MODE_LLM,
+            escalation_reason=reason,
+            model_alpha=prediction.alpha_score if prediction is not None else None,
+        )
+
+    def _escalation(self, prediction: Prediction | None, mode: str) -> str | None:
+        if mode == MODE_PRIOR:
+            # ``prior`` is an explicit A/B of the deterministic path; escalating
+            # would quietly re-enable the spend it was chosen to remove.
+            return None
+        return escalation_reason(
+            prediction,
+            thresholds=self._settings.thresholds,
+            margin=self._settings.ml.escalate_margin,
+            min_confidence=self._settings.ml.min_confidence,
+        )
+
+    async def _alpha_from_llm(self, snapshot: TokenSnapshot, prior: float, errors: list[str]) -> AlphaAssessment:
         llm = self._settings.llm
         try:
             payload, result = await self._call_json(

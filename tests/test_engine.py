@@ -163,7 +163,7 @@ class TestCycle:
         assert run["verdicts_written"] == 1
 
         # Parquet mirror.
-        assert set(engine.cold.list_datasets()) == {"verdicts", "layer_signals", "runs"}
+        assert set(engine.cold.list_datasets()) == {"verdicts", "layer_signals", "training_rows", "runs"}
         verdicts_frame = engine.cold.read_frame("verdicts")
         assert len(verdicts_frame) == 1
         assert verdicts_frame.iloc[0]["token_address"] == TOKEN
@@ -171,6 +171,17 @@ class TestCycle:
         signals_frame = engine.cold.read_frame("layer_signals")
         assert len(signals_frame) == 3
         assert set(signals_frame["layer"]) == {"dex", "social", "derivatives"}
+
+        # One training row per audit, carrying both features and labels.
+        training_frame = engine.cold.read_frame("training_rows")
+        assert len(training_frame) == 1
+        row = training_frame.iloc[0]
+        assert row["token_address"] == TOKEN
+        assert 0.0 <= float(row["prior_score"]) <= 100.0
+        assert row["alpha_source"] == "llm"
+        assert row["final_status"] == "approved"
+        assert "llm_alpha_score" in training_frame.columns
+        assert "dex_score" in training_frame.columns
 
     async def test_dry_run_persists_nothing_but_reports(self, settings, store, make_verdict):
         alerter = FakeAlerter()

@@ -246,6 +246,12 @@ LLM_PROVIDER_PRESETS: dict[str, ProviderPreset] = {
 }
 DEFAULT_LLM_PROVIDER = "deepseek"
 
+#: How the alpha side of the audit is produced. ``llm`` is the historical
+#: behaviour and the default; ``model`` uses a trained artefact and escalates to
+#: the LLM only when the prediction is unsafe; ``prior`` never calls the LLM for
+#: alpha at all. See :mod:`ml.predictor`.
+ALPHA_PREDICTOR_MODES: tuple[str, ...] = ("llm", "model", "prior")
+
 
 @dataclass(frozen=True, slots=True)
 class LLMSettings:
@@ -438,6 +444,30 @@ class ThresholdSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class MLSettings:
+    """Optional learned alpha scorer (see :mod:`ml`).
+
+    Defaults are inert: ``alpha_predictor="llm"`` with ``shadow=False`` runs
+    exactly the pre-existing two-agent flow, so deploying this code changes no
+    behaviour until an operator opts in.
+    """
+
+    #: ``llm`` | ``model`` | ``prior`` - who is authoritative for alpha.
+    alpha_predictor: str = "llm"
+    model_path: Path = PROJECT_ROOT / "models" / "alpha_model.pkl"
+    #: Run the model next to the LLM without letting it decide, to measure
+    #: agreement on live traffic before switching ``alpha_predictor`` over.
+    shadow: bool = False
+    #: Escalate to the LLM when a prediction is within this distance of a
+    #: decision boundary - the call could flip, so the cheap path is not safe.
+    escalate_margin: float = 5.0
+    #: Escalate when the *input trust* score falls below this (thin snapshot).
+    min_confidence: float = 0.6
+    #: Persist one ``training_rows`` row per completed audit.
+    write_training_rows: bool = True
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     runtime: RuntimeSettings = RuntimeSettings()
     llm: LLMSettings = LLMSettings()
@@ -449,6 +479,7 @@ class Settings:
     telegram: TelegramSettings = TelegramSettings()
     scanners: ScannerSettings = ScannerSettings()
     thresholds: ThresholdSettings = ThresholdSettings()
+    ml: MLSettings = MLSettings()
 
     # -- validation ---------------------------------------------------------
     def missing_critical(self) -> list[str]:
@@ -525,6 +556,9 @@ class Settings:
             "health_max_stale_seconds": self.scanners.health_max_stale_seconds,
             "llm_max_usd_per_cycle": self.llm.max_usd_per_cycle,
             "llm_max_usd_per_day": self.llm.max_usd_per_day,
+            "alpha_predictor": self.ml.alpha_predictor,
+            "alpha_predictor_shadow": self.ml.shadow,
+            "alpha_model_path": str(self.ml.model_path),
             "layers": list(self.scanners.enabled_layers),
             "sec_user_agent_configured": bool(self.scanners.sec_user_agent),
         }
@@ -640,6 +674,20 @@ class Settings:
             alpha_weight=_env_float(env, "ALPHA_WEIGHT", 0.6, minimum=0.0),
         )
 
+        alpha_predictor = _env_str(env, "ALPHA_PREDICTOR", "llm").strip().lower()
+        if alpha_predictor not in ALPHA_PREDICTOR_MODES:
+            raise ConfigError(
+                f"ALPHA_PREDICTOR must be one of {', '.join(ALPHA_PREDICTOR_MODES)}, got {alpha_predictor!r}"
+            )
+        ml = MLSettings(
+            alpha_predictor=alpha_predictor,
+            model_path=_env_path(env, "ALPHA_MODEL_PATH", "models/alpha_model.pkl"),
+            shadow=_env_bool(env, "ALPHA_SHADOW", False),
+            escalate_margin=_env_float(env, "ALPHA_ESCALATE_MARGIN", 5.0, minimum=0.0),
+            min_confidence=_env_float(env, "ALPHA_MIN_CONFIDENCE", 0.6, minimum=0.0),
+            write_training_rows=_env_bool(env, "ML_WRITE_TRAINING_ROWS", True),
+        )
+
         settings = cls(
             runtime=runtime,
             llm=llm,
@@ -651,6 +699,7 @@ class Settings:
             telegram=telegram,
             scanners=scanners,
             thresholds=thresholds,
+            ml=ml,
         )
         settings._register_secrets()
         return settings
@@ -785,6 +834,7 @@ def iter_secret_values(settings: Settings) -> Iterable[str]:
 
 
 __all__ = [
+    "ALPHA_PREDICTOR_MODES",
     "BLOCKSCOUT_CHAINS",
     "ConfigError",
     "DEFAULT_LLM_PROVIDER",
@@ -793,6 +843,7 @@ __all__ = [
     "LEGACY_LAYER_ALIASES",
     "LLM_PROVIDER_PRESETS",
     "LLMSettings",
+    "MLSettings",
     "PROJECT_ROOT",
     "ProviderPreset",
     "ProviderSettings",

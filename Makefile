@@ -1,5 +1,5 @@
 .PHONY: help install lint test audit ci demo honeypot smoke status health once dry-run scanners bot dashboard \
-        probe docker-build docker-up docker-down docker-logs clean
+        probe ml-export ml-train docker-build docker-up docker-down docker-logs clean
 
 PY ?= python3
 VENV := .venv
@@ -22,7 +22,7 @@ test: ## Hermetic pytest suite (no keys, no network)
 audit: lint test ## Lint + tests
 
 ci: audit ## Full local gate: lint, tests, byte-compile, smoke
-	$(BIN)/python -m compileall -q bot core config scanners storage ai_engine dashboard tests
+	$(BIN)/python -m compileall -q bot core config scanners storage ai_engine dashboard ml tests
 	$(MAKE) smoke
 
 demo: ## Run the dual-agent flow offline (no API key needed)
@@ -45,6 +45,12 @@ status: ## Print hot-store status
 
 health: ## Cycle-freshness check on the configured store (same command as the container)
 	$(BIN)/python -m bot.main --health
+
+ml-export: ## Export training_rows for a notebook, with the prior baseline
+	$(BIN)/python -m ml.dataset export --out data/exports/train.parquet --baseline
+
+ml-train: ## Train the alpha model (needs requirements-ml.txt)
+	$(BIN)/python -m ml.train --out models/alpha_model.pkl
 
 once: ## One real cycle, then exit
 	$(BIN)/python -m bot.main --once

@@ -1,0 +1,17 @@
+# =============================================================================
+# Optional extras for TRAINING the alpha-score model (ml/train.py).
+# =============================================================================
+# The service image does NOT need these. `ml.train` imports scikit-learn lazily,
+# so the bot keeps scanning without them, and `ALPHA_PREDICTOR=llm` (the default)
+# never touches this code path.
+#
+#   python -m pip install -r requirements-ml.txt
+#   make ml-export    # training_rows  -> data/exports/train.parquet + baseline
+#   make ml-train     # train          -> models/alpha_model.pkl
+#
+# For exploratory work, add jupyterlab / matplotlib yourself; they are not
+# pinned here because nothing in the repo imports them.
+# =============================================================================
+
+scikit-learn==1.6.1
+joblib==1.4.2

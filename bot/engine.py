@@ -31,6 +31,7 @@ from bot.watchlist import WatchToken, WatchlistBundle, WatchlistLoader
 from config.settings import Settings
 from core.logging import get_logger
 from core.models import FinalVerdict, VerdictStatus, iso, json_safe, utcnow
+from ml.dataset import training_row, write_training_rows
 from scanners.pipeline import CollectedSnapshot, ScanPipeline
 from storage.hot_store import HotStore
 from storage.parquet_store import ParquetStore, StorageError
@@ -307,6 +308,7 @@ class ScanEngine:
 
             verdicts: list[FinalVerdict] = []
             signals: list[dict[str, Any]] = []
+            training: list[dict[str, Any]] = []
 
             if targets and self._budget_precheck(report, targets, dry_run=dry_run):
                 targets = []
@@ -380,6 +382,8 @@ class ScanEngine:
 
                     if not dry_run:
                         self._persist_verdict(verdict)
+                        if self.settings.ml.write_training_rows:
+                            self._collect_training_row(training, snapshot_result, result.outcome)
                         if result.outcome.degraded:
                             report.errors += 1
                         try:
@@ -409,7 +413,7 @@ class ScanEngine:
             report.health = self.pipeline.health_report()
 
             if not dry_run:
-                self._write_cold(verdicts, signals, report)
+                self._write_cold(verdicts, signals, training, report)
             log.info("cycle_finished", extra=report.to_dict() | {"results": len(report.results)})
             return report
         finally:
@@ -463,10 +467,26 @@ class ScanEngine:
             )
         return rows
 
+    def _collect_training_row(self, rows: list[dict[str, Any]], collected: CollectedSnapshot, outcome: Any) -> None:
+        """Add one feature/label row for the learned scorer.
+
+        Training data is a side effect of a normal cycle, not a separate job, so
+        it cannot silently fall behind the code that produces it. A failure here
+        is logged and dropped: the audit itself already succeeded.
+        """
+        try:
+            rows.append(training_row(collected, outcome))
+        except Exception as exc:  # noqa: BLE001 - never fail a cycle over a dataset row
+            log.warning(
+                "training_row_failed",
+                extra={"token": collected.snapshot.token_address, "error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+            )
+
     def _write_cold(
         self,
         verdicts: list[FinalVerdict],
         signals: list[dict[str, Any]],
+        training: list[dict[str, Any]],
         report: ScanReport,
     ) -> None:
         """Mirror the cycle into Parquet. Failure here is loud but never fatal."""
@@ -486,6 +506,8 @@ class ScanEngine:
                     timestamp_column="observed_at",
                     dedupe_keys=("token_address", "chain", "asset_class", "layer", "observed_at"),
                 )
+            if training:
+                write_training_rows(self.cold, training)
             run_row = pd.DataFrame(
                 [
                     {
