@@ -41,6 +41,22 @@ class LLMError(RuntimeError):
     """Any unrecoverable failure talking to the LLM endpoint."""
 
 
+class LLMBudgetExceeded(LLMError):
+    """A configured spend ceiling was reached; the request was never sent.
+
+    Deliberately its own class: a budget stop is an *operator decision*, not a
+    provider outage, so the audit flow must not turn it into the fail-closed
+    veto it uses for an unavailable auditor. Doing that would file a CRITICAL
+    risk verdict - and fire an alert - for every instrument still queued.
+    """
+
+    def __init__(self, *, scope: str, spent_usd: float, limit_usd: float) -> None:
+        super().__init__(f"llm {scope} spend ceiling reached: ${spent_usd:.4f} >= ${limit_usd:.4f}")
+        self.scope = scope
+        self.spent_usd = spent_usd
+        self.limit_usd = limit_usd
+
+
 @dataclass(slots=True)
 class ChatResult:
     content: str
@@ -63,6 +79,10 @@ class ClientStats:
     completion_tokens: int = 0
     cost_usd: float = 0.0
     total_latency_ms: float = 0.0
+    #: Responses that arrived without a ``usage`` block. The cost of those is not
+    #: visible to the ledger, so a non-zero value here means the spend ceilings
+    #: are only approximate - check the provider or your invoice.
+    usage_missing: int = 0
 
     def as_dict(self) -> dict[str, float | int]:
         avg = self.total_latency_ms / self.requests if self.requests else 0.0
@@ -74,6 +94,7 @@ class ClientStats:
             "completion_tokens": self.completion_tokens,
             "cost_usd": round(self.cost_usd, 6),
             "avg_latency_ms": round(avg, 1),
+            "usage_missing": self.usage_missing,
         }
 
 
@@ -94,6 +115,10 @@ class LLMClient:
         self._owns_session = session is None
         self._semaphore = asyncio.Semaphore(max(1, settings.max_concurrency))
         self._stats = ClientStats()
+        #: Spend meters. ``_day_spend_usd`` is seeded from persistent storage at
+        #: the start of each cycle, so a restart does not reset today's bill.
+        self._cycle_spend_usd = 0.0
+        self._day_spend_usd = 0.0
 
     # -- lifecycle ---------------------------------------------------------
     async def __aenter__(self) -> "LLMClient":
@@ -121,6 +146,39 @@ class LLMClient:
     @property
     def provider(self) -> str:
         return self._settings.provider
+
+    # -- spend ceilings ----------------------------------------------------
+    @property
+    def cycle_spend_usd(self) -> float:
+        """Cost accrued since :meth:`start_cycle`."""
+        return round(self._cycle_spend_usd, 6)
+
+    @property
+    def day_spend_usd(self) -> float:
+        return round(self._day_spend_usd, 6)
+
+    def start_cycle(self, *, day_spend_usd: float = 0.0) -> None:
+        """Reset the per-cycle meter and seed the day meter from the store."""
+        self._cycle_spend_usd = 0.0
+        self._day_spend_usd = max(float(day_spend_usd or 0.0), 0.0)
+
+    def _check_budget(self) -> None:
+        """Refuse a request that would cross a ceiling.
+
+        Checked inside the concurrency semaphore, immediately before the send:
+        a request that queued behind 60 others must see the spend of everything
+        that finished while it waited, not the spend at the time it was created.
+        """
+        for scope, spent, limit in (
+            ("cycle", self._cycle_spend_usd, self._settings.max_usd_per_cycle),
+            ("day", self._day_spend_usd, self._settings.max_usd_per_day),
+        ):
+            if limit > 0 and spent >= limit:
+                log.warning(
+                    "llm_budget_exceeded",
+                    extra={"scope": scope, "spent_usd": round(spent, 6), "limit_usd": limit},
+                )
+                raise LLMBudgetExceeded(scope=scope, spent_usd=spent, limit_usd=limit)
 
     # -- core call ---------------------------------------------------------
     async def chat_json(
@@ -150,6 +208,7 @@ class LLMClient:
 
         started = time.perf_counter()
         async with self._semaphore:
+            self._check_budget()
             body = await self._post_adapted(payload, model=model)
         latency_ms = (time.perf_counter() - started) * 1000.0
         return self._parse_body(body, model=model, latency_ms=latency_ms)
@@ -219,6 +278,11 @@ class LLMClient:
 
     # -- response handling -------------------------------------------------
     def _parse_body(self, body: dict[str, Any], *, model: str, latency_ms: float) -> ChatResult:
+        # Price the call before judging it: a response that turns out to be
+        # unusable (empty content, a gateway error envelope) was still billed,
+        # and a ceiling that ignores those calls can be walked around.
+        usage, cost = self._record_usage(body, model=model)
+
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices:
             self._stats.failures += 1
@@ -235,19 +299,7 @@ class LLMClient:
             self._stats.failures += 1
             raise LLMError(f"llm returned empty content (finish_reason={first.get('finish_reason')})")
 
-        usage_raw = body.get("usage") or {}
-        usage = {
-            key: int(usage_raw.get(key) or 0)
-            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-        }
-        cost = (
-            usage["prompt_tokens"] / 1_000_000 * self._settings.input_usd_per_mtok
-            + usage["completion_tokens"] / 1_000_000 * self._settings.output_usd_per_mtok
-        )
         self._stats.requests += 1
-        self._stats.prompt_tokens += usage["prompt_tokens"]
-        self._stats.completion_tokens += usage["completion_tokens"]
-        self._stats.cost_usd += cost
         self._stats.total_latency_ms += latency_ms
 
         log.debug(
@@ -267,6 +319,35 @@ class LLMClient:
             latency_ms=round(latency_ms, 1),
             reasoning_content=str(message.get("reasoning_content") or ""),
         )
+
+    def _record_usage(self, body: dict[str, Any], *, model: str) -> tuple[dict[str, int], float]:
+        """Add this response's tokens to the ledger and the spend meters."""
+        usage_raw = body.get("usage") or {}
+        usage: dict[str, int] = {}
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            try:
+                usage[key] = int(usage_raw.get(key) or 0)
+            except (TypeError, ValueError):
+                usage[key] = 0
+        cost = (
+            usage["prompt_tokens"] / 1_000_000 * self._settings.input_usd_per_mtok
+            + usage["completion_tokens"] / 1_000_000 * self._settings.output_usd_per_mtok
+        )
+        self._cycle_spend_usd += cost
+        self._day_spend_usd += cost
+        self._stats.prompt_tokens += usage["prompt_tokens"]
+        self._stats.completion_tokens += usage["completion_tokens"]
+        self._stats.cost_usd += cost
+        if usage["prompt_tokens"] + usage["completion_tokens"] <= 0:
+            # A gateway that strips ``usage`` - or reports only a total, which no
+            # input/output price can split - makes the ceiling blind. Keep the
+            # count visible instead of silently pricing the call at zero.
+            self._stats.usage_missing += 1
+            log.warning(
+                "llm_usage_missing",
+                extra={"provider": self._settings.provider, "model": model},
+            )
+        return usage, cost
 
 
 # ---------------------------------------------------------------------------
@@ -302,4 +383,4 @@ def _adapt_payload(exc: LLMError, payload: dict[str, Any]) -> dict[str, Any] | N
     return adapted
 
 
-__all__ = ["ChatResult", "ClientStats", "LLMClient", "LLMError"]
+__all__ = ["ChatResult", "ClientStats", "LLMBudgetExceeded", "LLMClient", "LLMError"]

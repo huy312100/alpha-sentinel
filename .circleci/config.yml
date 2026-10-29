@@ -79,13 +79,18 @@ jobs:
           name: Build the runtime image
           command: docker build --tag alpha-sentinel:${CIRCLE_SHA1:0:7} .
       - run:
-          name: Smoke the image (status command, no credentials)
+          name: Smoke the image (status + health, no credentials)
           command: |
             docker run --rm \
               -e DEMO_MODE=true \
               -e TELEGRAM_BOT_TOKEN= \
               -e TELEGRAM_CHAT_ID= \
               alpha-sentinel:${CIRCLE_SHA1:0:7} python -m bot.main --status
+            docker run --rm \
+              -e DEMO_MODE=true \
+              -e TELEGRAM_BOT_TOKEN= \
+              -e TELEGRAM_CHAT_ID= \
+              alpha-sentinel:${CIRCLE_SHA1:0:7} python -m bot.main --health
       - run:
           name: The image refuses to boot on an invalid configuration (exit 2)
           # The boot gate is the point of the image: a production container with

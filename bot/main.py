@@ -5,13 +5,15 @@ Usage::
     python -m bot --once --dry-run          # one cycle, nothing persisted
     python -m bot                            # daemon loop (SCAN_INTERVAL_SECONDS)
     python -m bot --status                   # what is in the hot store right now
+    python -m bot --health                   # is the loop still turning? (docker healthcheck)
     python -m bot --token WETH --chain ethereum --once
     python -m bot --token AAPL --once        # any watchlist ticker works too
     python -m bot --maintenance              # retention + stale-run cleanup
 
-Exit codes are meaningful for cron/CI: ``0`` success, ``1`` the cycle hit errors,
-``2`` bad usage (unknown watchlist, unknown instrument) or an environment that
-cannot be trusted, so the process refuses to boot instead of scanning half blind.
+Exit codes are meaningful for cron/CI: ``0`` success, ``1`` the cycle hit errors
+(or, for ``--health``, the bot is stalled), ``2`` bad usage (unknown watchlist,
+unknown instrument) or an environment that cannot be trusted, so the process
+refuses to boot instead of scanning half blind.
 """
 
 from __future__ import annotations
@@ -25,7 +27,8 @@ from dataclasses import replace
 from typing import Sequence
 
 from bot.alerts import TelegramAlerter
-from bot.engine import ScanEngine, ScanReport
+from bot.engine import ScanEngine, ScanReport, day_spend_key
+from bot.health import evaluate
 from bot.watchlist import WatchToken, WatchlistBundle, WatchlistError, WatchlistLoader
 from config.errors import ConfigError
 from config.settings import Settings
@@ -50,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--once", action="store_true", help="run a single cycle and exit")
     mode.add_argument("--daemon", action="store_true", help="loop forever (default)")
     mode.add_argument("--status", action="store_true", help="print hot-store status and exit")
+    mode.add_argument(
+        "--health",
+        action="store_true",
+        help="print a cycle-freshness verdict and exit non-zero when the loop stopped",
+    )
     mode.add_argument("--maintenance", action="store_true", help="run retention and exit")
 
     parser.add_argument(
@@ -166,6 +174,11 @@ def format_status(settings: Settings, bundle: WatchlistBundle, store: HotStore) 
         f"key {'set' if settings.llm.api_key.is_configured() else 'missing'}",
         f"  alerts configured: {settings.telegram.is_configured()}",
         f"  fundamentals: {'SEC EDGAR enabled' if settings.scanners.sec_user_agent else 'off (SEC_USER_AGENT unset)'}",
+        "  llm spend: today {} (day cap {}), cycle cap {}".format(
+            _usd(_today_spend(store)),
+            _usd(settings.llm.max_usd_per_day),
+            _usd(settings.llm.max_usd_per_cycle),
+        ),
     ]
     breakdown = store.status_breakdown(since_hours=24.0)
     pretty = ", ".join(f"{status}={count}" for status, count in sorted(breakdown.items())) or "none"
@@ -196,6 +209,19 @@ def format_status(settings: Settings, bundle: WatchlistBundle, store: HotStore) 
     return "\n".join(lines)
 
 
+def _usd(value: float) -> str:
+    """Render a spend figure; a zero ceiling means "no ceiling", not "$0"."""
+    return "none" if value <= 0 else f"${value:.4f}"
+
+
+def _today_spend(store: HotStore) -> float:
+    """Today's ledgered LLM spend; a read failure must not hide the rest of status."""
+    try:
+        return max(float(store.get_state(day_spend_key(), 0.0) or 0.0), 0.0)
+    except (TypeError, ValueError, OSError, RuntimeError):
+        return 0.0
+
+
 def _install_signal_handlers(engine: ScanEngine) -> None:
     """Stop on Ctrl-C / SIGTERM *after* the cycle in flight completes."""
     loop = asyncio.get_running_loop()
@@ -221,7 +247,9 @@ def _refuse_invalid_config(settings: Settings, *, status_only: bool) -> int | No
     A misconfigured deploy must die before it writes a verdict, not on its first
     audit: an unset ``LLM_API_KEY``, production-with-``DEMO_MODE``, a broken
     endpoint catalogue or an unknown layer name are operator errors. ``--status``
-    is exempt because the container healthcheck runs exactly that command.
+    and ``--health`` are exempt because the container healthcheck runs them: a
+    check that refuses to answer when config is wrong cannot report on the loop,
+    and an invalid environment already kills the daemon at boot with exit ``2``.
     """
     if status_only:
         return None
@@ -248,7 +276,7 @@ async def main(argv: list[str] | None = None) -> int:
         # because the daemon refuses to boot otherwise.
         return _report_config_error(exc)
 
-    refusal = _refuse_invalid_config(settings, status_only=args.status)
+    refusal = _refuse_invalid_config(settings, status_only=args.status or args.health)
     if refusal is not None:
         return refusal
 
@@ -257,6 +285,12 @@ async def main(argv: list[str] | None = None) -> int:
 
 async def _run(args: argparse.Namespace, settings: Settings) -> int:
     """Execute the requested mode against a validated environment and one store."""
+    if args.health:
+        # Deliberately before the watchlist load: an unreadable watchlist is a
+        # content problem the daemon reports on its next cycle, not evidence
+        # that the loop stopped.
+        return _run_health(settings, as_json=args.json)
+
     loader = WatchlistLoader(
         settings.scanners.watchlist_path, default_chain=settings.runtime.default_chain
     )
@@ -305,6 +339,18 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
             return EXIT_OK
     finally:
         store.close()
+
+
+def _run_health(settings: Settings, *, as_json: bool = False) -> int:
+    """Print the freshness verdict. A non-zero exit is what restarts the container."""
+    store = HotStore(settings.storage.hot_db_path)
+    try:
+        store.initialize()
+        report = evaluate(store, settings)
+    finally:
+        store.close()
+    print(json.dumps(report.to_dict(), indent=2, default=str) if as_json else report.format())
+    return EXIT_OK if report.healthy else EXIT_ERROR
 
 
 async def _run_single_cycle(

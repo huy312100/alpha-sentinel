@@ -25,6 +25,7 @@ from typing import Any, Sequence
 import pandas as pd
 
 from ai_engine.dual_audit_flow import AuditOutcome, DualAuditFlow
+from ai_engine.llm_client import LLMBudgetExceeded
 from bot.alerts import AlertResult, TelegramAlerter
 from bot.watchlist import WatchToken, WatchlistBundle, WatchlistLoader
 from config.settings import Settings
@@ -39,6 +40,17 @@ log = get_logger(__name__)
 VERDICTS_DATASET = "verdicts"
 SIGNALS_DATASET = "layer_signals"
 RUNS_DATASET = "runs"
+
+#: ``kv`` key prefix for the spend ledger; one row per UTC day.
+LLM_SPEND_KEY = "llm_spend_usd"
+#: Written when the engine starts so ``--health`` can tell a booting daemon from
+#: a stalled one (a fresh process legitimately has no finished cycle yet).
+BOOT_STATE_KEY = "bot_booted_at"
+
+
+def day_spend_key(moment: Any | None = None) -> str:
+    """Hot-store key holding today's LLM spend (UTC day boundaries)."""
+    return f"{LLM_SPEND_KEY}:{(moment or utcnow()):%Y-%m-%d}"
 
 
 @dataclass(slots=True)
@@ -92,6 +104,9 @@ class ScanReport:
     vetoed: int = 0
     errors: int = 0
     alerts_sent: int = 0
+    #: USD spent on this cycle's LLM calls. Reported even for dry runs, because a
+    #: dry run still pays the provider - it only skips persistence.
+    llm_spend_usd: float = 0.0
     results: list[TokenResult] = field(default_factory=list)
     health: dict[str, Any] = field(default_factory=dict)
     dry_run: bool = False
@@ -121,6 +136,7 @@ class ScanReport:
             "by_status": self.verdicts_by_status(),
             "errors": self.errors,
             "alerts_sent": self.alerts_sent,
+            "llm_spend_usd": round(self.llm_spend_usd, 6),
             "dry_run": self.dry_run,
             "health": self.health,
             "results": [result.to_dict() for result in self.results],
@@ -164,6 +180,9 @@ class ScanEngine:
         self._started = False
         self._stop = asyncio.Event()
         self._last_maintenance: float = 0.0
+        #: Today's spend as measured before this cycle opened the meter, or
+        #: ``None`` when no cycle has opened one (nothing to persist yet).
+        self._spend_seeded: float | None = None
 
     # -- lifecycle ----------------------------------------------------------
     async def __aenter__(self) -> "ScanEngine":
@@ -177,6 +196,7 @@ class ScanEngine:
         if self._started:
             return
         self.store.initialize()
+        self._mark_booted()
         if self.pipeline is None:
             self.pipeline = ScanPipeline(self.settings)
             self._owns_pipeline = True
@@ -288,6 +308,9 @@ class ScanEngine:
             verdicts: list[FinalVerdict] = []
             signals: list[dict[str, Any]] = []
 
+            if targets and self._budget_precheck(report, targets, dry_run=dry_run):
+                targets = []
+
             if targets:
                 try:
                     collected = await self.pipeline.collect_many([token.to_snapshot() for token in targets])
@@ -304,7 +327,12 @@ class ScanEngine:
                     for item in collected
                 }
 
-                for token in targets:
+                #: Set only when a spend ceiling stops the queue mid-cycle, so
+                #: the instruments behind it are reported rather than dropped.
+                budget_message = ""
+                unspent: list[WatchToken] = []
+
+                for position, token in enumerate(targets):
                     snapshot_result = by_key.get(token.key)
                     if snapshot_result is None:
                         report.errors += 1
@@ -315,6 +343,29 @@ class ScanEngine:
                     signals.extend(self._signal_rows(snapshot_result))
                     try:
                         result.outcome = await self.audit.audit_detailed(snapshot_result.snapshot)
+                    except LLMBudgetExceeded as exc:
+                        # A ceiling is not a verdict. Spending stops here and the
+                        # rest of the queue is reported unaudited, instead of the
+                        # fail-closed risk path filing a CRITICAL veto - and an
+                        # alert - for every remaining instrument.
+                        budget_message = (
+                            f"llm_budget_exhausted ({exc.scope} ${exc.spent_usd:.4f} >= ${exc.limit_usd:.4f})"
+                        )
+                        result.error = budget_message
+                        report.errors += 1
+                        report.results.append(result)
+                        unspent = list(targets[position + 1 :])
+                        log.error(
+                            "llm_budget_exhausted",
+                            extra={
+                                "scope": exc.scope,
+                                "spent_usd": round(exc.spent_usd, 6),
+                                "limit_usd": exc.limit_usd,
+                                "token": token.token_address,
+                                "unaudited": len(unspent),
+                            },
+                        )
+                        break
                     except Exception as exc:  # noqa: BLE001 - isolate one token
                         result.error = f"{type(exc).__name__}: {str(exc)[:200]}"
                         report.errors += 1
@@ -347,6 +398,12 @@ class ScanEngine:
                         if result.alert and result.alert.sent:
                             report.alerts_sent += 1
 
+                for leftover in unspent:
+                    report.errors += 1
+                    report.results.append(TokenResult(token=leftover, error=budget_message))
+
+            report.llm_spend_usd = float(getattr(self.audit, "cycle_spend_usd", 0.0) or 0.0)
+            self._record_day_spend(dry_run=dry_run)
             report.finished_at = utcnow()
             report.duration_ms = (time.perf_counter() - started) * 1000
             report.health = self.pipeline.health_report()
@@ -474,6 +531,86 @@ class ScanEngine:
         except Exception as exc:  # noqa: BLE001 - bookkeeping
             log.error("run_finish_failed", extra={"run_id": report.run_id, "error": str(exc)[:200]})
 
+    # -- spend ceilings -----------------------------------------------------
+    def _mark_booted(self) -> None:
+        """Record the process start so a fresh daemon is not reported as stalled.
+
+        A bot that just came up legitimately has no finished cycle yet; without
+        this marker ``--health`` could not tell "booting" from "wedged".
+        """
+        try:
+            self.store.put_state(BOOT_STATE_KEY, iso(utcnow()))
+        except Exception as exc:  # noqa: BLE001 - diagnostic only, never fatal
+            log.warning("boot_marker_failed", extra={"error": str(exc)[:200]})
+
+    def _day_spend_usd(self) -> float:
+        """Today's ledgered spend, or ``0.0`` when it cannot be read.
+
+        A read failure fails *open*: the per-cycle ceiling inside the client
+        still binds, so the worst case is a bounded overspend today rather than
+        a bot that refuses to work because a counter row is unreadable.
+        """
+        try:
+            return max(float(self.store.get_state(day_spend_key(), 0.0) or 0.0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        except Exception as exc:  # noqa: BLE001 - storage hiccup
+            log.warning("llm_spend_read_failed", extra={"error": str(exc)[:200]})
+            return 0.0
+
+    def _budget_precheck(
+        self, report: ScanReport, targets: Sequence[WatchToken], *, dry_run: bool
+    ) -> bool:
+        """Open the cycle's spend window and stop early if the day is already spent.
+
+        Returns ``True`` when the daily ceiling is reached, in which case the
+        cycle must neither collect nor audit: collecting would burn scanner
+        time for a verdict the auditor is not allowed to produce.
+        """
+        day_spend = self._day_spend_usd()
+        starter = getattr(self.audit, "start_cycle", None)
+        if starter is not None:
+            starter(day_spend_usd=day_spend)
+        self._spend_seeded = day_spend
+
+        limit = self.settings.llm.max_usd_per_day
+        if limit <= 0 or day_spend < limit:
+            return False
+        message = f"llm_budget_exhausted (day ${day_spend:.4f} >= ${limit:.4f})"
+        for token in targets:
+            report.errors += 1
+            report.results.append(TokenResult(token=token, error=message))
+        log.error(
+            "llm_budget_exhausted",
+            extra={
+                "scope": "day",
+                "spent_usd": round(day_spend, 6),
+                "limit_usd": limit,
+                "unaudited": len(targets),
+                "dry_run": dry_run,
+            },
+        )
+        return True
+
+    def _record_day_spend(self, *, dry_run: bool) -> None:
+        """Persist today's total once per cycle.
+
+        Written once at the end rather than per request: a crash loses at most
+        one cycle of accounting, and the per-cycle ceiling bounds that loss.
+        Dry runs never write - they persist nothing, by contract.
+        """
+        seeded = self._spend_seeded
+        self._spend_seeded = None
+        if dry_run or seeded is None:
+            return
+        spent = seeded + float(getattr(self.audit, "cycle_spend_usd", 0.0) or 0.0)
+        if spent <= 0:
+            return
+        try:
+            self.store.put_state(day_spend_key(), round(spent, 6))
+        except Exception as exc:  # noqa: BLE001 - accounting must not fail a cycle
+            log.warning("llm_spend_record_failed", extra={"error": str(exc)[:200]})
+
     # -- maintenance --------------------------------------------------------
     def maintenance(self, *, force: bool = False) -> dict[str, Any]:
         """Trim the hot DB and the Parquet lake; safe to call repeatedly."""
@@ -547,10 +684,13 @@ class ScanEngine:
 
 
 __all__ = [
+    "BOOT_STATE_KEY",
+    "LLM_SPEND_KEY",
     "RUNS_DATASET",
     "SIGNALS_DATASET",
     "VERDICTS_DATASET",
     "ScanEngine",
     "ScanReport",
     "TokenResult",
+    "day_spend_key",
 ]
