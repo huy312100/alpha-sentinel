@@ -52,6 +52,16 @@ PARTITION_COLUMN = "dt"
 DEFAULT_DATASET_RETENTION_DAYS: dict[str, int] = {"training_rows": 1095}
 
 
+def _retention_cutoff(days: int, moment: datetime) -> datetime | None:
+    """The instant before which data has expired; ``None`` means keep forever.
+
+    The ``<= 0`` rule lives here and nowhere else. It used to be spelled twice -
+    a ``continue`` in the local pass, a ``None`` sentinel in the remote one - and
+    a reader checking "does zero really keep this?" had to find both.
+    """
+    return None if days <= 0 else moment - timedelta(days=days)
+
+
 class StorageError(RuntimeError):
     """Raised for invalid dataset names, missing credentials or corrupt layout."""
 
@@ -556,10 +566,10 @@ class ParquetStore:
         moment = now or utcnow()
         removed = 0
         for dataset in self.list_datasets():
-            days = self.retention_days(dataset)
-            if days <= 0:
+            limit = _retention_cutoff(self.retention_days(dataset), moment)
+            if limit is None:
                 continue
-            cutoff = (moment - timedelta(days=days)).date().isoformat()
+            cutoff = limit.date().isoformat()
             for partition in self.partitions(dataset):
                 if partition < cutoff and self.delete_partition(dataset, partition):
                     removed += 1
@@ -718,9 +728,15 @@ class ParquetStore:
     def apply_remote_retention(self, *, now: datetime | None = None) -> int:
         """Delete R2 objects older than ``remote_retention_days``.
 
+        A per-dataset override governs this pass too, and ``0`` keeps that
+        dataset forever - the same rule the local pass applies.
+
         Retention is refused without an explicit prefix: an empty prefix lists the
         whole bucket and would delete objects this project does not own. Only
         Parquet files inside a ``dt=`` partition of *this* lake are eligible.
+
+        ``remote_retention_days <= 0`` disables the pass outright, overrides
+        included: "keep everything" has to mean everything here as well.
         """
         if not self.r2_ready or self.remote_retention_days <= 0:
             return 0
@@ -730,8 +746,6 @@ class ParquetStore:
             return 0
         client = self._client()
         moment = now or utcnow()
-        # ``None`` is the "keep this dataset forever" sentinel; comparing against
-        # ``datetime.max`` would explode on the tz-aware timestamps S3 returns.
         cutoffs: dict[str, datetime | None] = {}
         removed = 0
         for item in self.remote_listing():
@@ -750,8 +764,7 @@ class ParquetStore:
                 continue
             dataset = layout[1]
             if dataset not in cutoffs:
-                days = self.retention_days(dataset, remote=True)
-                cutoffs[dataset] = None if days <= 0 else moment - timedelta(days=days)
+                cutoffs[dataset] = _retention_cutoff(self.retention_days(dataset, remote=True), moment)
             limit = cutoffs[dataset]
             if limit is None:
                 continue

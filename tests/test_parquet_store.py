@@ -239,3 +239,21 @@ def test_remote_retention_honours_the_per_dataset_window(remote):
 
     assert store.apply_remote_retention(now=utcnow()) == 1
     assert fake.deleted == ["alpha-sentinel/verdicts/dt=2020-01-01/old.parquet"]
+
+
+def test_a_zero_window_keeps_remote_objects_forever(tmp_path):
+    """``0`` has to mean the same thing on R2 as it does on disk."""
+    store = ParquetStore(
+        tmp_path / "lake",
+        r2=r2("alpha-sentinel"),
+        remote_retention_days=30,
+        dataset_retention_days={"training_rows": 0},
+    )
+    fake = FakeS3()
+    store._s3 = fake
+    fake.listing = [
+        {"Key": "alpha-sentinel/training_rows/dt=2020-01-01/old.parquet", "LastModified": utcnow() - timedelta(days=400)}
+    ]
+
+    assert store.apply_remote_retention(now=utcnow()) == 0
+    assert fake.deleted == []
