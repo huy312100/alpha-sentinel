@@ -349,10 +349,12 @@ jobs:
 
       # A failed review leaves a bare "Failed to review PR" comment behind, and
       # a later successful run replaces the guide but not that line - so a green
-      # PR keeps carrying a stale failure notice. Delete it once the review has
-      # actually succeeded. No status function in `if:`, so it is still gated on
-      # the review step having passed.
-      - name: Drop a stale failure comment
+      # PR keeps carrying a stale failure notice. The same is true of PR-Agent's
+      # temporary "Preparing review..." comment when a run is cancelled mid-way,
+      # which is exactly what a push during a 25-minute review does. Delete both
+      # kinds once the review has actually succeeded. No status function in
+      # `if:`, so it is still gated on the review step having passed.
+      - name: Drop stale bot comments
         if: steps.gate.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -361,7 +363,10 @@ jobs:
           set -euo pipefail
           pr="${PR_URL##*/}"
           gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$pr/comments" \
-            --jq '.[] | select(.user.login == "github-actions[bot]" and .body == "Failed to review PR") | .id' |
+            --jq '.[] | select(.user.login == "github-actions[bot]"
+                    and (.body == "Failed to review PR"
+                         or (.body | startswith("Preparing review"))
+                         or (.body | startswith("Preparing answer")))) | .id' |
             while read -r id; do
               gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/comments/$id"
             done
