@@ -286,6 +286,58 @@ everything — no alpha score can outvote a honeypot flag or a CRITICAL finding.
 
 ---
 
+## Learned alpha scorer (optional)
+
+`ml/` turns the bot's own audits into a dataset and can replace Agent 1 with a
+model trained on it. Off by default: `ALPHA_PREDICTOR=llm` runs exactly the
+two-agent flow above, and nothing in `ml/` is imported on that path.
+
+```
+cycle ──► training_rows (Parquet)          one row per audit: features + labels
+             │
+             ├─ make ml-export ──► data/exports/train.parquet   (+ prior baseline)
+             └─ make ml-train  ──► models/alpha_model.pkl       (time split, GBM)
+
+model ──► prediction ──► safe? ──yes──► verdict, no alpha call
+                          │no
+                          └──────► Agent 1 (LLM) ──► verdict
+```
+
+The model answers first; the LLM is downgraded to an adjudicator. A token is
+escalated to it when any of these holds:
+
+| Trigger | Why |
+| --- | --- |
+| prediction within `ALPHA_ESCALATE_MARGIN` of 65 or 50 | the verdict could flip, so the cheap path is not safe |
+| input trust below `ALPHA_MIN_CONFIDENCE` | too few core features are present to interpolate |
+| a core market input left its training range, or 5% of features did | regime drift: the model would be extrapolating |
+| no artefact, or the estimator raised | fall back to the LLM, never fail the audit |
+
+Only the alpha agent is replaced. The risk auditor keeps its veto, so a model
+score can never outvote a honeypot flag or a CRITICAL finding.
+
+**What this buys, honestly.** Distilling the LLM's *score* cannot make it more
+accurate - it reproduces the teacher faster and cheaper: ~1 ms instead of tens of
+seconds, deterministic, and no alpha call on the confident majority. That is
+roughly a third of the calls, not the whole bill, because the risk reasoner is
+the larger line item. If your goal is accuracy rather than cost, train on a
+forward-return column instead (`python -m ml.train --label forward_return_7d`) -
+that is the only target that can beat the teacher, and it needs weeks of price
+history to exist first.
+
+Guardrails: the deterministic veto hierarchy is untouched, a missing or corrupt
+artefact degrades to the LLM with a log line instead of failing boot, a model
+prediction always carries its id into `FinalVerdict.alpha.model`, and an
+artefact whose feature list contains a label column is refused as leakage.
+
+```bash
+python -m pip install -r requirements-ml.txt   # optional; the image does not need it
+ALPHA_SHADOW=true make bot        # measure agreement on live traffic, LLM still decides
+ALPHA_PREDICTOR=model make bot    # let the model answer first
+```
+
+---
+
 ## Configuration
 
 Everything is environment-driven and read once at process start (`config/settings.py`,
@@ -298,6 +350,7 @@ the groups that change behaviour:
 | Runtime | `APP_ENV`, `LOG_LEVEL`, `LOG_JSON`, `DEMO_MODE`, `DEFAULT_CHAIN` | `DEMO_MODE=true` swaps in scripted agents; no outbound LLM traffic |
 | Agents | `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_BASE_URL`, `ALPHA_MODEL`, `RISK_MODEL`, timeouts, retries, concurrency, per-MTok prices, `LLM_MAX_USD_PER_CYCLE`/`LLM_MAX_USD_PER_DAY` | any OpenAI-compatible endpoint; `RISK_MODEL` is the reasoner with veto power; the spend ceilings need prices to bind |
 | Storage | `DATA_DIR`, `HOT_DB_PATH`, `PARQUET_ROOT`, `PARQUET_COMPRESSION`, retention windows | one SQLite file + one Parquet lake |
+| Learned alpha | `ALPHA_PREDICTOR`, `ALPHA_MODEL_PATH`, `ALPHA_SHADOW`, `ALPHA_ESCALATE_MARGIN`, `ALPHA_MIN_CONFIDENCE`, `ML_WRITE_TRAINING_ROWS` | optional model scorer; the default `llm` is the historical behaviour |
 | R2 | `R2_ENABLED`, `R2_ENDPOINT_URL`, `R2_BUCKET`, keys, prefix | optional mirror of the cold lake |
 | Scanners | `GOPLUS_APP_KEY/SECRET`, `ETHERSCAN_API_KEY`, `LUNARCRUSH_API_KEY`, `X_BEARER_TOKEN`, `SEC_USER_AGENT`, timeouts | a missing key degrades that layer to `SKIPPED`, it does not fail the cycle |
 | Endpoints | `ENDPOINTS_FILE`, `<VENDOR>_BASE_URL`, `<VENDOR>_<NAME>_URL` | every outbound URL (host **and** path) lives in `config/endpoints.yaml`; mount that shape as a ConfigMap via `ENDPOINTS_FILE` to replace entries in bulk, or move one vendor/one endpoint from `.env`. No scanner contains a URL |
@@ -369,7 +422,7 @@ mirrored to R2. `engine.maintenance()` prunes both stores on
 ## Tests
 
 ```bash
-make test                                   # 538 tests, <2s
+make test                                   # 599 tests, <2s
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
@@ -459,6 +512,8 @@ bot/          watchlist loader (crypto + listed markets), scan engine, Telegram 
 config/       settings (env-driven dataclasses), endpoints.yaml (every vendor URL),
               watchlists.yaml
 core/         instrument identity, models, deterministic scoring, HTTP + logging helpers
+ml/           optional learned alpha scorer: features, training_rows, train, predictor
+              + escalation policy (imported only when ALPHA_PREDICTOR != llm)
 scanners/     framework only at the root: __init__, base (layer contract),
               registry (asset_class -> layer routing), pipeline, __main__
   crypto/       eight self-contained layers (layer1_onchain .. layer8_security);
