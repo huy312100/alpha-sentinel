@@ -635,9 +635,12 @@ class Settings:
             parquet_root=_env_path(env, "PARQUET_ROOT", "data/cold"),
             compression=_env_str(env, "PARQUET_COMPRESSION", "zstd").lower(),
             row_group_size=_env_int(env, "PARQUET_ROW_GROUP_SIZE", 262_144, minimum=1_024),
-            local_retention_days=_env_int(env, "LOCAL_RETENTION_DAYS", 90, minimum=1),
-            remote_retention_days=_env_int(env, "REMOTE_RETENTION_DAYS", 365, minimum=1),
-            training_retention_days=_env_int(env, "TRAINING_RETENTION_DAYS", 1095, minimum=1),
+            # ``0`` means "keep this dataset forever" all the way down to
+            # ParquetStore. Refusing it here would leave the store's contract
+            # unreachable from the only surface an operator has: the environment.
+            local_retention_days=_env_int(env, "LOCAL_RETENTION_DAYS", 90, minimum=0),
+            remote_retention_days=_env_int(env, "REMOTE_RETENTION_DAYS", 365, minimum=0),
+            training_retention_days=_env_int(env, "TRAINING_RETENTION_DAYS", 1095, minimum=0),
             r2=r2,
         )
 
