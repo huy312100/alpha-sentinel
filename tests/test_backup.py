@@ -88,6 +88,25 @@ def test_a_truncated_file_is_refused(tmp_path):
         inspect(broken)
 
 
+def test_a_path_with_uri_metacharacters_cannot_rewrite_the_access_mode(tmp_path):
+    """``as_uri`` escapes ``?``, ``#`` and ``%``, so the path stays a path.
+
+    Added after a reviewer flagged ``sqlite3.connect(uri=True)`` as an injection
+    risk: the parameters select an access mode, not SQL, and the encoding means a
+    filename cannot contribute any parameter at all. This pins that.
+    """
+    weird = tmp_path / "we?ird#name%.db"
+    conn = sqlite3.connect(weird)
+    try:
+        conn.execute("CREATE TABLE verdicts (id INTEGER PRIMARY KEY)")
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert inspect(weird).tables == {"verdicts": 0}
+
+
 def test_a_database_that_opens_but_fails_integrity_check_is_refused(tmp_path):
     """The copy that still opens is the one an operator would trust.
 

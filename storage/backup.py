@@ -52,7 +52,13 @@ class BackupError(RuntimeError):
 
 
 def _uri(path: Path, mode: str) -> str:
-    """A ``file:`` URI, percent-encoded by ``Path`` so odd directories still work."""
+    """A ``file:`` URI, percent-encoded by ``Path`` so odd directories still work.
+
+    ``as_uri`` escapes ``?``, ``#`` and ``%``, so the query string is always the
+    one written here: a path cannot smuggle in ``mode=rwc`` or a different
+    ``vfs``. Those parameters choose an access mode rather than executing SQL, and
+    the mode is the only thing this function is trying to guarantee.
+    """
     return f"{path.resolve().as_uri()}?mode={mode}"
 
 
