@@ -1,14 +1,31 @@
 # Dependabot - pinned dependencies stay pinned, but never rot.
+#
+# Cadence:
+#   pip      daily, 06:00 UTC - "daily" means weekdays (Mon-Fri), not every day
+#   actions  weekly, Monday 07:00 UTC - an hour later, so Monday does not post both at once
+#
+# Cadence alone does not make churn fast. A version update still waits out a
+# cooldown after its release, three days by default even when `cooldown` is
+# absent, so a weekly check plus that wait means up to ten days from release to
+# PR. The pip cooldown below shortens the wait for the bumps that are mechanical
+# and leaves majors slow, because those need a migration by hand anyway.
+#
+# Cost of the speed: every dependabot PR runs the full gate (GitHub CI, CodeQL,
+# CircleCI, the local AI review). The groups collapse a run into at most one PR
+# per bump class, and open-pull-requests-limit bounds how many can be in flight.
 version: 2
 
 updates:
   - package-ecosystem: pip
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
+      interval: daily
       time: "06:00"
       timezone: Etc/UTC
+    cooldown:
+      semver-patch-days: 1 # a bad patch still surfaces within a day
+      semver-minor-days: 3 # the default, stated so the intent is readable
+      semver-major-days: 7 # let a new major settle before the migration PR lands
     open-pull-requests-limit: 5
     versioning-strategy: increase-if-necessary
     commit-message:
@@ -20,10 +37,14 @@ updates:
         applies-to: version-updates
         update-types:
           - patch
+        patterns:
+          - "*"
       minor-updates:
         applies-to: version-updates
         update-types:
           - minor
+        patterns:
+          - "*"
     ignore:
       # Major bumps of the data stack need a migration + full suite run by hand.
       - dependency-name: numpy
@@ -36,9 +57,26 @@ updates:
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: monthly
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: Etc/UTC
+    # Actions only support the default cooldown, not the per-semver ones.
+    cooldown:
+      default-days: 3
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "ci"
     labels:
       - dependencies
       - ci
+    groups:
+      # Actions tags are not strictly semver, but a major is still a rewrite
+      # (checkout 4 -> 7 moved the runtime), so majors keep their own PR.
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+        patterns:
+          - "*"
