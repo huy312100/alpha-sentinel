@@ -17,4 +17,4 @@
 # (`make ml-export`) has to work on requirements.txt alone, which has neither.
 # =============================================================================
 
-scikit-learn==1.6.1
+scikit-learn==1.9.1
