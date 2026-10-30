@@ -1,0 +1,53 @@
+# =============================================================================
+# AlphaSentinel health watchdog - host unit, not a container.
+#
+# Docker restarts a container that exits; nothing restarts one that stays up but
+# stops working. This unit supplies the missing half, and it lives on the host
+# because restarting containers needs Docker access, and granting that to a
+# container means handing it root on the host.
+#
+# Install (on the VM that runs the stack):
+#   sudo cp ops/alphasentinel-watchdog.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now alphasentinel-watchdog
+#   journalctl -u alphasentinel-watchdog -f     # docker_watchdog_* JSON lines
+# =============================================================================
+[Unit]
+Description=AlphaSentinel health watchdog (restarts unhealthy containers)
+Documentation=https://github.com/huy312100/alpha-sentinel
+# The watchdog is only useful once the daemon it guards exists.
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+# Adjust the path to wherever the repository is checked out on the host.
+WorkingDirectory=/opt/alpha-sentinel
+# The system interpreter on purpose: ops/watchdog.py is stdlib-only, so the
+# supervisor does not depend on the project virtualenv or the image it guards.
+ExecStart=/usr/bin/python3 ops/watchdog.py \
+    --container alpha-sentinel-bot \
+    --container alpha-sentinel-dashboard \
+    --interval 60 \
+    --threshold 3 \
+    --max-restarts 3 \
+    --window 3600
+# Restart=always is safe here because a watchdog that exits has not restarted
+# anything yet: an exhausted restart budget halts inside the loop instead of
+# exiting, so this never becomes a disguised restart loop for the bot.
+Restart=always
+RestartSec=10
+# Journald captures the JSON lines on stdout, and the halting errors on stderr.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alphasentinel-watchdog
+# Minimal hardening: it needs the Docker socket and nothing else. Root is the
+# default here because the docker group is a root-equivalent grant anyway; add
+# User=/Group=docker instead if the host already runs an operator account.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

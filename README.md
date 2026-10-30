@@ -235,6 +235,9 @@ unchanged.
 | `--once` | single cycle, then exit |
 | `--daemon` | loop forever (default) |
 | `--maintenance` | run retention/pruning once and exit |
+| `--backup` | snapshot the hot store, verify the copy, upload if `R2_*` is set, prune old ones |
+| `--verify-backup PATH` | rehearse restoring a snapshot: integrity, migrations, row counts |
+| `--backup-dir`, `--keep`, `--no-upload` | where snapshots go, how many to retain (default 7), skip the upload |
 | `--dry-run` | collect + audit, persist nothing, send nothing |
 | `--no-alerts` | run normally but suppress Telegram |
 | `--watchlist NAME` | restrict to one or more named lists (repeatable) |
@@ -450,12 +453,34 @@ Writes are atomic (`os.replace`), idempotent under the dedupe keys, and optional
 mirrored to R2. `engine.maintenance()` prunes both stores on
 `MAINTENANCE_INTERVAL_SECONDS`; `--maintenance` forces one pass.
 
+**Snapshots** — `data/backups/alpha_sentinel-*.db`, `--keep` of them (default 7):
+
+```bash
+make backup          # python -m bot.main --backup
+make backup-verify   # rehearse restoring the newest snapshot
+```
+
+`--backup` copies through SQLite's online backup API rather than `shutil`, so a
+snapshot taken mid-cycle is consistent even though WAL makes the database three
+files; the copy is then opened read-only and checked with `PRAGMA
+integrity_check` before it is accepted. `--verify-backup` goes further: it
+restores the file into a throwaway directory, boots `HotStore` on it - running the
+same migrations a real restore would - and fails if any table comes back with
+fewer rows. Uploads to `<R2_PREFIX>/hot-backups/` happen when `R2_*` is
+configured, best-effort: the local file is the product.
+
+A nightly cron is enough, and it must run inside the container so the paths match:
+
+```cron
+15 3 * * * cd /opt/alpha-sentinel && docker compose exec -T bot python -m bot.main --backup
+```
+
 ---
 
 ## Tests
 
 ```bash
-make test                                   # 599 tests, <2s
+make test                                   # 690 tests, <10s
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
@@ -486,6 +511,8 @@ writes to the repo — which is why CI can run it on every push.
 | `test_logging.py` | secret redaction across `msg`, `extra` and tracebacks, escaped JSON values, metadata keys |
 | `test_dashboard.py` | Streamlit `AppTest` render against empty stores, plus the password gate (hidden, wrong, right) |
 | `test_compose_config.py` | log rotation on every service, loopback publication of the dashboard port |
+| `test_backup.py` | snapshot consistency under WAL, integrity/schema refusals, the restore rehearsal, retention |
+| `test_watchdog.py` | restart thresholds, `start_period`, the restart budget, per-container evidence |
 
 ---
 
@@ -512,6 +539,21 @@ docker compose down
   asks for that password before reading either store.
 * Container logs are capped at 20 MB x 5 files per service on the `json-file`
   driver, so a long run cannot fill the host disk with its own output.
+* Backups of the hot store go to `./data/backups` (see **Storage**). Nothing else
+  copies that file: R2 mirrors the lake only, so without `--backup` a lost disk
+  means a daemon that restarts cleanly and remembers nothing.
+* Supervision: `restart: unless-stopped` acts on an *exit*, not on health status, so
+  a container that stays up but stops working is never restarted by Docker alone.
+  Install `ops/alphasentinel-watchdog.service` on the host - a systemd unit running
+  stdlib Python, with no Docker socket handed to a container - to restart a
+  container that has been `unhealthy` for `--threshold` consecutive probes. It acts
+  within a restart budget and then halts and logs, instead of bouncing a broken
+  container forever.
+* ARM64 (Oracle Always Free A1, Apple Silicon, Raspberry Pi): `make wheels-arm64`
+  proves every pin resolves to an aarch64 wheel with no compiler involved, and
+  `make image-arm64` builds the image with buildx. CI runs the wheel probe on
+  every push, because a bump that drops an aarch64 wheel fails at deploy time
+  otherwise.
 
 ---
 
@@ -519,7 +561,7 @@ docker compose down
 
 | Artifact | Purpose |
 | --- | --- |
-| `.circleci/config.yml` | `lint` (flake8 + byte-compile), `test` (pytest with JUnit artifacts), `docker-build` (image + `--status`/`--health` smoke, plus the boot-gate check) |
+| `.circleci/config.yml` | `lint` (flake8 + byte-compile), `test` (pytest with JUnit artifacts), `arm64` (every pin resolves to an aarch64 wheel), `docker-build` (image + `--status`/`--health` smoke, plus the boot-gate check) |
 | `.github/workflows/codeql.yml` | CodeQL `security-and-quality` on push/PR/weekly |
 | `.github/dependabot.yml` | weekly grouped pip PRs, monthly actions PRs, major bumps of numpy/pandas/pyarrow ignored |
 | `.coderabbit.yaml` | review rules per path (prompt boundary, veto precedence, hermetic tests, secrets) |
@@ -553,6 +595,8 @@ config/       settings (env-driven dataclasses), endpoints.yaml (every vendor UR
 core/         instrument identity, models, deterministic scoring, HTTP + logging helpers
 ml/           optional learned alpha scorer: features, training_rows, train, predictor
               + escalation policy (imported only when ALPHA_PREDICTOR != llm)
+ops/          host-side tooling, never imported by the app: the health watchdog
+              and its systemd unit
 scanners/     framework only at the root: __init__, base (layer contract),
               registry (asset_class -> layer routing), pipeline, __main__
   crypto/       eight self-contained layers (layer1_onchain .. layer8_security);
