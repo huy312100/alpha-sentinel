@@ -51,15 +51,28 @@ class BackupError(RuntimeError):
     """Raised when a snapshot cannot be taken, or does not restore."""
 
 
-def _uri(path: Path, mode: str) -> str:
-    """A ``file:`` URI, percent-encoded by ``Path`` so odd directories still work.
+def _connect(path: Path, mode: str) -> sqlite3.Connection:
+    """The only place a connection to a database file is opened.
 
-    ``as_uri`` escapes ``?``, ``#`` and ``%``, so the query string is always the
-    one written here: a path cannot smuggle in ``mode=rwc`` or a different
-    ``vfs``. Those parameters choose an access mode rather than executing SQL, and
-    the mode is the only thing this function is trying to guarantee.
+    One call site instead of four, so the two properties that matter are stated
+    once and audited once:
+
+    * **The path is data.** ``Path.as_uri`` percent-encodes ``?``, ``#`` and ``%``,
+      so the query string is always the one written here - a filename cannot
+      contribute a parameter of its own.
+    * **``mode`` selects an access mode.** SQLite's URI parameters are ``mode``,
+      ``vfs``, ``immutable`` and ``cache``; none of them carries SQL. ``ro`` keeps
+      a validation pass from mutating the snapshot it is inspecting, and ``rw``
+      keeps a mistyped source path from being created as an empty database.
+
+    Read-only connections also get ``PRAGMA query_only``, so the restriction is
+    enforced by the SQL layer as well as the file layer: neither a mode nor a
+    statement can turn auditing a suspect file into writing to it.
     """
-    return f"{path.resolve().as_uri()}?mode={mode}"
+    connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode={mode}", uri=True, timeout=30.0)
+    if mode == "ro":
+        connection.execute("PRAGMA query_only=ON")
+    return connection
 
 
 def backup_name(moment: datetime | None = None) -> str:
@@ -179,7 +192,7 @@ def snapshot(source: str | Path, destination: str | Path) -> Snapshot:
         raise BackupError(f"nothing to back up: {src} does not exist")
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    source_conn = sqlite3.connect(_uri(src, "rw"), uri=True, timeout=30.0)
+    source_conn = _connect(src, "rw")
     try:
         target_conn = sqlite3.connect(str(dst), isolation_level=None)
         try:
@@ -212,7 +225,7 @@ def inspect(path: str | Path, *, source: Path | None = None) -> Snapshot:
     if not target.is_file():
         raise BackupError(f"snapshot not found: {target}")
     try:
-        conn = sqlite3.connect(_uri(target, "ro"), uri=True, timeout=10.0)
+        conn = _connect(target, "ro")
         try:
             integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -261,7 +274,7 @@ def rehearse(path: str | Path) -> Rehearsal:
         finally:
             store.close()
         if not problems:
-            conn = sqlite3.connect(_uri(restored, "ro"), uri=True, timeout=10.0)
+            conn = _connect(restored, "ro")
             try:
                 version = int(conn.execute("PRAGMA user_version").fetchone()[0])
                 after = table_counts(conn)

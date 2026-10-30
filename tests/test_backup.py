@@ -16,6 +16,7 @@ import pytest
 from config.settings import R2Settings
 from storage.backup import (
     BackupError,
+    _connect,
     backup_name,
     inspect,
     missing_rows,
@@ -105,6 +106,29 @@ def test_a_path_with_uri_metacharacters_cannot_rewrite_the_access_mode(tmp_path)
         conn.close()
 
     assert inspect(weird).tables == {"verdicts": 0}
+
+
+def test_auditing_a_snapshot_cannot_write_to_it(store, settings, make_verdict, tmp_path):
+    """Read-only is enforced twice: on the file and on the SQL layer.
+
+    ``_connect`` is imported directly here because it is the boundary where the
+    mode is chosen; every public function in the module goes through it. Beyond
+    the mode flag, ``query_only`` means a statement cannot turn a validation pass
+    into a write even if the file was opened writable.
+    """
+    store.record_verdict(make_verdict())
+    taken = snapshot(settings.storage.hot_db_path, tmp_path / "copy.db")
+    before = taken.path.read_bytes()
+
+    conn = _connect(taken.path, "ro")
+    try:
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute("DELETE FROM verdicts")
+    finally:
+        conn.close()
+
+    assert taken.path.read_bytes() == before
 
 
 def test_a_database_that_opens_but_fails_integrity_check_is_refused(tmp_path):
