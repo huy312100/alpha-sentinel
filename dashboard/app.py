@@ -24,6 +24,8 @@ import streamlit as st
 from bot.watchlist import WatchlistError, load_watchlists
 from config.settings import Settings
 from core.models import utcnow
+from ml.dataset import TRAINING_DATASET
+from ml.shadow import DEFAULT_BOUNDARIES, MIN_PAIRED_ROWS, format_shadow, shadow_report
 from storage.hot_store import HotStore
 from storage.parquet_store import ParquetStore, StorageError
 
@@ -139,8 +141,10 @@ def load_alerts(limit: int = 50) -> pd.DataFrame:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_cold(dataset: str, days: int) -> pd.DataFrame:
+    """Cold rows from the last ``days`` days; ``0`` means the whole history."""
+    start = utcnow() - timedelta(days=days) if days > 0 else None
     try:
-        frame = get_cold().read_frame(dataset, start=utcnow() - timedelta(days=days))
+        frame = get_cold().read_frame(dataset, start=start)
     except (StorageError, OSError, ValueError):
         return pd.DataFrame()
     if frame.empty:
@@ -244,6 +248,18 @@ def empty_state(message: str, hint: str = "") -> None:
     st.info(message + (f"\n\n`{hint}`" if hint else ""))
 
 
+def _pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1%}"
+
+
+def paired_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    """Rows carrying both an LLM and a model score, numeric, blanks dropped."""
+    wanted = [column for column in ("llm_alpha_score", "model_alpha_score") if column in frame.columns]
+    if len(wanted) < 2:
+        return pd.DataFrame()
+    return frame[wanted].apply(pd.to_numeric, errors="coerce").dropna()
+
+
 # --------------------------------------------------------------------------- #
 # Sidebar + filters
 # --------------------------------------------------------------------------- #
@@ -338,8 +354,10 @@ def render_overview(frame: pd.DataFrame, runs: pd.DataFrame, alerts: pd.DataFram
                 "final_score": st.column_config.ProgressColumn(
                     "final", min_value=0, max_value=100, format="%.1f"
                 ),
+                # ProgressColumn takes no colour; Streamlit dropped the argument
+                # and passing it raised TypeError on the first non-empty store.
                 "risk_score": st.column_config.ProgressColumn(
-                    "risk", min_value=0, max_value=100, format="%.1f", color="#dc2626"
+                    "risk", min_value=0, max_value=100, format="%.1f"
                 ),
             },
         )
@@ -535,6 +553,75 @@ def render_signals(cold_days: int) -> None:
     )
 
 
+def render_scorer(cold_days: int) -> None:
+    """Shadow agreement: is the learned scorer a candidate to replace the LLM?"""
+    everything = st.checkbox("Use the full training history", value=False)
+    rows = load_cold(TRAINING_DATASET, 0 if everything else cold_days)
+    if rows.empty:
+        empty_state(
+            "No training rows in this window. One row is written per persisted audit, "
+            "carrying both the model and the LLM score while shadow mode is on.",
+            "ALPHA_SHADOW=true python -m bot --once",
+        )
+        return
+
+    report = shadow_report(rows)
+    agreement = report.get("agreement_65")
+    left, middle, right = st.columns(3)
+    left.metric(
+        "Paired rows",
+        f"{report['paired_rows']:,}",
+        help=f"{MIN_PAIRED_ROWS}+ before agreement counts as evidence",
+    )
+    middle.metric("Agreement at 65", _pct(agreement))
+    right.metric("Would still escalate", _pct(report["escalation"]["rate"]))
+    st.info(report["recommendation"])
+
+    pairs = paired_scores(rows)
+    if len(pairs) >= 2:
+        fig = px.scatter(pairs, x="llm_alpha_score", y="model_alpha_score", opacity=0.6)
+        for edge in DEFAULT_BOUNDARIES:
+            color = STATUS_COLORS["approved" if edge == DEFAULT_BOUNDARIES[0] else "watch"]
+            fig.add_hline(y=edge, line_dash="dot", line_color=color, annotation_text=f"{int(edge)}")
+            fig.add_vline(x=edge, line_dash="dot", line_color=color)
+        st.plotly_chart(
+            _layout(fig, height=360, title="Model vs LLM alpha score (distance from the diagonal is disagreement)"),
+            use_container_width=True,
+        )
+
+    breakdown = [
+        {
+            "boundary": int(edge),
+            "agreement": _pct(report.get(f"agreement_{int(edge)}")),
+            "flip rate": _pct(report.get(f"flip_rate_{int(edge)}")),
+        }
+        for edge in DEFAULT_BOUNDARIES
+        if f"agreement_{int(edge)}" in report
+    ]
+    if breakdown:
+        st.dataframe(pd.DataFrame(breakdown), use_container_width=True, hide_index=True)
+
+    left, right = st.columns(2)
+    if report.get("sources"):
+        left.markdown("**Alpha source**")
+        left.dataframe(
+            pd.DataFrame(sorted(report["sources"].items()), columns=["source", "rows"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+    reasons = report["escalation"].get("reasons") or {}
+    if reasons:
+        right.markdown("**Escalation reasons**")
+        right.dataframe(
+            pd.DataFrame(sorted(reasons.items()), columns=["reason", "rows"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("Full text report (same output as `python -m ml.shadow`)"):
+        st.code(format_shadow(report), language="text")
+
+
 def render_runs(runs: pd.DataFrame, alerts: pd.DataFrame) -> None:
     if runs.empty:
         empty_state("No runs recorded yet.", "python -m bot --once")
@@ -618,6 +705,8 @@ def render_system() -> None:
                     "- `python -m scanners --symbol AAPL --asset-class equity` - probe any market.",
                     "- `python -m bot --status` - hot-store state without the UI.",
                     "- `python -m bot --maintenance` - prune hot rows, apply retention.",
+                    "- `python -m ml.dataset export --baseline` - training rows + prior baseline.",
+                    "- `python -m ml.shadow` - model-vs-LLM agreement, the handover gate.",
                     "- `DEMO_MODE=true` - offline deterministic agents, no API key needed.",
                 ]
             )
@@ -638,8 +727,8 @@ def main() -> None:
     runs = load_runs()
     alerts = load_alerts()
 
-    overview, verdicts_tab, signals_tab, runs_tab, watch_tab, system_tab = st.tabs(
-        ["Overview", "Verdicts", "Layer signals", "Runs & alerts", "Watchlists", "System"]
+    overview, verdicts_tab, signals_tab, scorer_tab, runs_tab, watch_tab, system_tab = st.tabs(
+        ["Overview", "Verdicts", "Layer signals", "Scorer", "Runs & alerts", "Watchlists", "System"]
     )
     with overview:
         render_overview(verdicts, runs, alerts)
@@ -647,6 +736,8 @@ def main() -> None:
         render_verdicts(verdicts)
     with signals_tab:
         render_signals(opts["cold_days"])
+    with scorer_tab:
+        render_scorer(opts["cold_days"])
     with runs_tab:
         render_runs(runs, alerts)
     with watch_tab:

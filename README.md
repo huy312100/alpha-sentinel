@@ -296,7 +296,8 @@ two-agent flow above, and nothing in `ml/` is imported on that path.
 cycle ──► training_rows (Parquet)          one row per audit: features + labels
              │
              ├─ make ml-export ──► data/exports/train.parquet   (+ prior baseline)
-             └─ make ml-train  ──► models/alpha_model.pkl       (time split, GBM)
+             ├─ make ml-train  ──► models/alpha_model.pkl       (time split, GBM)
+             └─ make ml-report ──► agreement at 65 and 50        (the handover gate)
 
 model ──► prediction ──► safe? ──yes──► verdict, no alpha call
                           │no
@@ -335,6 +336,38 @@ python -m pip install -r requirements-ml.txt   # optional; the image does not ne
 ALPHA_SHADOW=true make bot        # measure agreement on live traffic, LLM still decides
 ALPHA_PREDICTOR=model make bot    # let the model answer first
 ```
+
+### Is the model good enough to take over?
+
+`make ml-report` - or the dashboard's **Scorer** tab - pairs the model's score with
+the LLM's on the same audit and answers one question: how often do the two disagree
+at a decision boundary?
+
+```
+$ make ml-report
+shadow    rows=1842  tokens=141  paired=1210
+  sources   {'llm': 1210, 'model': 1210}
+  model     MAE 2.914  bias -0.180  rank r +0.973
+  agreement 50: 99.2%  65: 97.1%
+  escalation 31.4% of rows (near_boundary 214, out_of_range 96, low_confidence 70)
+  verdict   Agreement 97.1% or better at every boundary over 1210 paired rows,
+            31.4% would still escalate. Candidate for ALPHA_PREDICTOR=model.
+```
+
+Below 200 paired rows the report recommends nothing: agreement on thirty rows is a
+coincidence, not evidence. Above it, the recommendation names the boundary that
+decides the handover. A flip at 65 turns an approval into a watch; a flip at 50
+turns a watch into a rejection. Both are verdicts someone acts on, so both must
+clear 95%.
+
+`escalation.rate` is the saving the model *would* produce. While `ALPHA_SHADOW=true`
+it costs nothing, because the LLM answers everything by design - which is why those
+rows are counted as measured rather than escalated.
+
+Training rows outlive the operational lake: `TRAINING_RETENTION_DAYS` (default 1095)
+keeps them while `LOCAL_RETENTION_DAYS` (default 90) turns over everything else.
+Without that split, next quarter's training set is deleted by routine maintenance.
+Setting any of the three to `0` keeps that window open forever.
 
 ---
 

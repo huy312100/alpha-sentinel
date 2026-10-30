@@ -1,5 +1,5 @@
 .PHONY: help install lint test audit ci demo honeypot smoke status health once dry-run scanners bot dashboard \
-        probe ml-export ml-train docker-build docker-up docker-down docker-logs clean
+        probe ml-export ml-train ml-report docker-build docker-up docker-down docker-logs clean
 
 PY ?= python3
 VENV := .venv
@@ -51,6 +51,9 @@ ml-export: ## Export training_rows for a notebook, with the prior baseline
 
 ml-train: ## Train the alpha model (needs requirements-ml.txt)
 	$(BIN)/python -m ml.train --out models/alpha_model.pkl
+
+ml-report: ## Shadow agreement: is the learned scorer ready to replace the LLM?
+	$(BIN)/python -m ml.shadow --days 90
 
 once: ## One real cycle, then exit
 	$(BIN)/python -m bot.main --once
