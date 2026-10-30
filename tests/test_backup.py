@@ -88,22 +88,57 @@ def test_a_truncated_file_is_refused(tmp_path):
         inspect(broken)
 
 
-def test_a_database_that_opens_but_is_corrupt_is_refused(store, settings, make_verdict, tmp_path):
-    """The copy that still opens is the one that would be trusted, so it must fail.
+def test_a_database_that_opens_but_fails_integrity_check_is_refused(tmp_path):
+    """The copy that still opens is the one an operator would trust.
 
-    Zeroing a middle page leaves the header and page count intact: SQLite opens
-    the file happily and only ``integrity_check`` reports the damage.
+    Built rather than corrupted by byte offset, because the damage has to be one
+    that leaves ``sqlite_master`` readable: dropping the index from the schema
+    leaves its b-tree pages allocated but unreferenced, so the file opens, the
+    tables count, and only ``integrity_check`` says "Page N: never used". A
+    corruption that makes the file fail to open would prove nothing about the
+    check - SQLite refuses that on its own.
     """
-    store.record_verdict(make_verdict())
-    taken = snapshot(settings.storage.hot_db_path, tmp_path / "copy.db")
-    data = bytearray(taken.path.read_bytes())
-    assert len(data) > 3 * 4096, "the fixture needs a multi-page database"
-    start = 4096 * (len(data) // 4096 // 2)
-    data[start:start + 4096] = b"\x00" * 4096
-    taken.path.write_bytes(bytes(data))
+    target = tmp_path / "damaged.db"
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute("CREATE TABLE verdicts (id INTEGER PRIMARY KEY, sym TEXT)")
+        conn.executemany("INSERT INTO verdicts (sym) VALUES (?)", [("x" * 50,)] * 300)
+        conn.execute("CREATE INDEX idx_sym ON verdicts(sym)")
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute("DELETE FROM sqlite_master WHERE type='index' AND name='idx_sym'")
+        conn.commit()
+    finally:
+        conn.close()
 
     with pytest.raises(BackupError, match="integrity_check"):
-        inspect(taken.path)
+        inspect(target)
+
+
+def test_a_damaged_btree_page_is_refused_even_though_the_header_is_intact(tmp_path):
+    """The other mechanism: SQLite raises before it can report at all."""
+    target = tmp_path / "flattened.db"
+    conn = sqlite3.connect(target)
+    try:
+        conn.execute("CREATE TABLE verdicts (id INTEGER PRIMARY KEY, padding TEXT)")
+        conn.executemany("INSERT INTO verdicts (padding) VALUES (?)", [("x" * 200,)] * 200)
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
+        page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+        pages = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    finally:
+        conn.close()
+    assert pages > 2, "the fixture needs a table b-tree page of its own"
+
+    # Page 2 is the root of the table's b-tree: the header still says the file is
+    # fine, so this is the shape of a half-written copy rather than a stray file.
+    data = bytearray(target.read_bytes())
+    data[page_size:2 * page_size] = b"\x00" * page_size
+    target.write_bytes(bytes(data))
+
+    with pytest.raises(BackupError):
+        inspect(target)
 
 
 def test_an_empty_database_is_refused(tmp_path):
