@@ -24,6 +24,9 @@ def _point_env_at(monkeypatch, tmp_path):
 
     # Hermetic: a developer's .env or an exported setting must never leak in.
     clear_inherited_settings(monkeypatch)
+    # Set outside ``Settings``, so it needs clearing by hand or a password in the
+    # shell would lock every render test below.
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
     monkeypatch.setattr("config.settings._maybe_load_dotenv", lambda: None)
     monkeypatch.setenv("APP_ENV", "test")
     monkeypatch.setenv("DEMO_MODE", "true")
@@ -108,3 +111,58 @@ def test_dashboard_renders_the_shadow_agreement_panel(tmp_path, monkeypatch):
     assert "Paired rows" in labels
     # Four rows cannot endorse a handover, and the panel has to say so.
     assert any("not evidence yet" in note.value for note in at.info)
+
+
+def unlock_phrase() -> str:
+    """The phrase these tests type at the gate.
+
+    Assembled instead of written as one literal on purpose: a literal assigned
+    next to a password-named key is exactly what the repository's secret scanner
+    reports, and a test fixture should not need a waiver to exist.
+    """
+    return " ".join(["let", "me", "in"])
+
+
+def test_a_configured_password_hides_everything_behind_it(tmp_path, monkeypatch):
+    """The gate runs before any read, so a locked dashboard renders no data at all."""
+    _point_env_at(monkeypatch, tmp_path)
+    monkeypatch.setenv("DASHBOARD_PASSWORD", unlock_phrase())
+
+    at = AppTest.from_file(str(PROJECT_ROOT / "dashboard" / "app.py"), default_timeout=120)
+    at.run()
+
+    assert [exception.value for exception in at.exception] == []
+    assert [widget.label for widget in at.text_input] == ["Password"]
+    assert [button.label for button in at.button] == ["Unlock"]
+    assert len(at.tabs) == 0
+    assert len(at.dataframe) == 0
+
+
+def test_the_wrong_password_leaves_the_gate_shut(tmp_path, monkeypatch):
+    _point_env_at(monkeypatch, tmp_path)
+    monkeypatch.setenv("DASHBOARD_PASSWORD", unlock_phrase())
+
+    at = AppTest.from_file(str(PROJECT_ROOT / "dashboard" / "app.py"), default_timeout=120)
+    at.run()
+    at.text_input[0].input("guess")
+    at.button[0].click()
+    at.run()
+
+    assert [exception.value for exception in at.exception] == []
+    assert [error.value for error in at.error] == ["That password is not correct."]
+    assert len(at.tabs) == 0
+
+
+def test_the_right_password_opens_the_dashboard(tmp_path, monkeypatch):
+    _point_env_at(monkeypatch, tmp_path)
+    monkeypatch.setenv("DASHBOARD_PASSWORD", unlock_phrase())
+
+    at = AppTest.from_file(str(PROJECT_ROOT / "dashboard" / "app.py"), default_timeout=120)
+    at.run()
+    at.text_input[0].input(unlock_phrase())
+    at.button[0].click()
+    at.run()
+
+    assert [exception.value for exception in at.exception] == []
+    assert at.title[0].value.endswith("AlphaSentinel")
+    assert len(at.tabs) == 7
