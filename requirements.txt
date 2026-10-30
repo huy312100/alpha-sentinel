@@ -38,5 +38,5 @@ requests==2.34.2             # preflight / smoke-test tooling (scripts/)
 
 # --- Test & lint (installed in CI and locally) -------------------------------
 pytest==8.3.3
-pytest-asyncio==0.24.0
+pytest-asyncio==1.4.1
 flake8==7.4.1
