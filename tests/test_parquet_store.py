@@ -175,3 +175,85 @@ def test_remote_retention_refuses_an_empty_prefix(tmp_path, prefix):
 
     assert store.apply_remote_retention(now=utcnow()) == 0
     assert fake.deleted == []
+
+
+# -- per-dataset retention ------------------------------------------------
+def write_partition(store: ParquetStore, dataset: str, partition: str) -> None:
+    frame = pd.DataFrame([{"id": 1, "ts": pd.Timestamp("2020-01-01T00:00:00Z"), "value": 1}])
+    store.write_frame(dataset, frame, timestamp_column="ts", dedupe_keys=("id",), partition=partition)
+
+
+def test_training_rows_outlive_the_operational_window(tmp_path):
+    """The whole point: a model needs history that a dashboard does not."""
+    store = ParquetStore(tmp_path / "lake", compression="snappy", local_retention_days=90)
+    stale = (utcnow() - timedelta(days=200)).date().isoformat()
+    write_partition(store, "verdicts", stale)
+    write_partition(store, "training_rows", stale)
+
+    removed = store.apply_local_retention(now=utcnow())
+
+    assert removed == 1
+    assert store.partitions("verdicts") == []
+    assert store.partitions("training_rows") == [stale]
+
+
+def test_a_dataset_window_can_be_overridden(tmp_path):
+    store = ParquetStore(
+        tmp_path / "lake", compression="snappy", local_retention_days=90, dataset_retention_days={"verdicts": 500}
+    )
+    stale = (utcnow() - timedelta(days=200)).date().isoformat()
+    write_partition(store, "verdicts", stale)
+
+    assert store.apply_local_retention(now=utcnow()) == 0
+    assert store.partitions("verdicts") == [stale]
+
+
+def test_a_zero_dataset_window_keeps_it_forever(tmp_path):
+    store = ParquetStore(
+        tmp_path / "lake", compression="snappy", local_retention_days=90, dataset_retention_days={"training_rows": 0}
+    )
+    ancient = "2015-01-01"
+    write_partition(store, "training_rows", ancient)
+
+    assert store.apply_local_retention(now=utcnow()) == 0
+    assert store.partitions("training_rows") == [ancient]
+
+
+def test_a_global_zero_still_disables_the_pass(tmp_path):
+    """``0`` has always meant "keep everything"; an override must not revive it."""
+    store = ParquetStore(tmp_path / "lake", compression="snappy", local_retention_days=0)
+    ancient = "2015-01-01"
+    write_partition(store, "verdicts", ancient)
+
+    assert store.apply_local_retention(now=utcnow()) == 0
+    assert store.partitions("verdicts") == [ancient]
+
+
+def test_remote_retention_honours_the_per_dataset_window(remote):
+    store, fake = remote
+    old = utcnow() - timedelta(days=400)
+    fake.listing = [
+        {"Key": "alpha-sentinel/verdicts/dt=2020-01-01/old.parquet", "LastModified": old},
+        {"Key": "alpha-sentinel/training_rows/dt=2020-01-01/old.parquet", "LastModified": old},
+    ]
+
+    assert store.apply_remote_retention(now=utcnow()) == 1
+    assert fake.deleted == ["alpha-sentinel/verdicts/dt=2020-01-01/old.parquet"]
+
+
+def test_a_zero_window_keeps_remote_objects_forever(tmp_path):
+    """``0`` has to mean the same thing on R2 as it does on disk."""
+    store = ParquetStore(
+        tmp_path / "lake",
+        r2=r2("alpha-sentinel"),
+        remote_retention_days=30,
+        dataset_retention_days={"training_rows": 0},
+    )
+    fake = FakeS3()
+    store._s3 = fake
+    fake.listing = [
+        {"Key": "alpha-sentinel/training_rows/dt=2020-01-01/old.parquet", "LastModified": utcnow() - timedelta(days=400)}
+    ]
+
+    assert store.apply_remote_retention(now=utcnow()) == 0
+    assert fake.deleted == []

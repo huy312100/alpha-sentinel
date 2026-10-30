@@ -79,6 +79,7 @@ def get_cold() -> ParquetStore:
         row_group_size=settings.storage.row_group_size,
         local_retention_days=settings.storage.local_retention_days,
         remote_retention_days=settings.storage.remote_retention_days,
+        dataset_retention_days=settings.storage.dataset_retention(),
     )
 
 

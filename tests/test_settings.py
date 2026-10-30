@@ -198,6 +198,41 @@ def test_a_path_that_does_not_exist_yet_still_loads(tmp_path):
     assert settings.storage.parquet_root == cold.resolve()
 
 
+def test_training_retention_is_its_own_window(tmp_path):
+    """Verdicts expire in weeks; the training corpus has to outlive them."""
+    settings = load(PARQUET_ROOT=str(tmp_path / "cold"), LOCAL_RETENTION_DAYS="30")
+
+    assert settings.storage.local_retention_days == 30
+    assert settings.storage.training_retention_days > settings.storage.local_retention_days
+    assert settings.storage.dataset_retention() == {"training_rows": settings.storage.training_retention_days}
+
+
+def test_training_retention_can_be_configured(tmp_path):
+    settings = load(PARQUET_ROOT=str(tmp_path / "cold"), TRAINING_RETENTION_DAYS="3650")
+
+    assert settings.storage.dataset_retention()["training_rows"] == 3650
+
+
+@pytest.mark.parametrize(
+    "variable", ["LOCAL_RETENTION_DAYS", "REMOTE_RETENTION_DAYS", "TRAINING_RETENTION_DAYS"]
+)
+def test_zero_retention_reaches_the_store_as_keep_forever(tmp_path, variable):
+    """ParquetStore reads 0 as "never expire"; the environment has to be able to ask."""
+    settings = load(PARQUET_ROOT=str(tmp_path / "cold"), **{variable: "0"})
+
+    window = {
+        "LOCAL_RETENTION_DAYS": settings.storage.local_retention_days,
+        "REMOTE_RETENTION_DAYS": settings.storage.remote_retention_days,
+        "TRAINING_RETENTION_DAYS": settings.storage.training_retention_days,
+    }[variable]
+    assert window == 0
+
+
+def test_a_negative_retention_window_is_still_refused(tmp_path):
+    with pytest.raises(ConfigError):
+        load(PARQUET_ROOT=str(tmp_path / "cold"), TRAINING_RETENTION_DAYS="-1")
+
+
 def test_env_example_does_not_override_presets():
     """Copying the template must not send model ids like ``model`` to a provider."""
 
