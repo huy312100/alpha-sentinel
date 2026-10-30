@@ -44,6 +44,27 @@ DEFAULT_BOUNDARIES: tuple[float, ...] = (65.0, 50.0)
 SHADOW_MARKER = "shadow"
 
 
+def _validated_boundaries(boundaries: Sequence[float]) -> tuple[float, ...]:
+    """Whole-number decision boundaries in ``0..100``.
+
+    A bad boundary does not fail loudly on its own: ``predicted >= None`` is a
+    comparison against NaN, so every row "agrees" and the report claims 100%
+    agreement on a line that does not exist. A fractional edge would also leave
+    the key ``agreement_64`` behind a boundary of 64.5.
+    """
+    checked: list[float] = []
+    for edge in boundaries:
+        if isinstance(edge, bool) or not isinstance(edge, (int, float)):
+            raise ValueError(f"decision boundary must be a number, got {edge!r}")
+        value = float(edge)
+        if value != int(value) or not 0.0 <= value <= 100.0:
+            raise ValueError(f"decision boundary must be a whole number in 0..100, got {value}")
+        checked.append(value)
+    if not checked:
+        raise ValueError("at least one decision boundary is required")
+    return tuple(checked)
+
+
 def _numeric(frame: pd.DataFrame, column: str) -> pd.Series:
     if column not in frame.columns:
         return pd.Series([float("nan")] * len(frame), index=frame.index, dtype="float64")
@@ -95,6 +116,7 @@ def _escalation_mix(frame: pd.DataFrame) -> dict[str, Any]:
 
 def shadow_report(frame: pd.DataFrame, *, boundaries: Sequence[float] = DEFAULT_BOUNDARIES) -> dict[str, Any]:
     """Model-vs-LLM agreement over the paired rows in ``training_rows``."""
+    boundaries = _validated_boundaries(boundaries)
     if frame is None or frame.empty:
         report = {"rows": 0, "reason": "no training rows yet"}
         report["recommendation"] = _recommend(report)
