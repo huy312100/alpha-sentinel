@@ -37,6 +37,6 @@ botocore==1.43.118
 requests==2.34.2             # preflight / smoke-test tooling (scripts/)
 
 # --- Test & lint (installed in CI and locally) -------------------------------
-pytest==8.4.2
+pytest==9.1.1
 pytest-asyncio==1.4.1   # 1.x needs pytest>=8.4; keep the two in step
 flake8==7.4.1
