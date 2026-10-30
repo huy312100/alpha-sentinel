@@ -69,6 +69,19 @@ jobs:
           name: Propagate the pytest status
           command: exit $(cat /tmp/pytest.exit)
 
+  arm64:
+    executor: py311
+    steps:
+      - checkout
+      # The deployment target is an ARM box (Oracle Always Free A1 is the cheapest
+      # always-on option), and a wheel that does not exist there fails as a build
+      # error at deploy time rather than here. The probe is one pip resolve and
+      # needs no venv, no cache and no Docker: it answers "would this image build
+      # on aarch64", which is the half of the question that a bump can break.
+      - run:
+          name: Every pinned dependency resolves to a linux/arm64 wheel
+          command: make wheels-arm64 PYTHON=python
+
   docker-build:
     executor: py311
     steps:
@@ -111,4 +124,5 @@ workflows:
     jobs:
       - lint
       - test
+      - arm64
       - docker-build
