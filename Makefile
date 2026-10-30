@@ -1,9 +1,24 @@
 .PHONY: help install lint test audit ci demo honeypot smoke status health once dry-run scanners bot dashboard \
-        probe ml-export ml-train ml-report docker-build docker-up docker-down docker-logs clean
+        probe ml-export ml-train ml-report docker-build docker-up docker-down docker-logs clean \
+        wheels-arm64 image-arm64 backup backup-verify
 
 PY ?= python3
 VENV := .venv
 BIN := $(VENV)/bin
+# The interpreter that runs pip/downloads. Defaults to the venv, and CI overrides
+# it with the system interpreter so the ARM64 probe needs no installed suite.
+PYTHON ?= $(BIN)/python
+BACKUP_DIR := data/backups
+
+# ARM64 (Oracle Always Free A1, Apple Silicon, Raspberry Pi) has no guarantee of
+# a compiler in the runtime image, so every pin has to resolve to a wheel. pip
+# matches ``--platform`` *exactly* and does not expand manylinux compatibility:
+# pandas ships its aarch64 wheel as manylinux_2_24, pyarrow as manylinux_2_17, so
+# the whole list is needed. One missing tag reads as "no such version", which is
+# how this target caught pandas 2.3.3 on its first run.
+ARM64_PLATFORMS := manylinux2014_aarch64 manylinux_2_17_aarch64 manylinux_2_24_aarch64 \
+                   manylinux_2_28_aarch64 manylinux_2_34_aarch64
+ARM64_PLATFORM_ARGS := $(foreach platform,$(ARM64_PLATFORMS),--platform $(platform))
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -22,7 +37,7 @@ test: ## Hermetic pytest suite (no keys, no network)
 audit: lint test ## Lint + tests
 
 ci: audit ## Full local gate: lint, tests, byte-compile, smoke
-	$(BIN)/python -m compileall -q bot core config scanners storage ai_engine dashboard ml tests
+	$(BIN)/python -m compileall -q bot core config scanners storage ai_engine dashboard ml ops tests
 	$(MAKE) smoke
 
 demo: ## Run the dual-agent flow offline (no API key needed)
@@ -72,6 +87,24 @@ bot: ## Start the async scanner loop
 
 dashboard: ## Start the Streamlit dashboard (loopback; set DASHBOARD_PASSWORD to gate it)
 	$(BIN)/streamlit run dashboard/app.py --server.port 8501 --server.address 127.0.0.1
+
+wheels-arm64: ## Prove every pin resolves to a linux/arm64 wheel (no compiler needed)
+	rm -rf /tmp/arm64-wheels && mkdir -p /tmp/arm64-wheels
+	$(PYTHON) -m pip download -q -r requirements.txt --only-binary=:all: \
+		$(ARM64_PLATFORM_ARGS) --python-version 311 --implementation cp --abi cp311 --abi none \
+		-d /tmp/arm64-wheels
+	@echo "wheels-arm64: $$(ls /tmp/arm64-wheels | wc -l | tr -d ' ') wheels resolved for linux/arm64"
+
+image-arm64: ## Build the image for linux/arm64 (needs docker buildx)
+	docker buildx build --platform linux/arm64 --tag alpha-sentinel:arm64 --load .
+
+backup: ## Snapshot the hot store (verified), upload if R2 is set, prune old copies
+	$(BIN)/python -m bot.main --backup
+
+backup-verify: ## Rehearse restoring the newest snapshot
+	@latest=$$(ls -1t $(BACKUP_DIR)/alpha_sentinel-*.db 2>/dev/null | head -1); \
+	if [ -z "$$latest" ]; then echo "no snapshots in $(BACKUP_DIR) - run 'make backup' first" >&2; exit 1; fi; \
+	$(BIN)/python -m bot.main --verify-backup "$$latest"
 
 docker-build: ## Build the container image
 	docker compose build
