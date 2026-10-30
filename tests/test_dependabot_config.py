@@ -23,7 +23,19 @@ COOLDOWN_KEYS = {
     "exclude",
 }
 
-GROUP_UPDATE_TYPES = {"patch", "minor", "major"}
+#: The groups the PR volume depends on: one pull request per bump class instead of
+#: one per package. Spelled out rather than "whatever is in the file", because a
+#: dropped group is not a config error - dependabot simply reverts to a PR per
+#: package, which is the churn this configuration exists to avoid.
+EXPECTED_GROUPS: dict[str, dict[str, dict[str, set[str]]]] = {
+    "pip": {
+        "patch-updates": {"patterns": {"*"}, "update-types": {"patch"}},
+        "minor-updates": {"patterns": {"*"}, "update-types": {"minor"}},
+    },
+    "github-actions": {
+        "actions-minor-patch": {"patterns": {"*"}, "update-types": {"minor", "patch"}},
+    },
+}
 
 
 def load() -> dict[str, dict]:
@@ -47,11 +59,17 @@ def test_a_weekly_schedule_is_the_only_one_that_names_a_day():
     assert updates["github-actions"]["schedule"]["day"] == "monday"
 
 
-def test_every_group_states_the_patterns_it_covers():
-    for ecosystem, entry in load().items():
-        for name, group in entry.get("groups", {}).items():
-            assert group["patterns"], f"{ecosystem}/{name} has no patterns"
-            assert set(group["update-types"]) <= GROUP_UPDATE_TYPES, f"{ecosystem}/{name}"
+def test_every_group_states_exactly_the_bumps_it_covers():
+    updates = load()
+
+    for ecosystem, expected in EXPECTED_GROUPS.items():
+        groups = updates[ecosystem].get("groups", {})
+        assert set(groups) == set(expected), f"{ecosystem} groups changed"
+        for name, wanted in expected.items():
+            group = groups[name]
+            assert set(group["patterns"]) == wanted["patterns"], f"{ecosystem}/{name} patterns"
+            assert set(group["update-types"]) == wanted["update-types"], f"{ecosystem}/{name} update-types"
+            assert group["applies-to"] == "version-updates", f"{ecosystem}/{name} applies-to"
 
 
 def test_actions_use_only_the_cooldown_keys_they_support():
