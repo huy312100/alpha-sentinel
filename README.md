@@ -90,7 +90,7 @@ make health                  # is the scan loop still turning? (exit 1 if not)
 make dry-run                 # one cycle, nothing persisted
 make once                    # one real cycle
 make bot                     # the daemon loop (SCAN_INTERVAL_SECONDS)
-make dashboard               # Streamlit on :8501
+make dashboard               # Streamlit on 127.0.0.1:8501
 ```
 
 ### Markets
@@ -484,7 +484,8 @@ writes to the repo — which is why CI can run it on every push.
 | `test_parquet_store.py` | idempotent compaction, `overwrite=False` uploads, compacted-file-then-cleanup, scoped remote retention |
 | `test_scanners.py` | base-token pair filtering, supply-based concentration, ISO-8601 wash timestamps |
 | `test_logging.py` | secret redaction across `msg`, `extra` and tracebacks, escaped JSON values, metadata keys |
-| `test_dashboard.py` | Streamlit `AppTest` render against empty stores (no server, no browser) |
+| `test_dashboard.py` | Streamlit `AppTest` render against empty stores, plus the password gate (hidden, wrong, right) |
+| `test_compose_config.py` | log rotation on every service, loopback publication of the dashboard port |
 
 ---
 
@@ -505,7 +506,12 @@ docker compose down
 * `config/watchlists.yaml` is mounted read-only; edit it on the host and the next
   cycle picks it up (the loader caches by mtime).
 * Dashboard: <http://localhost:8501> (`DASHBOARD_PORT` to change). It is read-only by
-  design — no token, no order, no button that writes.
+  design — no token, no order, no button that writes. The published port binds
+  loopback (`DASHBOARD_BIND`, default `127.0.0.1`), so reaching it from another
+  machine is an explicit edit; set `DASHBOARD_PASSWORD` in the same breath and it
+  asks for that password before reading either store.
+* Container logs are capped at 20 MB x 5 files per service on the `json-file`
+  driver, so a long run cannot fill the host disk with its own output.
 
 ---
 

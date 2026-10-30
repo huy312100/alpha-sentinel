@@ -70,8 +70,8 @@ probe: ## Probe one listed instrument (equity) through the applicable layers
 bot: ## Start the async scanner loop
 	$(BIN)/python -m bot.main
 
-dashboard: ## Start the Streamlit dashboard
-	$(BIN)/streamlit run dashboard/app.py --server.port 8501
+dashboard: ## Start the Streamlit dashboard (loopback; set DASHBOARD_PASSWORD to gate it)
+	$(BIN)/streamlit run dashboard/app.py --server.port 8501 --server.address 127.0.0.1
 
 docker-build: ## Build the container image
 	docker compose build

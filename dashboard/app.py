@@ -12,6 +12,8 @@ left open on a wall display.
 
 from __future__ import annotations
 
+import hmac
+import os
 from datetime import timedelta
 from typing import Any
 from urllib.parse import quote
@@ -713,7 +715,57 @@ def render_system() -> None:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Access gate
+# --------------------------------------------------------------------------- #
+#
+# The dashboard is read-only, but it is not public: it shows live verdicts,
+# watchlists and redacted runtime configuration. Compose publishes the port on
+# loopback by default, so this gate matters as soon as someone publishes it
+# further out - a wall display on the LAN, or a cloud host.
+#
+# The secret is read straight from the environment rather than through
+# ``Settings`` on purpose. ``Settings`` is summarised and logged in several
+# places, and a password must not be able to take that path.
+AUTH_SESSION_KEY = "dashboard_authenticated"
+
+
+def dashboard_password() -> str:
+    """The shared secret, or an empty string when the gate is off."""
+    return os.environ.get("DASHBOARD_PASSWORD", "").strip()
+
+
+def authentication_gate() -> bool:
+    """True when the viewer may see the data; draws the unlock form otherwise.
+
+    An unset ``DASHBOARD_PASSWORD`` disables the gate so a developer's
+    ``streamlit run`` and the hermetic tests stay frictionless, which is safe
+    only because the published port defaults to loopback. Nothing is read from
+    the stores until this returns True, so a locked dashboard never opens the
+    SQLite hot store or the Parquet lake.
+    """
+    expected = dashboard_password()
+    if not expected or st.session_state.get(AUTH_SESSION_KEY):
+        return True
+
+    st.title("\U0001F6F0\uFE0F AlphaSentinel")
+    st.caption("This instance requires a password. The dashboard is read-only.")
+    with st.form("dashboard-auth"):
+        candidate = st.text_input("Password", type="password", autocomplete="current-password")
+        submitted = st.form_submit_button("Unlock")
+    if submitted:
+        # compare_digest is constant-time; a plain == leaks the shared prefix.
+        if hmac.compare_digest(candidate, expected):
+            st.session_state[AUTH_SESSION_KEY] = True
+            st.rerun()
+        st.error("That password is not correct.")
+    return False
+
+
 def main() -> None:
+    if not authentication_gate():
+        return
+
     opts = sidebar()
     st.title("\U0001F6F0\uFE0F AlphaSentinel")
     st.caption(

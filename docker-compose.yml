@@ -14,6 +14,16 @@ x-service: &service
     - path: .env
       required: false
   restart: unless-stopped
+  # Bounded logs. Docker's json-file driver is unbounded by default, so a
+  # seven-day soak of a JSON-logging daemon eventually fills the host disk -
+  # and it fills it on the one run that exists to prove the service is
+  # trustworthy unattended. 20m x 5 keeps ~100MB per container, which is days
+  # of cycle logs at the default interval.
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
   volumes:
     - ./data:/app/data
     - ./config/watchlists.yaml:/app/config/watchlists.yaml:ro
@@ -45,7 +55,11 @@ services:
       - --server.headless=true
       - --browser.gatherUsageStats=false
     ports:
-      - "${DASHBOARD_PORT:-8501}:8501"
+      # Loopback by default: the dashboard has no accounts, so publishing it on
+      # 0.0.0.0 is a deliberate act, not an accident of `docker compose up` on a
+      # cloud host. Set DASHBOARD_BIND=0.0.0.0 only together with
+      # DASHBOARD_PASSWORD, which turns on the dashboard's unlock form.
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8501}:8501"
     depends_on:
       bot:
         condition: service_started
