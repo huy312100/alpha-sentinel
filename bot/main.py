@@ -9,6 +9,8 @@ Usage::
     python -m bot --token WETH --chain ethereum --once
     python -m bot --token AAPL --once        # any watchlist ticker works too
     python -m bot --maintenance              # retention + stale-run cleanup
+    python -m bot --backup                   # snapshot the hot store (cron)
+    python -m bot --verify-backup FILE       # rehearse restoring that snapshot
 
 Exit codes are meaningful for cron/CI: ``0`` success, ``1`` the cycle hit errors
 (or, for ``--health``, the bot is stalled), ``2`` bad usage (unknown watchlist,
@@ -24,6 +26,7 @@ import json
 import signal
 import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Sequence
 
 from bot.alerts import TelegramAlerter
@@ -33,6 +36,7 @@ from bot.watchlist import WatchToken, WatchlistBundle, WatchlistError, Watchlist
 from config.errors import ConfigError
 from config.settings import Settings
 from core.logging import configure_logging, get_logger
+from storage import backup as hot_backup
 from storage.hot_store import HotStore
 
 log = get_logger(__name__)
@@ -59,6 +63,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="print a cycle-freshness verdict and exit non-zero when the loop stopped",
     )
     mode.add_argument("--maintenance", action="store_true", help="run retention and exit")
+    mode.add_argument(
+        "--backup",
+        action="store_true",
+        help="snapshot the hot store, verify the copy and exit (cron entry point)",
+    )
+    mode.add_argument(
+        "--verify-backup",
+        metavar="PATH",
+        default=None,
+        help="rehearse restoring a snapshot: integrity, migrations, row counts",
+    )
 
     parser.add_argument(
         "--token",
@@ -88,6 +103,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop the daemon after N cycles (useful for smoke tests)",
     )
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
+    parser.add_argument(
+        "--backup-dir",
+        default=None,
+        help="snapshot directory (default: <DATA_DIR>/backups, which is on the mounted volume)",
+    )
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=hot_backup.DEFAULT_KEEP,
+        help=f"snapshots to retain after a successful backup (default {hot_backup.DEFAULT_KEEP})",
+    )
+    parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="keep the snapshot local even when R2 is configured",
+    )
     parser.add_argument(
         "--log-level",
         default="INFO",
@@ -241,17 +272,19 @@ def _report_config_error(exc: ConfigError) -> int:
     return EXIT_USAGE
 
 
-def _refuse_invalid_config(settings: Settings, *, status_only: bool) -> int | None:
+def _refuse_invalid_config(settings: Settings, *, ops_only: bool) -> int | None:
     """Return the exit code that must stop this process, or ``None`` to boot.
 
     A misconfigured deploy must die before it writes a verdict, not on its first
     audit: an unset ``LLM_API_KEY``, production-with-``DEMO_MODE``, a broken
-    endpoint catalogue or an unknown layer name are operator errors. ``--status``
-    and ``--health`` are exempt because the container healthcheck runs them: a
-    check that refuses to answer when config is wrong cannot report on the loop,
-    and an invalid environment already kills the daemon at boot with exit ``2``.
+    endpoint catalogue or an unknown layer name are operator errors. The read-only
+    and operations modes (``--status``, ``--health``, ``--backup``) are exempt
+    because they are the tools an operator reaches for *when* the environment is
+    wrong - and the container healthcheck runs ``--health``: a check that refuses
+    to answer when config is broken cannot report on the loop. An invalid
+    environment already kills the daemon at boot with exit ``2``.
     """
-    if status_only:
+    if ops_only:
         return None
     try:
         settings.validate_or_raise()
@@ -276,7 +309,9 @@ async def main(argv: list[str] | None = None) -> int:
         # because the daemon refuses to boot otherwise.
         return _report_config_error(exc)
 
-    refusal = _refuse_invalid_config(settings, status_only=args.status or args.health)
+    refusal = _refuse_invalid_config(
+        settings, ops_only=bool(args.status or args.health or args.backup or args.verify_backup)
+    )
     if refusal is not None:
         return refusal
 
@@ -285,6 +320,12 @@ async def main(argv: list[str] | None = None) -> int:
 
 async def _run(args: argparse.Namespace, settings: Settings) -> int:
     """Execute the requested mode against a validated environment and one store."""
+    if args.backup or args.verify_backup:
+        # Before the watchlist load, for the same reason as --health: taking a
+        # snapshot is an operations action, and a broken watchlist is not a
+        # reason to leave the only copy of the verdict history unbacked-up.
+        return _run_backup(args, settings)
+
     if args.health:
         # Deliberately before the watchlist load: an unreadable watchlist is a
         # content problem the daemon reports on its next cycle, not evidence
@@ -339,6 +380,49 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
             return EXIT_OK
     finally:
         store.close()
+
+
+def _run_backup(args: argparse.Namespace, settings: Settings) -> int:
+    """Snapshot the hot store, or rehearse restoring one, and report as JSON.
+
+    Exit ``1`` is deliberate for both halves: a cron job that cannot produce a
+    snapshot, and a snapshot that would not restore, are the same class of
+    emergency - the difference is only whether it is discovered today or on the
+    day it is needed.
+    """
+    if args.verify_backup:
+        try:
+            report = hot_backup.rehearse(args.verify_backup)
+        except hot_backup.BackupError as exc:
+            print(f"backup verification failed: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        print(json.dumps(report.to_dict(), indent=2, default=str))
+        if not report.ok:
+            print("backup would not restore: " + "; ".join(report.problems), file=sys.stderr)
+            return EXIT_ERROR
+        return EXIT_OK
+
+    directory = (
+        Path(args.backup_dir).expanduser()
+        if args.backup_dir
+        else settings.storage.data_dir / "backups"
+    )
+    try:
+        taken = hot_backup.snapshot(settings.storage.hot_db_path, directory / hot_backup.backup_name())
+    except hot_backup.BackupError as exc:
+        print(f"backup failed: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    key = None if args.no_upload else hot_backup.upload(taken, settings.storage.r2)
+    removed = hot_backup.prune(directory, keep=args.keep)
+    print(
+        json.dumps(
+            {**taken.to_dict(), "remote_key": key, "pruned": [path.name for path in removed]},
+            indent=2,
+            default=str,
+        )
+    )
+    return EXIT_OK
 
 
 def _run_health(settings: Settings, *, as_json: bool = False) -> int:
