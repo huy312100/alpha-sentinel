@@ -145,17 +145,42 @@ def test_a_frame_without_the_model_columns_does_not_crash():
     assert report["recommendation"]
 
 
-@pytest.mark.parametrize("boundaries", [(None,), ("sixty",), (64.5,), (120,), (), (True,)])
+@pytest.mark.parametrize(
+    "boundaries",
+    [
+        (None,),
+        ("sixty",),
+        (64.5,),
+        (120,),
+        (),
+        (True,),
+        (float("nan"),),
+        (float("inf"),),
+        (10**400,),
+    ],
+)
 def test_a_boundary_that_cannot_be_reported_is_refused(boundaries):
     """``predicted >= None`` compares against NaN, so every row "agrees".
 
     Without validation the report would claim 100% agreement on a line that does
-    not exist; a 64.5 edge would be filed under ``agreement_64``.
+    not exist; a 64.5 edge would be filed under ``agreement_64``. An infinity and a
+    too-wide integer used to escape as ``OverflowError`` rather than ``ValueError``.
     """
     rows = frame(4, model=[80.0] * 4, llm=[80.0] * 4)
 
     with pytest.raises(ValueError):
         shadow_report(rows, boundaries=boundaries)
+
+
+def test_numpy_boundaries_are_accepted():
+    """``isinstance(np.int64(65), int)`` is False, but pandas hands those back."""
+    np = pytest.importorskip("numpy")
+    rows = frame(4, model=[80.0] * 4, llm=[80.0] * 4)
+
+    report = shadow_report(rows, boundaries=(np.int64(65), np.int64(50)))
+
+    assert report["agreement_65"] == 1.0
+    assert report["agreement_50"] == 1.0
 
 
 def test_the_text_report_mentions_the_boundaries():

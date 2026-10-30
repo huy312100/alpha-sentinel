@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import numbers
 import sys
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -51,13 +53,23 @@ def _validated_boundaries(boundaries: Sequence[float]) -> tuple[float, ...]:
     comparison against NaN, so every row "agrees" and the report claims 100%
     agreement on a line that does not exist. A fractional edge would also leave
     the key ``agreement_64`` behind a boundary of 64.5.
+
+    ``numbers.Real`` rather than ``int``/``float`` because pandas hands back numpy
+    scalars, and ``np.int64`` is not an ``int`` subclass. Every rejection is a
+    ``ValueError``, including the two the arithmetic would raise as
+    ``OverflowError`` on its own: an infinity, and an integer too wide for a float.
     """
     checked: list[float] = []
     for edge in boundaries:
-        if isinstance(edge, bool) or not isinstance(edge, (int, float)):
+        if isinstance(edge, bool) or not isinstance(edge, numbers.Real):
             raise ValueError(f"decision boundary must be a number, got {edge!r}")
-        value = float(edge)
-        if value != int(value) or not 0.0 <= value <= 100.0:
+        try:
+            value = float(edge)
+        except OverflowError as exc:  # ``10**400`` does not fit in a float
+            raise ValueError(f"decision boundary is out of range, got {edge}") from exc
+        # Tested before ``int()``: an infinity raises OverflowError there, and NaN
+        # would fail with a message about the conversion rather than the value.
+        if not math.isfinite(value) or value != int(value) or not 0.0 <= value <= 100.0:
             raise ValueError(f"decision boundary must be a whole number in 0..100, got {value}")
         checked.append(value)
     if not checked:
