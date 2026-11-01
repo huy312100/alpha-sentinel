@@ -11,6 +11,7 @@ Usage::
     python -m bot --maintenance              # retention + stale-run cleanup
     python -m bot --backup                   # snapshot the hot store (cron)
     python -m bot --verify-backup FILE       # rehearse restoring that snapshot
+    python -m bot --print-backup-dir         # where snapshots go, for cron and Make
 
 Exit codes are meaningful for cron/CI: ``0`` success, ``1`` the cycle hit errors
 (or, for ``--health``, the bot is stalled), ``2`` bad usage (unknown watchlist,
@@ -73,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         default=None,
         help="rehearse restoring a snapshot: integrity, migrations, row counts",
+    )
+    mode.add_argument(
+        "--print-backup-dir",
+        action="store_true",
+        help="print where snapshots go, resolved from the same settings as --backup, and exit",
     )
 
     parser.add_argument(
@@ -310,7 +316,8 @@ async def main(argv: list[str] | None = None) -> int:
         return _report_config_error(exc)
 
     refusal = _refuse_invalid_config(
-        settings, ops_only=bool(args.status or args.health or args.backup or args.verify_backup)
+        settings,
+        ops_only=bool(args.status or args.health or args.backup or args.verify_backup or args.print_backup_dir),
     )
     if refusal is not None:
         return refusal
@@ -320,7 +327,7 @@ async def main(argv: list[str] | None = None) -> int:
 
 async def _run(args: argparse.Namespace, settings: Settings) -> int:
     """Execute the requested mode against a validated environment and one store."""
-    if args.backup or args.verify_backup:
+    if args.backup or args.verify_backup or args.print_backup_dir:
         # Before the watchlist load, for the same reason as --health: taking a
         # snapshot is an operations action, and a broken watchlist is not a
         # reason to leave the only copy of the verdict history unbacked-up.
@@ -383,13 +390,20 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def _run_backup(args: argparse.Namespace, settings: Settings) -> int:
-    """Snapshot the hot store, or rehearse restoring one, and report as JSON.
+    """Snapshot the hot store, rehearse a restore, or state where snapshots go.
 
-    Exit ``1`` is deliberate for both halves: a cron job that cannot produce a
-    snapshot, and a snapshot that would not restore, are the same class of
-    emergency - the difference is only whether it is discovered today or on the
+    Exit ``1`` is deliberate for the two working halves: a cron job that cannot
+    produce a snapshot, and a snapshot that would not restore, are the same class
+    of emergency - the difference is only whether it is discovered today or on the
     day it is needed.
     """
+    if args.print_backup_dir:
+        # Scripts must not guess this. A DATA_DIR outside the checkout moves the
+        # snapshots, and a push that read the old folder would upload stale files
+        # and exit 0 - the failure that looks like success.
+        print(hot_backup.default_backup_dir(settings.storage.data_dir))
+        return EXIT_OK
+
     if args.verify_backup:
         try:
             report = hot_backup.rehearse(args.verify_backup)
@@ -405,7 +419,7 @@ def _run_backup(args: argparse.Namespace, settings: Settings) -> int:
     directory = (
         Path(args.backup_dir).expanduser()
         if args.backup_dir
-        else settings.storage.data_dir / "backups"
+        else hot_backup.default_backup_dir(settings.storage.data_dir)
     )
     try:
         taken = hot_backup.snapshot(settings.storage.hot_db_path, directory / hot_backup.backup_name())

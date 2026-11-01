@@ -22,6 +22,13 @@
   KeepAlive restarts the bot when it *exits*: a crash, a SIGTERM, a reboot. It
   cannot help a process that stays alive while its scan loop is wedged, which is
   why com.alphasentinel.watchdog.plist exists alongside this one.
+
+  Scope, stated plainly because it is easy to get wrong: a LaunchAgent belongs to a
+  user's GUI session. It does not run before anyone logs in, and logout stops it. A
+  reboot therefore leaves the stack down until a login happens. On a dedicated Mac
+  mini the usual answer is to enable automatic login so a session always exists; a
+  LaunchDaemon would start at boot but runs as root, which is the wrong privilege
+  level for a process that holds API keys and writes a data directory.
 -->
 <plist version="1.0">
 <dict>
@@ -39,7 +46,8 @@
   <key>WorkingDirectory</key>
   <string>__REPO__</string>
 
-  <!-- Start on load and at every login, so a reboot does not need a human. -->
+  <!-- Loaded when the user's session starts, which is also when it first runs.
+       See the scope note at the top: that is a login, not a boot. -->
   <key>RunAtLoad</key>
   <true/>
 

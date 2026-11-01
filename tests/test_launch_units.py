@@ -56,8 +56,15 @@ def test_the_supervisor_bounds_the_logs_the_bot_actually_writes():
     assert {bot["StandardOutPath"], bot["StandardErrorPath"]} <= bounded
 
 
-def test_both_units_survive_a_reboot_without_a_human():
-    """The point of a LaunchAgent over a terminal session."""
+def test_both_units_start_with_the_session_and_throttle_a_failing_job():
+    """RunAtLoad means *at login*, which is a real limit worth keeping visible.
+
+    A LaunchAgent lives in a user's GUI session: it is not running before someone
+    logs in, and logout stops it. Asserting these keys says the units come up with
+    that session and relaunch a dying process without hammering - not that the box
+    survives a reboot unattended, which needs automatic login or a root-level
+    LaunchDaemon, and the second is the wrong privilege for a process holding keys.
+    """
     for name in (BOT_LABEL, WATCHDOG_LABEL):
         document = unit(name)
         assert document["RunAtLoad"] is True, name

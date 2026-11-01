@@ -58,6 +58,30 @@ def misconfigured_env(environment):
     environment(APP_ENV="production", DEMO_MODE="false")
 
 
+def test_the_snapshot_directory_is_reported_where_the_settings_put_it(environment, tmp_path, capsys):
+    """Scripts ask instead of guessing.
+
+    ``data/backups`` inside the checkout is a plausible-looking wrong answer: a
+    DATA_DIR elsewhere moves the snapshots, and a push that read the old folder
+    uploads stale files while exiting 0.
+    """
+    elsewhere = tmp_path / "volumes" / "ssd"
+    environment(DATA_DIR=str(elsewhere))
+
+    assert asyncio.run(bot_main.main(["--print-backup-dir"])) == bot_main.EXIT_OK
+
+    assert capsys.readouterr().out.strip() == str(elsewhere / "backups")
+
+
+def test_the_snapshot_directory_is_answered_on_a_broken_environment(misconfigured_env, tmp_path, capsys):
+    """Exempt from the boot gate for the same reason --status is: a cron entry that
+    cannot state its path without a valid LLM key will be worked around by hardcoding
+    it, which is exactly how the stale-directory push was written."""
+    assert asyncio.run(bot_main.main(["--print-backup-dir"])) == bot_main.EXIT_OK
+
+    assert capsys.readouterr().out.strip().endswith("backups")
+
+
 def test_a_cycle_refuses_to_start_without_the_llm_key(misconfigured_env, capsys):
     """A run mode must die on the gate, before the watchlist or store is touched."""
     exit_code = asyncio.run(bot_main.main(["--once", "--limit", "1"]))

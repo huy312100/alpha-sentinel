@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -345,3 +346,14 @@ def test_upload_is_a_no_op_when_r2_is_not_configured(store, settings, make_verdi
     taken = snapshot(settings.storage.hot_db_path, tmp_path / "copy.db")
 
     assert upload(taken, R2Settings()) is None
+
+
+def test_the_makefile_asks_where_snapshots_live_instead_of_guessing():
+    """The Makefile is the documented cron entry, so it is where a second, divergent
+    answer to "where do snapshots go" can hide. A hardcoded ``data/backups`` pushes
+    stale files from the checkout and exits 0 while the real snapshots sit elsewhere.
+    """
+    recipe = (Path(__file__).resolve().parents[1] / "Makefile").read_text(encoding="utf-8")
+
+    assert "--print-backup-dir" in recipe
+    assert "BACKUP_DIR := data/backups" not in recipe

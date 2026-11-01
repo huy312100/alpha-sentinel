@@ -237,6 +237,7 @@ unchanged.
 | `--maintenance` | run retention/pruning once and exit |
 | `--backup` | snapshot the hot store, verify the copy, upload if `R2_*` is set, prune old ones |
 | `--verify-backup PATH` | rehearse restoring a snapshot: integrity, migrations, row counts |
+| `--print-backup-dir` | print where snapshots go, resolved from the same settings as `--backup` |
 | `--backup-dir`, `--keep`, `--no-upload` | where snapshots go, how many to retain (default 7), skip the upload |
 | `--dry-run` | collect + audit, persist nothing, send nothing |
 | `--no-alerts` | run normally but suppress Telegram |
@@ -480,7 +481,7 @@ A nightly cron is enough, and it must run inside the container so the paths matc
 ## Tests
 
 ```bash
-make test                                   # 718 tests
+make test                                   # 723 tests
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
@@ -579,6 +580,11 @@ launchctl load ~/Library/LaunchAgents/com.alphasentinel.watchdog.plist
   restarting a bot that refuses to boot over a missing key would bounce it forever.
 * Both units set `ThrottleInterval` so a job that dies on startup is not relaunched
   as fast as launchd can spawn it.
+* **These are login-session agents.** A LaunchAgent belongs to a user's GUI session:
+  it does not run before someone logs in, and logout stops it, so after a reboot the
+  stack stays down until a login. On a dedicated Mac mini, enable automatic login so
+  a session always exists. A LaunchDaemon would start at boot, but it runs as root -
+  the wrong privilege level for a process holding API keys.
 * Logs go to `~/Library/Logs/alpha-sentinel/`, which needs no Full Disk Access
   grant. launchd appends to them forever, so the watchdog bounds them at 20 MB -
   the same ceiling compose gives container logs, and the reason `--log-file` names

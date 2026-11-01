@@ -81,6 +81,17 @@ def backup_name(moment: datetime | None = None) -> str:
     return f"{BACKUP_PREFIX}-{stamp}{BACKUP_SUFFIX}"
 
 
+def default_backup_dir(data_dir: str | Path) -> Path:
+    """Where snapshots go, derived from the configured data directory.
+
+    Exposed because the directory is not a constant: ``DATA_DIR`` moves it, and any
+    tool that guesses it (a Make target, a cron line) can find a stale folder inside
+    the checkout and push yesterday's snapshots while reporting success. Asking the
+    same function the backup itself uses makes that impossible to get wrong quietly.
+    """
+    return Path(data_dir).expanduser() / "backups"
+
+
 def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """Row count per user table.
 
@@ -378,6 +389,7 @@ __all__ = [
     "Rehearsal",
     "Snapshot",
     "backup_name",
+    "default_backup_dir",
     "inspect",
     "missing_rows",
     "prune",
