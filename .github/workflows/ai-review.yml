@@ -321,9 +321,11 @@ jobs:
           # and the reviewer still reported the old constant as a security concern,
           # while the same comment's summary line said "No security concerns
           # identified". Cost of turning this off: wording may shift between runs,
-          # and a thread a human resolved inline can be re-raised. Cost of leaving
-          # it on: a label that outlives its subject, on a check people read before
-          # they read the tests.
+          # a thread a human resolved inline can be re-raised, and - the subtle
+          # one - a partial review that drops files for token budget cannot re-derive
+          # their findings, so the replaced comment omits them and silence reads as
+          # "fixed" when it means "not re-checked". Cost of leaving it on: a label
+          # that outlives its subject, on a check people read before the tests.
           PR_REVIEWER__PERSISTENT_FINDING_STATE: "false"
           PR_REVIEWER__EXTRA_INSTRUCTIONS: |
             This is a Python service that trades real money against third-party
