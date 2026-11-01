@@ -10,7 +10,7 @@
 #   sudo cp ops/alphasentinel-watchdog.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now alphasentinel-watchdog
-#   journalctl -u alphasentinel-watchdog -f     # docker_watchdog_* JSON lines
+#   journalctl -u alphasentinel-watchdog -f     # watchdog_* JSON lines
 # =============================================================================
 [Unit]
 Description=AlphaSentinel health watchdog (restarts unhealthy containers)
@@ -23,11 +23,13 @@ Requires=docker.service
 Type=simple
 # Adjust the path to wherever the repository is checked out on the host.
 WorkingDirectory=/opt/alpha-sentinel
-# The system interpreter on purpose: ops/watchdog.py is stdlib-only, so the
-# supervisor does not depend on the project virtualenv or the image it guards.
+# The system interpreter on purpose: ops/watchdog.py is stdlib-only and sticks to
+# Python 3.8 syntax, so the supervisor does not depend on the project virtualenv
+# or on the image it guards.
 ExecStart=/usr/bin/python3 ops/watchdog.py \
-    --container alpha-sentinel-bot \
-    --container alpha-sentinel-dashboard \
+    --backend docker \
+    --target alpha-sentinel-bot \
+    --target alpha-sentinel-dashboard \
     --interval 60 \
     --threshold 3 \
     --max-restarts 3 \

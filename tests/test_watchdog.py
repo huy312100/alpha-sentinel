@@ -9,7 +9,12 @@ what is broken.
 
 from __future__ import annotations
 
+import ast
+from argparse import Namespace
+from pathlib import Path
 from typing import Any
+
+import pytest
 
 from ops.watchdog import (
     HALT,
@@ -17,8 +22,14 @@ from ops.watchdog import (
     WAIT,
     Policy,
     WatchState,
+    bound_log,
     container_health,
+    launchd_health,
+    launchd_restart,
+    log_caps,
     next_decision,
+    resolve_backend,
+    resolve_targets,
     restart_container,
     tick,
 )
@@ -229,3 +240,167 @@ def test_a_restart_that_cannot_be_invoked_is_a_failure_not_a_crash():
         raise FileNotFoundError("docker")
 
     assert restart_container("bot", runner=boom) is False
+
+
+# -- the launchd backend -----------------------------------------------------
+
+
+def test_the_apps_own_health_exit_code_becomes_the_status_word():
+    """``--health`` already answers the question; the watchdog adds no judgement."""
+    for code, expected in ((0, "healthy"), (1, "unhealthy")):
+        assert launchd_health("bot", command=["x"], runner=lambda *a, **k: Completed(code, "")) == expected
+
+
+def test_a_refused_boot_is_missing_and_never_unhealthy():
+    """Exit 2 means the environment is wrong, which a kickstart cannot repair."""
+    assert launchd_health("bot", command=["x"], runner=lambda *a, **k: Completed(2, "")) == "missing"
+
+
+def test_a_health_probe_that_cannot_run_is_not_evidence_of_a_dead_loop():
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise OSError("no python")
+
+    assert launchd_health("bot", command=["x"], runner=boom) == "missing"
+
+
+def test_the_health_probe_runs_inside_the_app_directory():
+    """``bot.main`` is importable from the repo, not from the watchdog's cwd."""
+    seen: dict[str, Any] = {}
+
+    def spy(command, **kwargs):
+        seen["command"] = command
+        seen["cwd"] = kwargs.get("cwd")
+        return Completed(0, "")
+
+    launchd_health("bot", command=["py", "-m", "bot.main", "--health"], app_dir=Path("/srv/app"), runner=spy)
+
+    assert seen["command"] == ["py", "-m", "bot.main", "--health"]
+    assert seen["cwd"] == "/srv/app"
+
+
+def test_restart_kickstarts_the_label_in_the_user_domain():
+    """``-k`` is what kills a wedged process; without it launchd starts a second."""
+    seen: list[list[str]] = []
+
+    def spy(command, **kwargs):
+        seen.append(list(command))
+        return Completed(0, "")
+
+    assert launchd_restart("com.alphasentinel.bot", uid=501, runner=spy) is True
+    assert seen == [["launchctl", "kickstart", "-k", "gui/501/com.alphasentinel.bot"]]
+
+
+def test_a_missing_launchctl_is_a_failed_restart_not_an_exception():
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise FileNotFoundError("launchctl")
+
+    assert launchd_restart("com.alphasentinel.bot", uid=501, runner=boom) is False
+
+
+def test_the_backend_pair_is_chosen_by_name():
+    class Args:
+        backend = "launchd"
+        health_command = "python -m bot.main --health"
+        app_dir = None
+
+    probe, restart = resolve_backend("launchd", Args())
+    assert probe is not container_health
+    assert restart is launchd_restart
+
+    docker_probe, docker_restart = resolve_backend("docker", Args())
+    assert docker_probe is container_health and docker_restart is restart_container
+
+
+def test_the_watch_list_merges_the_alias_and_refuses_to_be_empty():
+    """A supervisor with nothing to watch starts, stays up and does nothing.
+
+    That is worse than crashing, because a crash gets noticed: the units install
+    with a typo in the target and then appear healthy for a week.
+    """
+    assert resolve_targets(Namespace(targets=["a"], containers=["b"])) == ["a", "b"]
+    assert resolve_targets(Namespace(targets=None, containers=["legacy"])) == ["legacy"]
+
+    with pytest.raises(ValueError, match="no --target given"):
+        resolve_targets(Namespace(targets=None, containers=None))
+
+
+def test_the_log_ceiling_is_declared_in_megabytes():
+    caps = log_caps(Namespace(log_files=["a.log", "b.log"], max_log_mb=20.0))
+
+    assert caps == [("a.log", 20 * 1024 * 1024), ("b.log", 20 * 1024 * 1024)]
+    assert log_caps(Namespace(log_files=["a.log"], max_log_mb=0.0)) == [("a.log", 0)]
+    assert log_caps(Namespace(log_files=None, max_log_mb=5.0)) == []
+
+
+# -- log bounding ------------------------------------------------------------
+
+
+def test_a_small_log_is_left_alone(tmp_path):
+    path = tmp_path / "bot.log"
+    path.write_text("line\n", encoding="utf-8")
+
+    assert bound_log(path, 20 * 1024 * 1024) == 0
+    assert path.read_text(encoding="utf-8") == "line\n"
+
+
+def test_bounding_keeps_the_tail_and_reports_what_it_dropped(tmp_path):
+    path = tmp_path / "bot.log"
+    path.write_bytes(b"OLD\n" + b"keep me\n" * 200)
+
+    dropped = bound_log(path, 256)
+
+    assert dropped > 0
+    text = path.read_bytes()
+    assert len(text) <= 256
+    assert text.endswith(b"keep me\n"), "the newest lines are the ones worth keeping"
+    assert b"OLD" not in text
+    assert b"dropped" in text
+
+
+def test_bounding_rewrites_in_place_because_launchd_holds_the_inode(tmp_path):
+    """Replacing the file would leave launchd appending to a deleted inode."""
+    path = tmp_path / "bot.log"
+    path.write_bytes(b"x" * 4000)
+    before = path.stat().st_ino
+
+    bound_log(path, 512)
+
+    assert path.stat().st_ino == before
+
+
+def test_bounding_an_absent_log_is_not_an_error(tmp_path):
+    assert bound_log(tmp_path / "never-written.log", 100) == 0
+
+
+def test_a_zero_cap_disables_bounding(tmp_path):
+    """``--max-log-mb 0`` means the operator asked for no ceiling, not for deletion."""
+    path = tmp_path / "bot.log"
+    path.write_bytes(b"y" * 5000)
+
+    assert bound_log(path, 0) == 0
+    assert path.stat().st_size == 5000
+
+
+def test_the_watchdog_stays_loadable_by_the_host_interpreter():
+    """The units invoke ``/usr/bin/python3``, which may be 3.8 or 3.9.
+
+    Two halves, because the two failure modes are different: the file must parse as
+    3.8 syntax, and it must not reach for dataclass ``slots``, which is 3.10 at
+    *runtime* and so invisible to a parser check - it is exactly what broke the
+    first draft of this supervisor.
+    """
+    source = (Path(__file__).resolve().parents[1] / "ops" / "watchdog.py").read_text(encoding="utf-8")
+
+    tree = ast.parse(source, filename="ops/watchdog.py", feature_version=(3, 8))
+
+    # Read the decorators, not the text: this file's own docstring *mentions*
+    # slots=True while explaining why it must not be used, and a substring search
+    # cannot tell a warning from a violation.
+    slotted = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "dataclass"
+        and any(keyword.arg == "slots" for keyword in node.keywords)
+    ]
+    assert slotted == []
