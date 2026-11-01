@@ -1,6 +1,6 @@
 .PHONY: help install lint test audit ci demo honeypot smoke status health once dry-run scanners bot dashboard \
         probe ml-export ml-train ml-report docker-build docker-up docker-down docker-logs clean \
-        wheels-arm64 image-arm64 backup backup-verify
+        wheels-arm64 image-arm64 backup backup-verify backup-push mac-install mac-uninstall
 
 PY ?= python3
 VENV := .venv
@@ -8,7 +8,19 @@ BIN := $(VENV)/bin
 # The interpreter that runs pip/downloads. Defaults to the venv, and CI overrides
 # it with the system interpreter so the ARM64 probe needs no installed suite.
 PYTHON ?= $(BIN)/python
-BACKUP_DIR := data/backups
+# Where snapshots live is the bot's answer, not a guess made here. DATA_DIR moves
+# them, and a push that read a stale data/backups left over in the checkout would
+# upload old snapshots and report success - the one failure a backup job must not
+# be able to have. Recursive (=) so the interpreter runs only for the targets that
+# ask, and an empty answer is a hard error rather than a fallback.
+BACKUP_DIR = $(shell $(BIN)/python -m bot.main --print-backup-dir 2>/dev/null)
+# Where the macOS LaunchAgents go and where they write. The log directory lives
+# inside the user container on purpose: ~/Library/Logs needs no Full Disk Access
+# grant, and the supervisor bounds these files the way compose bounds container logs.
+LAUNCH_DIR := $(HOME)/Library/LaunchAgents
+LOG_DIR := $(HOME)/Library/Logs/alpha-sentinel
+# Off-box destination for snapshots. rclone remote name, not a path.
+BACKUP_REMOTE ?= gdrive:alpha-sentinel/backups
 
 # ARM64 (Oracle Always Free A1, Apple Silicon, Raspberry Pi) has no guarantee of
 # a compiler in the runtime image, so every pin has to resolve to a wheel. pip
@@ -102,9 +114,39 @@ backup: ## Snapshot the hot store (verified), upload if R2 is set, prune old cop
 	$(BIN)/python -m bot.main --backup
 
 backup-verify: ## Rehearse restoring the newest snapshot
-	@latest=$$(ls -1t $(BACKUP_DIR)/alpha_sentinel-*.db 2>/dev/null | head -1); \
-	if [ -z "$$latest" ]; then echo "no snapshots in $(BACKUP_DIR) - run 'make backup' first" >&2; exit 1; fi; \
+	@dir='$(BACKUP_DIR)'; \
+	if [ -z "$$dir" ]; then echo "cannot resolve the snapshot directory from settings" >&2; exit 1; fi; \
+	latest=$$(ls -1t "$$dir"/alpha_sentinel-*.db 2>/dev/null | head -1); \
+	if [ -z "$$latest" ]; then echo "no snapshots in $$dir - run 'make backup' first" >&2; exit 1; fi; \
 	$(BIN)/python -m bot.main --verify-backup "$$latest"
+
+backup-push: ## Copy snapshots off the machine (needs rclone; override BACKUP_REMOTE)
+	@command -v rclone >/dev/null 2>&1 || { echo "rclone is not installed: brew install rclone" >&2; exit 1; }
+	@dir='$(BACKUP_DIR)'; \
+	if [ -z "$$dir" ]; then echo "cannot resolve the snapshot directory from settings" >&2; exit 1; fi; \
+	if [ ! -d "$$dir" ]; then echo "nothing to push: $$dir does not exist - run 'make backup' first" >&2; exit 1; fi; \
+	count=$$(ls -1 "$$dir"/alpha_sentinel-*.db 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$$count" = "0" ]; then echo "nothing to push: no snapshots in $$dir" >&2; exit 1; fi; \
+	rclone copy "$$dir" "$(BACKUP_REMOTE)"; \
+	echo "pushed $$count snapshot(s) from $$dir -> $(BACKUP_REMOTE)"
+
+mac-install: ## Write the macOS LaunchAgents for this checkout (loads nothing itself)
+	@mkdir -p $(LAUNCH_DIR) $(LOG_DIR)
+	@for unit in bot watchdog; do \
+		sed -e "s|__REPO__|$(CURDIR)|g" -e "s|__HOME__|$(HOME)|g" \
+			ops/com.alphasentinel.$$unit.plist > $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist || exit 1; \
+		echo "wrote $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist"; \
+	done
+	@echo "nothing is running yet. When ready:"
+	@echo "  launchctl load $(LAUNCH_DIR)/com.alphasentinel.bot.plist"
+	@echo "  launchctl load $(LAUNCH_DIR)/com.alphasentinel.watchdog.plist"
+
+mac-uninstall: ## Stop and remove the LaunchAgents this target wrote
+	@for unit in bot watchdog; do \
+		launchctl unload $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist 2>/dev/null || true; \
+		rm -f $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist; \
+	done
+	@echo "unloaded and removed (logs under $(LOG_DIR) are left alone)"
 
 docker-build: ## Build the container image
 	docker compose build

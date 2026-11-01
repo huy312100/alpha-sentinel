@@ -44,7 +44,10 @@ jobs:
           command: .venv/bin/python -m flake8 . --count --statistics
       - run:
           name: Byte-compile every module
-          command: .venv/bin/python -m compileall -q bot core config scanners storage ai_engine dashboard tests
+          # Same package list as `make ci`, deliberately: a byte-compile that
+          # covers fewer directories than the local gate is a gate that can pass
+          # while a module has not been parsed by anything at all.
+          command: .venv/bin/python -m compileall -q bot core config scanners storage ai_engine dashboard ml ops tests
 
   test:
     executor: py311

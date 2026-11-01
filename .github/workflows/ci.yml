@@ -38,8 +38,10 @@ jobs:
       - name: flake8 (must be zero findings)
         run: python -m flake8 . --count --statistics
 
+      # Keep this package list identical to `make ci` and to .circleci/config.yml:
+      # three gates that compile different directories is one gate with a hole in it.
       - name: Byte-compile every module
-        run: python -m compileall -q bot core config scanners storage ai_engine dashboard tests
+        run: python -m compileall -q bot core config scanners storage ai_engine dashboard ml ops tests
 
       - name: pytest (hermetic, DEMO_MODE)
         run: |
