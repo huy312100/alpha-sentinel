@@ -480,7 +480,7 @@ A nightly cron is enough, and it must run inside the container so the paths matc
 ## Tests
 
 ```bash
-make test                                   # 693 tests, <10s
+make test                                   # 716 tests, <10s
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
@@ -512,7 +512,8 @@ writes to the repo — which is why CI can run it on every push.
 | `test_dashboard.py` | Streamlit `AppTest` render against empty stores, plus the password gate (hidden, wrong, right) |
 | `test_compose_config.py` | log rotation on every service, loopback publication of the dashboard port |
 | `test_backup.py` | snapshot consistency under WAL, integrity/schema refusals, the restore rehearsal, retention |
-| `test_watchdog.py` | restart thresholds, `start_period`, the restart budget, per-container evidence |
+| `test_watchdog.py` | restart thresholds, `start_period`, the restart budget, per-container evidence, log bounding |
+| `test_launch_units.py` | LaunchAgent XML, label cross-references, bounded logs matching written logs |
 
 ---
 
@@ -548,12 +549,55 @@ docker compose down
   stdlib Python, with no Docker socket handed to a container - to restart a
   container that has been `unhealthy` for `--threshold` consecutive probes. It acts
   within a restart budget and then halts and logs, instead of bouncing a broken
-  container forever.
+  container forever. See **macOS** for the same supervisor without Docker.
 * ARM64 (Oracle Always Free A1, Apple Silicon, Raspberry Pi): `make wheels-arm64`
   proves every pin resolves to an aarch64 wheel with no compiler involved, and
   `make image-arm64` builds the image with buildx. CI runs the wheel probe on
   every push, because a bump that drops an aarch64 wheel fails at deploy time
   otherwise.
+
+---
+
+## macOS
+
+No Docker, no systemd, one machine you already own. `make mac-install` writes two
+LaunchAgents for this checkout (it deliberately loads nothing):
+
+```bash
+make mac-install
+launchctl load ~/Library/LaunchAgents/com.alphasentinel.bot.plist
+launchctl load ~/Library/LaunchAgents/com.alphasentinel.watchdog.plist
+```
+
+* **`com.alphasentinel.bot`** runs `bot.main --daemon` with `KeepAlive`, which
+  covers crashes, reboots and logouts - but not a wedged scan loop, because a
+  wedged loop never exits.
+* **`com.alphasentinel.watchdog`** is the missing half: it runs
+  `ops/watchdog.py --backend launchd`, which asks the app its own freshness
+  question (`bot.main --health`) and, after three consecutive failures,
+  `launchctl kickstart -k`. Exit 2 is treated as *unknown*, not unhealthy -
+  restarting a bot that refuses to boot over a missing key would bounce it forever.
+* Both units set `ThrottleInterval` so a job that dies on startup is not relaunched
+  as fast as launchd can spawn it.
+* Logs go to `~/Library/Logs/alpha-sentinel/`, which needs no Full Disk Access
+  grant. launchd appends to them forever, so the watchdog bounds them at 20 MB -
+  the same ceiling compose gives container logs, and the reason `--log-file` names
+  the bot's files rather than its own.
+* Nothing sleeps it for you: turn off automatic sleep in Energy Saver, or a soak
+  quietly measures how often the machine was awake.
+
+Backups push off-box with rclone (`brew install rclone`), default target a Google
+Drive folder:
+
+```bash
+make backup        # snapshot + verify + prune, local
+make backup-push   # copy data/backups to $BACKUP_REMOTE
+make backup-push BACKUP_REMOTE=mygdrive:alpha-sentinel/backups
+```
+
+Two rules for the snapshot job: it runs *after* `--backup` (an in-flight snapshot is
+not a backup), and the live database never lives on a synced drive - SQLite in WAL
+mode plus a file-sync daemon is how you end up restoring a conflict copy.
 
 ---
 
@@ -596,7 +640,8 @@ core/         instrument identity, models, deterministic scoring, HTTP + logging
 ml/           optional learned alpha scorer: features, training_rows, train, predictor
               + escalation policy (imported only when ALPHA_PREDICTOR != llm)
 ops/          host-side tooling, never imported by the app: the health watchdog
-              and its systemd unit
+              (docker and launchd backends), its systemd unit, and the two macOS
+              LaunchAgents
 scanners/     framework only at the root: __init__, base (layer contract),
               registry (asset_class -> layer routing), pipeline, __main__
   crypto/       eight self-contained layers (layer1_onchain .. layer8_security);

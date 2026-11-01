@@ -1,6 +1,6 @@
 .PHONY: help install lint test audit ci demo honeypot smoke status health once dry-run scanners bot dashboard \
         probe ml-export ml-train ml-report docker-build docker-up docker-down docker-logs clean \
-        wheels-arm64 image-arm64 backup backup-verify
+        wheels-arm64 image-arm64 backup backup-verify backup-push mac-install mac-uninstall
 
 PY ?= python3
 VENV := .venv
@@ -9,6 +9,13 @@ BIN := $(VENV)/bin
 # it with the system interpreter so the ARM64 probe needs no installed suite.
 PYTHON ?= $(BIN)/python
 BACKUP_DIR := data/backups
+# Where the macOS LaunchAgents go and where they write. The log directory lives
+# inside the user container on purpose: ~/Library/Logs needs no Full Disk Access
+# grant, and the supervisor bounds these files the way compose bounds container logs.
+LAUNCH_DIR := $(HOME)/Library/LaunchAgents
+LOG_DIR := $(HOME)/Library/Logs/alpha-sentinel
+# Off-box destination for snapshots. rclone remote name, not a path.
+BACKUP_REMOTE ?= gdrive:alpha-sentinel/backups
 
 # ARM64 (Oracle Always Free A1, Apple Silicon, Raspberry Pi) has no guarantee of
 # a compiler in the runtime image, so every pin has to resolve to a wheel. pip
@@ -105,6 +112,30 @@ backup-verify: ## Rehearse restoring the newest snapshot
 	@latest=$$(ls -1t $(BACKUP_DIR)/alpha_sentinel-*.db 2>/dev/null | head -1); \
 	if [ -z "$$latest" ]; then echo "no snapshots in $(BACKUP_DIR) - run 'make backup' first" >&2; exit 1; fi; \
 	$(BIN)/python -m bot.main --verify-backup "$$latest"
+
+backup-push: ## Copy snapshots off the machine (needs rclone; override BACKUP_REMOTE)
+	@command -v rclone >/dev/null 2>&1 || { echo "rclone is not installed: brew install rclone" >&2; exit 1; }
+	@[ -d "$(BACKUP_DIR)" ] || { echo "nothing to push: run 'make backup' first" >&2; exit 1; }
+	rclone copy $(BACKUP_DIR) "$(BACKUP_REMOTE)"
+	@echo "pushed $(BACKUP_DIR) -> $(BACKUP_REMOTE)"
+
+mac-install: ## Write the macOS LaunchAgents for this checkout (loads nothing itself)
+	@mkdir -p $(LAUNCH_DIR) $(LOG_DIR)
+	@for unit in bot watchdog; do \
+		sed -e "s|__REPO__|$(CURDIR)|g" -e "s|__HOME__|$(HOME)|g" \
+			ops/com.alphasentinel.$$unit.plist > $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist || exit 1; \
+		echo "wrote $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist"; \
+	done
+	@echo "nothing is running yet. When ready:"
+	@echo "  launchctl load $(LAUNCH_DIR)/com.alphasentinel.bot.plist"
+	@echo "  launchctl load $(LAUNCH_DIR)/com.alphasentinel.watchdog.plist"
+
+mac-uninstall: ## Stop and remove the LaunchAgents this target wrote
+	@for unit in bot watchdog; do \
+		launchctl unload $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist 2>/dev/null || true; \
+		rm -f $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist; \
+	done
+	@echo "unloaded and removed (logs under $(LOG_DIR) are left alone)"
 
 docker-build: ## Build the container image
 	docker compose build

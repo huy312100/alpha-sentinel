@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  AlphaSentinel scanner bot, as a macOS LaunchAgent.
+
+  Note on this file's prose: XML comments may not contain a double hyphen, so
+  option names are written here without their leading dashes ("threshold", not
+  dash-dash-threshold). plutil rejects the file otherwise, which is the first
+  thing that goes wrong when editing these.
+
+  Install (replace both placeholders, then load):
+    REPO=$HOME/Projects/alpha-sentinel
+    sed -e "s|__REPO__|$REPO|g" -e "s|__HOME__|$HOME|g" \
+        ops/com.alphasentinel.bot.plist > ~/Library/LaunchAgents/com.alphasentinel.bot.plist
+    launchctl load ~/Library/LaunchAgents/com.alphasentinel.bot.plist
+
+  Watch and debug:
+    launchctl list com.alphasentinel.bot
+    tail -f ~/Library/Logs/alpha-sentinel/bot.json.log
+    launchctl kickstart -k gui/$(id -u)/com.alphasentinel.bot
+
+  KeepAlive restarts the bot when it *exits*: a crash, a SIGTERM, a reboot. It
+  cannot help a process that stays alive while its scan loop is wedged, which is
+  why com.alphasentinel.watchdog.plist exists alongside this one.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.alphasentinel.bot</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO__/.venv/bin/python</string>
+    <string>-m</string>
+    <string>bot.main</string>
+    <string>--daemon</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <!-- Start on load and at every login, so a reboot does not need a human. -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Relaunch on exit, including on a non-zero exit. A misconfigured deploy is
+       meant to be loud here: the boot gate's exit code 2 is throttled below
+       rather than given up on, so the log keeps saying why. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Minimum seconds between relaunches. Without it, a bot that refuses to boot
+       (missing LLM_API_KEY) is restarted as fast as launchd can manage. -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Unbuffered, or a wedged process would show no log lines at all. -->
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>LOG_JSON</key>
+    <string>true</string>
+    <key>DATA_DIR</key>
+    <string>__REPO__/data</string>
+    <key>HOT_DB_PATH</key>
+    <string>__REPO__/data/hot/alpha_sentinel.db</string>
+    <key>PARQUET_ROOT</key>
+    <string>__REPO__/data/cold</string>
+  </dict>
+
+  <!-- Logs live under ~/Library/Logs, inside the user container, so no Full Disk
+       Access grant is needed. Their size is bounded by the watchdog agent, because
+       launchd itself appends forever. -->
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/alpha-sentinel/bot.json.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/alpha-sentinel/bot.err.log</string>
+
+  <!-- Positive niceness: a scan cycle should never make the machine feel slower. -->
+  <key>Nice</key>
+  <integer>5</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

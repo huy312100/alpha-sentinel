@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  AlphaSentinel supervisor: the half KeepAlive cannot do.
+
+  Install:
+    REPO=$HOME/Projects/alpha-sentinel
+    sed -e "s|__REPO__|$REPO|g" -e "s|__HOME__|$HOME|g" \
+        ops/com.alphasentinel.watchdog.plist > ~/Library/LaunchAgents/com.alphasentinel.watchdog.plist
+    mkdir -p ~/Library/Logs/alpha-sentinel
+    launchctl load ~/Library/LaunchAgents/com.alphasentinel.watchdog.plist
+
+  Why this exists: KeepAlive relaunches a process that exits. A scan loop wedged
+  behind a hung provider never exits; it sits there, healthy-looking, producing
+  nothing, while the dashboard shows the last verdict it managed. So this agent
+  asks the app its own freshness question (the bot's health mode) and, after three
+  consecutive failures, kickstarts the bot.
+
+  It runs as a long-lived loop rather than a cron entry because the decision needs
+  memory: consecutive failure counts and the restart budget live in process state.
+  A single pass per invocation would restart the arithmetic from zero every time.
+
+  Watch it:
+    tail -f __HOME__/Library/Logs/alpha-sentinel/watchdog.log
+
+  Option names in this comment carry no leading dashes because XML forbids a double
+  hyphen inside a comment; the arguments below keep theirs.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.alphasentinel.watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO__/.venv/bin/python</string>
+    <string>ops/watchdog.py</string>
+    <string>--backend</string>
+    <string>launchd</string>
+    <!-- The LaunchAgent label to kickstart, not a Docker container name. -->
+    <string>--target</string>
+    <string>com.alphasentinel.bot</string>
+    <string>--interval</string>
+    <string>300</string>
+    <!-- Three failed reads, so one slow provider never restarts anything. -->
+    <string>--threshold</string>
+    <string>3</string>
+    <string>--max-restarts</string>
+    <string>3</string>
+    <string>--window</string>
+    <string>3600</string>
+    <!-- launchd appends to the bot's log files forever; naming them here is what
+         bounds them. Same 20 MB ceiling as the compose json-file driver. -->
+    <string>--log-file</string>
+    <string>__HOME__/Library/Logs/alpha-sentinel/bot.json.log</string>
+    <string>--log-file</string>
+    <string>__HOME__/Library/Logs/alpha-sentinel/bot.err.log</string>
+    <string>--max-log-mb</string>
+    <string>20</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- The supervisor must outlive the thing it supervises, so it is kept alive by
+       the same mechanism. Its own restart budget halts inside the loop rather than
+       exiting, so this can never become a disguised bounce of the bot. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <!-- One JSON object per line: watchdog_started, _observe, _restart, _halted. -->
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/alpha-sentinel/watchdog.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/alpha-sentinel/watchdog.err.log</string>
+
+  <key>Nice</key>
+  <integer>10</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
