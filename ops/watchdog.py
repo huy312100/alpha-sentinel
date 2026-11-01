@@ -65,6 +65,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 #: Launch the app's own freshness check. ``--health`` exits 0 when a cycle finished
 #: inside the window, 1 when the loop stopped or hung, and 2 on bad usage/config.
+#: Overridable by ``--health-command``, which is an operator argument at exactly the
+#: trust level of the unit file's own ExecStart: this script's job is to run a
+#: command and act on its exit code, so a flag that changes the command is the
+#: feature, not an input to be sanitised. Nothing untrusted writes a plist.
 DEFAULT_HEALTH_COMMAND = f"{sys.executable} -m bot.main --health"
 
 log = logging.getLogger("alphasentinel.watchdog")
@@ -239,12 +243,21 @@ def bound_log(path: str | Path, max_bytes: int) -> int:
     if max_bytes <= 0 or size <= max_bytes:
         return 0
     keep = max(max_bytes // 2, 1)
+    offset = max(size - keep, 0)
     with target.open("rb") as handle:
-        handle.seek(max(size - keep, 0))
+        handle.seek(offset)
         tail = handle.read()
-    # Drop the leading partial line, or the file would open mid-sentence forever.
-    newline = tail.find(b"\n")
-    tail = tail[newline + 1:] if newline != -1 else tail
+    # Drop the leading partial line, or the file would open mid-sentence forever -
+    # but only when it *is* partial. The byte before the offset decides: a newline
+    # there means the read began on a line boundary and that first line is whole,
+    # which is the newest-but-one record an operator would go looking for.
+    if offset > 0:
+        with target.open("rb") as handle:
+            handle.seek(offset - 1)
+            boundary = handle.read(1)
+        if boundary != b"\n":
+            newline = tail.find(b"\n")
+            tail = tail[newline + 1:] if newline != -1 else b""
     notice = f"\n... watchdog dropped {size - len(tail)} earlier bytes ...\n".encode()
     with target.open("wb") as handle:
         handle.write(notice + tail)

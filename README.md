@@ -480,7 +480,7 @@ A nightly cron is enough, and it must run inside the container so the paths matc
 ## Tests
 
 ```bash
-make test                                   # 716 tests, <10s
+make test                                   # 718 tests
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```

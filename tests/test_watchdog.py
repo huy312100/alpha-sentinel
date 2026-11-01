@@ -357,6 +357,38 @@ def test_bounding_keeps_the_tail_and_reports_what_it_dropped(tmp_path):
     assert b"dropped" in text
 
 
+def test_bounding_keeps_a_first_line_that_is_not_actually_partial(tmp_path):
+    """Uniform log lines land the read exactly on a line boundary.
+
+    Dropping the first line unconditionally - which the first draft did - throws
+    away a whole, intact record every single time, which is the newest-but-one
+    line an operator reaches for when asking what happened just before a restart.
+    """
+    path = tmp_path / "bot.log"
+    path.write_bytes(b"".join(f"line {i:03d}\n".encode() for i in range(100)))  # 1000 bytes
+
+    bound_log(path, 200)
+
+    assert b"line 090" in path.read_bytes()
+
+
+def test_bounding_drops_a_partial_first_line_rather_than_keeping_it_mangled(tmp_path):
+    """The other half: a boundary inside a line must not leave half a record.
+
+    The retained window starts 40 bytes into a 120-byte line, so that line is
+    truncated and goes; the complete line after it survives untouched.
+    """
+    path = tmp_path / "bot.log"
+    path.write_bytes(b"m" * 120 + b"\n" + b"GOOD LINE\n")  # 130 bytes
+
+    bound_log(path, 100)  # keeps the last 50 bytes, which start mid-line
+
+    kept = path.read_bytes()
+
+    assert b"GOOD LINE" in kept.split(b"\n"), kept
+    assert b"mmmm" not in kept, "a truncated line must not masquerade as a record"
+
+
 def test_bounding_rewrites_in_place_because_launchd_holds_the_inode(tmp_path):
     """Replacing the file would leave launchd appending to a deleted inode."""
     path = tmp_path / "bot.log"
