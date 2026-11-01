@@ -63,13 +63,40 @@ HEALTH_TEMPLATE = "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end
 #: The repository root, so the launchd health probe works whatever the cwd is.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-#: Launch the app's own freshness check. ``--health`` exits 0 when a cycle finished
-#: inside the window, 1 when the loop stopped or hung, and 2 on bad usage/config.
-#: Overridable by ``--health-command``, which is an operator argument at exactly the
-#: trust level of the unit file's own ExecStart: this script's job is to run a
-#: command and act on its exit code, so a flag that changes the command is the
-#: feature, not an input to be sanitised. Nothing untrusted writes a plist.
-DEFAULT_HEALTH_COMMAND = f"{sys.executable} -m bot.main --health"
+
+def default_health_command(executable: str | None = None) -> str:
+    """The fallback freshness command, with the interpreter quoted.
+
+    ``sys.executable`` is a filesystem path, and macOS paths carry spaces without
+    complaint - a checkout under ``/Users/John Smith/`` is ordinary. Unquoted, the
+    split below hands back ``/Users/John`` as the program: ``FileNotFoundError``,
+    which this script deliberately reads as ``missing`` rather than ``unhealthy``.
+    The result is a supervisor that starts, loops, and never restarts anything, with
+    no log line pointing at the cause. Quoting is the whole fix.
+    """
+    return f"{shlex.quote(executable or sys.executable)} -m bot.main --health"
+
+
+#: ``--health`` exits 0 when a cycle finished inside the window, 1 when the loop
+#: stopped or hung, and 2 on bad usage or configuration.
+DEFAULT_HEALTH_COMMAND = default_health_command()
+
+
+def health_argv(raw: str) -> list[str]:
+    """Split a configured health command into arguments.
+
+    One code path for the flag and the default, because having two is how the
+    quoting above could be quietly undone: a ``str.split`` fallback would agree with
+    ``shlex.split`` on every machine whose interpreter path has no space, and differ
+    only on the one machine that matters.
+
+    The command is an operator argument read from a unit file they wrote, at the
+    trust level of that file's own ``ExecStart``: this script exists to run one
+    command and act on its exit code, so a configurable command is the feature.
+    Nothing here accepts a command from the network or from a stored row.
+    """
+    return shlex.split(raw or DEFAULT_HEALTH_COMMAND)
+
 
 log = logging.getLogger("alphasentinel.watchdog")
 
@@ -269,7 +296,7 @@ def resolve_backend(
 ) -> tuple[Callable[[str], str], Callable[[str], bool]]:
     """The (probe, restart) pair for one backend, wired from the parsed arguments."""
     if backend == "launchd":
-        command = shlex.split(args.health_command) or list(DEFAULT_HEALTH_COMMAND.split())
+        command = health_argv(args.health_command)
         app_dir = Path(args.app_dir).expanduser() if args.app_dir else PROJECT_ROOT
         probe = lambda target: launchd_health(target, command=command, app_dir=app_dir)  # noqa: E731
         return probe, launchd_restart
@@ -487,7 +514,9 @@ __all__ = [
     "WatchState",
     "bound_log",
     "container_health",
+    "default_health_command",
     "emit",
+    "health_argv",
     "launchd_health",
     "launchd_restart",
     "log_caps",

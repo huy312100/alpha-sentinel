@@ -10,6 +10,7 @@ what is broken.
 from __future__ import annotations
 
 import ast
+import shlex
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from typing import Any
 import pytest
 
 from ops.watchdog import (
+    DEFAULT_HEALTH_COMMAND,
     HALT,
     RESTART,
     WAIT,
@@ -24,6 +26,8 @@ from ops.watchdog import (
     WatchState,
     bound_log,
     container_health,
+    default_health_command,
+    health_argv,
     launchd_health,
     launchd_restart,
     log_caps,
@@ -322,6 +326,28 @@ def test_the_watch_list_merges_the_alias_and_refuses_to_be_empty():
 
     with pytest.raises(ValueError, match="no --target given"):
         resolve_targets(Namespace(targets=None, containers=None))
+
+
+def test_an_interpreter_path_containing_a_space_stays_one_argument():
+    """A checkout under ``/Users/John Smith/`` is ordinary on macOS.
+
+    Unquoted, the split hands back ``/Users/John`` as the program. That raises
+    FileNotFoundError, which maps to ``missing`` rather than ``unhealthy`` - so the
+    supervisor starts, loops, reports success, and never once restarts the bot it was
+    installed to restart. Nothing in the log points at the cause.
+    """
+    spaced = "/Users/John Smith/repo/.venv/bin/python"
+
+    argv = health_argv(default_health_command(spaced))
+
+    assert argv[0] == spaced
+    assert argv[1:] == ["-m", "bot.main", "--health"]
+
+
+def test_the_fallback_is_split_the_same_way_as_the_configured_command():
+    """An empty flag falls back; a ``str.split`` fallback would undo the quoting."""
+    assert health_argv("") == shlex.split(DEFAULT_HEALTH_COMMAND)
+    assert " " not in health_argv("")[0] or health_argv("")[0].startswith("/")
 
 
 def test_the_log_ceiling_is_declared_in_megabytes():
