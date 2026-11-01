@@ -10,7 +10,7 @@ what is broken.
 from __future__ import annotations
 
 import ast
-import shlex
+import sys
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 from ops.watchdog import (
-    DEFAULT_HEALTH_COMMAND,
+    DEFAULT_HEALTH_ARGV,
     HALT,
     RESTART,
     WAIT,
@@ -26,7 +26,6 @@ from ops.watchdog import (
     WatchState,
     bound_log,
     container_health,
-    default_health_command,
     health_argv,
     launchd_health,
     launchd_restart,
@@ -328,26 +327,32 @@ def test_the_watch_list_merges_the_alias_and_refuses_to_be_empty():
         resolve_targets(Namespace(targets=None, containers=None))
 
 
-def test_an_interpreter_path_containing_a_space_stays_one_argument():
-    """A checkout under ``/Users/John Smith/`` is ordinary on macOS.
+def test_the_default_probe_hands_the_interpreter_over_as_one_argument():
+    """The default is a list, so no path shape can split it.
 
-    Unquoted, the split hands back ``/Users/John`` as the program. That raises
-    FileNotFoundError, which maps to ``missing`` rather than ``unhealthy`` - so the
-    supervisor starts, loops, reports success, and never once restarts the bot it was
-    installed to restart. Nothing in the log points at the cause.
+    A checkout under ``/Users/John Smith/`` is ordinary on macOS. The earlier form
+    interpolated ``sys.executable`` into a command string that then had to be split,
+    producing ``/Users/John`` as the program: FileNotFoundError, read as ``missing``,
+    and a supervisor that restarted nothing while logging success.
     """
-    spaced = "/Users/John Smith/repo/.venv/bin/python"
+    argv = health_argv("")
 
-    argv = health_argv(default_health_command(spaced))
-
-    assert argv[0] == spaced
+    assert argv[0] == sys.executable
     assert argv[1:] == ["-m", "bot.main", "--health"]
+    assert list(DEFAULT_HEALTH_ARGV) == argv
 
 
-def test_the_fallback_is_split_the_same_way_as_the_configured_command():
-    """An empty flag falls back; a ``str.split`` fallback would undo the quoting."""
-    assert health_argv("") == shlex.split(DEFAULT_HEALTH_COMMAND)
-    assert " " not in health_argv("")[0] or health_argv("")[0].startswith("/")
+def test_an_explicit_override_is_split_with_quoting_honoured():
+    """Parsing applies only to what an operator typed, and it parses correctly."""
+    argv = health_argv("'/Users/John Smith/py' -m bot.main --health")
+
+    assert argv == ["/Users/John Smith/py", "-m", "bot.main", "--health"]
+
+
+def test_a_blank_override_falls_back_to_the_builtin_probe():
+    """Whitespace is not a command, and the default must survive asking for it."""
+    assert health_argv("") == list(DEFAULT_HEALTH_ARGV)
+    assert health_argv("   ") == list(DEFAULT_HEALTH_ARGV)
 
 
 def test_the_log_ceiling_is_declared_in_megabytes():
@@ -424,6 +429,21 @@ def test_bounding_rewrites_in_place_because_launchd_holds_the_inode(tmp_path):
     bound_log(path, 512)
 
     assert path.stat().st_ino == before
+
+
+def test_a_window_with_no_line_boundary_is_kept_instead_of_deleted(tmp_path):
+    """One enormous line: there is no complete record to protect, so keep something.
+
+    The partial-line rule exists to avoid leaving a mangled fragment at the head of
+    the file. When the retained window holds no newline at all, applying it deletes
+    the entire tail, which is strictly worse than starting mid-line.
+    """
+    path = tmp_path / "bot.log"
+    path.write_bytes(b"z" * 4000)
+
+    bound_log(path, 512)
+
+    assert path.read_bytes().endswith(b"z" * 256)
 
 
 def test_bounding_an_absent_log_is_not_an_error(tmp_path):

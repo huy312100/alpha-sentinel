@@ -64,38 +64,27 @@ HEALTH_TEMPLATE = "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def default_health_command(executable: str | None = None) -> str:
-    """The fallback freshness command, with the interpreter quoted.
-
-    ``sys.executable`` is a filesystem path, and macOS paths carry spaces without
-    complaint - a checkout under ``/Users/John Smith/`` is ordinary. Unquoted, the
-    split below hands back ``/Users/John`` as the program: ``FileNotFoundError``,
-    which this script deliberately reads as ``missing`` rather than ``unhealthy``.
-    The result is a supervisor that starts, loops, and never restarts anything, with
-    no log line pointing at the cause. Quoting is the whole fix.
-    """
-    return f"{shlex.quote(executable or sys.executable)} -m bot.main --health"
-
-
-#: ``--health`` exits 0 when a cycle finished inside the window, 1 when the loop
-#: stopped or hung, and 2 on bad usage or configuration.
-DEFAULT_HEALTH_COMMAND = default_health_command()
+#: The freshness probe, as arguments.
+#:
+#: Built as a list and never round-tripped through a string. The previous form
+#: interpolated ``sys.executable`` into a command line that then had to be split
+#: again, which is how a checkout under ``/Users/John Smith/`` became two arguments,
+#: ``FileNotFoundError``, and a supervisor that silently restarted nothing. There is
+#: no parser on this path to get wrong.
+DEFAULT_HEALTH_ARGV: tuple[str, ...] = (sys.executable, "-m", "bot.main", "--health")
 
 
 def health_argv(raw: str) -> list[str]:
-    """Split a configured health command into arguments.
+    """Arguments for the freshness probe: the built-in default, or a parsed override.
 
-    One code path for the flag and the default, because having two is how the
-    quoting above could be quietly undone: a ``str.split`` fallback would agree with
-    ``shlex.split`` on every machine whose interpreter path has no space, and differ
-    only on the one machine that matters.
-
-    The command is an operator argument read from a unit file they wrote, at the
-    trust level of that file's own ``ExecStart``: this script exists to run one
-    command and act on its exit code, so a configurable command is the feature.
-    Nothing here accepts a command from the network or from a stored row.
+    ``shlex`` runs only over a command an operator supplied explicitly, so the
+    default never passes through string parsing at all. An override is an operator
+    argument read from a unit file they wrote, at the trust level of that file's own
+    ``ExecStart``: this script exists to run one command and act on its exit code, so
+    a configurable command is the feature. Nothing here accepts a command from the
+    network or from a stored row, and ``subprocess`` runs it without a shell.
     """
-    return shlex.split(raw or DEFAULT_HEALTH_COMMAND)
+    return shlex.split(raw) if raw.strip() else list(DEFAULT_HEALTH_ARGV)
 
 
 log = logging.getLogger("alphasentinel.watchdog")
@@ -284,7 +273,10 @@ def bound_log(path: str | Path, max_bytes: int) -> int:
             boundary = handle.read(1)
         if boundary != b"\n":
             newline = tail.find(b"\n")
-            tail = tail[newline + 1:] if newline != -1 else b""
+            # No line boundary anywhere in the window means there is no complete
+            # line to preserve, so keeping the fragment is the only option that
+            # cannot lose data - the alternative discards the whole tail.
+            tail = tail[newline + 1:] if newline != -1 else tail
     notice = f"\n... watchdog dropped {size - len(tail)} earlier bytes ...\n".encode()
     with target.open("wb") as handle:
         handle.write(notice + tail)
@@ -399,9 +391,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window", type=float, default=3600.0, help="budget window in seconds (default 3600)")
     parser.add_argument(
         "--health-command",
-        default=DEFAULT_HEALTH_COMMAND,
-        help="command for --backend launchd to ask the app if its loop is turning "
-        "(default: this interpreter, -m bot.main --health)",
+        default="",
+        help="override the freshness probe (default: this interpreter, "
+        "-m bot.main --health). Quote a path containing a space.",
     )
     parser.add_argument(
         "--app-dir",
@@ -514,7 +506,7 @@ __all__ = [
     "WatchState",
     "bound_log",
     "container_health",
-    "default_health_command",
+    "DEFAULT_HEALTH_ARGV",
     "emit",
     "health_argv",
     "launchd_health",
