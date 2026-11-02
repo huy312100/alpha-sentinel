@@ -138,6 +138,77 @@ def test_demo_mode_needs_no_key():
     assert settings.validate() == []
 
 
+def test_a_ceiling_without_prices_is_a_boot_problem():
+    """A ceiling nobody can measure against is worse than no ceiling.
+
+    The `custom` preset is the self-hosted endpoint and it ships zero prices, so this
+    is the exact shape an operator boots by accident: a ceiling compared against a
+    spend ledger that can only ever read zero, enforced never, reported as configured.
+    """
+    settings = load(
+        LLM_PROVIDER="custom",
+        LLM_BASE_URL="http://localhost:11434/v1",
+        ALPHA_MODEL="hermes3:8b",
+        RISK_MODEL="hermes3:8b",
+        LLM_API_KEY="ollama-any-value",
+        LLM_MAX_USD_PER_CYCLE="0.50",
+    )
+
+    assert (settings.llm.input_usd_per_mtok, settings.llm.output_usd_per_mtok) == (0.0, 0.0)
+    problems = settings.validate()
+
+    assert any("LLM_MAX_USD_PER_CYCLE" in problem and "never bind" in problem for problem in problems)
+
+
+def test_a_ceiling_can_be_set_once_spend_is_measurable():
+    """One non-zero price is enough to opt in - the guard is about measurability.
+
+    A free endpoint can still budget its own calls by pricing the tokens it consumes;
+    what boot refuses is a ceiling that cannot be checked at all.
+    """
+    settings = load(
+        LLM_PROVIDER="custom",
+        LLM_BASE_URL="http://localhost:11434/v1",
+        ALPHA_MODEL="hermes3:8b",
+        RISK_MODEL="hermes3:8b",
+        LLM_API_KEY="ollama-any-value",
+        LLM_MAX_USD_PER_CYCLE="0.50",
+        LLM_MAX_USD_PER_DAY="5.00",
+        LLM_OUTPUT_USD_PER_MTOK="0.0",
+        LLM_INPUT_USD_PER_MTOK="0.0",
+    )
+    assert settings.validate()  # still unmeasurable: both prices are zero
+
+    priced = replace(
+        settings,
+        llm=replace(settings.llm, output_usd_per_mtok=0.05),
+        runtime=replace(settings.runtime, demo_mode=True),
+    )
+    assert priced.validate() == []
+    assert priced.llm.max_usd_per_cycle == 0.50
+
+
+def test_the_verdict_window_is_configurable_and_defaults_to_two_days():
+    """A bound on unproductive time has to outlast ordinary cooldowns by default."""
+    assert load().scanners.health_max_stale_verdict_seconds == 172_800
+    assert load(HEALTH_MAX_STALE_VERDICT_SECONDS="86400").scanners.health_max_stale_verdict_seconds == 86_400
+    assert load(HEALTH_MAX_STALE_VERDICT_SECONDS="0").scanners.health_max_stale_verdict_seconds == 0
+
+
+def test_validate_rejects_a_verdict_window_that_would_fire_on_a_cooldown():
+    """A sub-hour verdict bound would alarm on ordinary scheduling.
+
+    The check exists to catch a stalled pipeline; set too tight it becomes the noise
+    it was meant to replace, so the floor is enforced at boot rather than left to a
+    comment nobody reads at 3am.
+    """
+    settings = load(HEALTH_MAX_STALE_VERDICT_SECONDS="600")
+
+    problems = settings.validate()
+
+    assert any("HEALTH_MAX_STALE_VERDICT_SECONDS" in problem for problem in problems)
+
+
 def test_bad_numeric_llm_setting_fails_fast():
     with pytest.raises(ConfigError, match="LLM_MAX_CONCURRENCY"):
         load(LLM_MAX_CONCURRENCY="lots")

@@ -436,6 +436,11 @@ class ScannerSettings:
     #: ``--health`` calls a cycle stale after this long; ``0`` derives it from
     #: ``scan_interval_seconds`` with a floor (see :mod:`bot.health`).
     health_max_stale_seconds: int = 0
+    #: ``--health`` also asks whether the bot has produced *anything* lately.
+    #: A long cooldown makes empty cycles normal, so cycle freshness alone cannot
+    #: tell a working daemon from one that has written no verdict in a week. Keep
+    #: this above the longest per-instrument cooldown; ``0`` disables the check.
+    health_max_stale_verdict_seconds: int = 172_800
     enabled_layers: tuple[str, ...] = DEFAULT_ENABLED_LAYERS
     #: SEC EDGAR's fair-access policy requires a contact in the User-Agent.
     #: Empty -> the fundamentals layer reports SKIPPED instead of calling out.
@@ -521,6 +526,11 @@ class Settings:
             )
         if 0 < self.scanners.health_max_stale_seconds < 60:
             problems.append("HEALTH_MAX_STALE_SECONDS must be 0 (auto) or >= 60")
+        if 0 < self.scanners.health_max_stale_verdict_seconds < 3_600:
+            problems.append(
+                "HEALTH_MAX_STALE_VERDICT_SECONDS must be 0 (off) or >= 3600: below an hour "
+                "it fires on ordinary cooldowns instead of on a stalled pipeline"
+            )
         unknown_layers = [
             name
             for name in self.scanners.enabled_layers
@@ -567,6 +577,7 @@ class Settings:
             "telegram_configured": self.telegram.is_configured(),
             "scan_interval_seconds": self.scanners.scan_interval_seconds,
             "health_max_stale_seconds": self.scanners.health_max_stale_seconds,
+            "health_max_stale_verdict_seconds": self.scanners.health_max_stale_verdict_seconds,
             "llm_max_usd_per_cycle": self.llm.max_usd_per_cycle,
             "llm_max_usd_per_day": self.llm.max_usd_per_day,
             "alpha_predictor": self.ml.alpha_predictor,
@@ -681,6 +692,7 @@ class Settings:
             http_timeout_seconds=_env_float(env, "HTTP_TIMEOUT_SECONDS", 25.0, minimum=1.0),
             maintenance_interval_seconds=_env_int(env, "MAINTENANCE_INTERVAL_SECONDS", 3_600, minimum=60),
             health_max_stale_seconds=_env_int(env, "HEALTH_MAX_STALE_SECONDS", 0, minimum=0),
+            health_max_stale_verdict_seconds=_env_int(env, "HEALTH_MAX_STALE_VERDICT_SECONDS", 172_800, minimum=0),
             enabled_layers=_parse_csv(_env_str(env, "ENABLED_LAYERS", ",".join(DEFAULT_ENABLED_LAYERS))),
             sec_user_agent=_env_str(env, "SEC_USER_AGENT", "").strip(),
         )
