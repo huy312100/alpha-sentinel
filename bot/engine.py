@@ -536,10 +536,16 @@ class ScanEngine:
             )
 
     def _finish_run(self, report: ScanReport) -> None:
+        # Cooldown skips are the schedule working, not a deficiency. `select_targets`
+        # only ever marks a token skipped for cooldown, so with a 6-hour cooldown and
+        # a 5-minute interval nearly every cycle has them - and counting them here
+        # made `partial` the permanent status of a healthy daemon. A run where three
+        # providers genuinely failed then looked identical to one where nothing was
+        # due, which is the one thing the run history exists to distinguish.
         status = "completed"
         if report.errors and not report.verdicts:
             status = "failed"
-        elif report.errors or report.skipped:
+        elif report.errors:
             status = "partial"
         try:
             self.store.finish_run(

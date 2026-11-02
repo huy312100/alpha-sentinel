@@ -519,6 +519,24 @@ class HotStore:
             row = conn.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 1").fetchone()
         return RunRecord(**dict(row)).to_dict() if row else None
 
+    def last_verdict_run(self) -> dict[str, Any] | None:
+        """The newest run that actually wrote verdicts, skipping the empty ones.
+
+        Freshness of the *loop* and freshness of the *work* are different facts. A
+        daemon whose every instrument is on a long cooldown still finishes cycles
+        happily, so `latest_run` cannot tell a productive bot from one that has
+        produced nothing in a week - which is the failure a soak should catch and
+        the one a cycle-freshness check alone cannot see.
+        """
+        with self._cursor() as conn:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE verdicts_written > 0 "
+                # `rowid` breaks ties: run stamps are second-precision, so two runs
+                # inside the same second would otherwise order by nothing.
+                "ORDER BY COALESCE(finished_at, started_at) DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+        return RunRecord(**dict(row)).to_dict() if row else None
+
     def recent_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._cursor() as conn:
             rows = conn.execute(

@@ -18,12 +18,20 @@ Verdicts:
   cycle can have finished yet); or nothing has ever run, because a fresh volume
   must not fail its first healthcheck;
 * **unhealthy** - a cycle has been running longer than the window (wedged), or
-  the newest finished cycle is older than the window (the loop stopped).
+  the newest finished cycle is older than the window (the loop stopped), or the
+  newest cycle that *wrote a verdict* is older than the verdict window (the loop
+  is turning but producing nothing).
 
 The *outcome* of a cycle is deliberately not a liveness signal: a provider
 outage is reported by the cycle's own error count and logs, and restarting the
 container would not fix it - it would only lose in-memory state and re-race the
 provider. A failed-but-fresh cycle is logged here, not failed on.
+
+The verdict window is the one exception, and it is deliberately slow: two days by
+default, so an afternoon of provider failures stays a log line while a pipeline
+that has quietly stopped writing anything becomes a restart. It exists because
+empty cycles are normal on a long per-instrument cooldown, and cycle freshness
+alone would keep reporting a bot that produces nothing as healthy.
 """
 
 from __future__ import annotations
@@ -125,9 +133,8 @@ def _booted_at(store: HotStore) -> str | None:
     return str(value) if value else None
 
 
-def evaluate(store: HotStore, settings: Settings, *, now: datetime | None = None) -> HealthReport:
-    """Decide whether the daemon is still producing cycles."""
-    moment = now or utcnow()
+def _cycle_report(store: HotStore, settings: Settings, moment: datetime) -> HealthReport:
+    """The scheduler's side of health: is a cycle running, or recently finished?"""
     window = stale_window_seconds(settings)
 
     try:
@@ -206,6 +213,74 @@ def evaluate(store: HotStore, settings: Settings, *, now: datetime | None = None
         healthy=False, reason="cycle_stale", window_seconds=window, age_seconds=age,
         status=status, last_run_at=finished_at or started_at, booted_at=booted,
     )
+
+
+def _productivity_check(
+    report: HealthReport,
+    store: HotStore,
+    settings: Settings,
+    moment: datetime,
+) -> HealthReport:
+    """Downgrade a live-but-unproductive daemon to unhealthy.
+
+    ``cycle_fresh`` is a fact about the scheduler. With a 6-hour cooldown and a
+    5-minute interval, almost every cycle legitimately scans nothing, so a daemon
+    can keep finishing empty cycles for a week and stay green while producing no
+    verdict at all - the exact failure a soak exists to catch, and the one a
+    cycle-freshness check cannot see.
+
+    Fails open on a read error, like the cycle check does, and never fires on a
+    fresh volume: nothing has had a chance to be produced yet.
+    """
+    window = int(settings.scanners.health_max_stale_verdict_seconds or 0)
+    if window <= 0:
+        return report
+
+    try:
+        last = store.last_verdict_run()
+    except Exception as exc:  # noqa: BLE001 - an unreadable store is not proof of an idle one
+        log.warning("health_verdict_read_failed", extra={"error": str(exc)[:200]})
+        return report
+
+    if last is None:
+        boot_age = _age(_parse(report.booted_at), moment)
+        if boot_age is not None and boot_age > window:
+            log.warning(
+                "health_no_verdict_since_boot",
+                extra={"booted_at": report.booted_at, "age_seconds": round(boot_age, 1), "window": window},
+            )
+            return HealthReport(
+                healthy=False, reason="no_verdict_since_boot", window_seconds=window, age_seconds=boot_age,
+                status=report.status, last_run_at=report.last_run_at, booted_at=report.booted_at,
+            )
+        return report
+
+    age = _age(_parse(last.get("finished_at") or last.get("started_at")), moment)
+    if age is not None and age > window:
+        log.warning(
+            "health_verdicts_stale",
+            extra={"last_verdict_run_at": last.get("finished_at") or last.get("started_at"),
+                   "age_seconds": round(age, 1), "window": window},
+        )
+        return HealthReport(
+            healthy=False, reason="verdicts_stale", window_seconds=window, age_seconds=age,
+            status=report.status, last_run_at=report.last_run_at, booted_at=report.booted_at,
+        )
+    return report
+
+
+def evaluate(store: HotStore, settings: Settings, *, now: datetime | None = None) -> HealthReport:
+    """Decide whether the daemon is still *producing*, not merely still running.
+
+    Two independent bounds: the cycle window says the loop is turning, the verdict
+    window says the loop is accomplishing something. Reporting only the first is how
+    a bot that has written nothing for a week reports itself healthy.
+    """
+    moment = now or utcnow()
+    report = _cycle_report(store, settings, moment)
+    if not report.healthy:
+        return report
+    return _productivity_check(report, store, settings, moment)
 
 
 __all__ = ["HealthReport", "MIN_STALE_SECONDS", "STALE_INTERVAL_FACTOR", "evaluate", "stale_window_seconds"]

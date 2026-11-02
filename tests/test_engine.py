@@ -351,6 +351,34 @@ class TestTargetSelection:
         assert second.results[0].skipped is True
         assert len(pipeline.calls) == 1
 
+    async def test_a_cycle_where_everything_is_cooling_down_is_completed(
+        self, settings, store, make_verdict, watchlist_file
+    ):
+        """`partial` has to mean something, and the schedule is not it.
+
+        With a 6-hour cooldown and a 5-minute interval, nearly every cycle of a
+        healthy daemon is this one: nothing due, nothing collected, nothing wrong.
+        Counting those skips as a deficiency made `partial` the permanent status of
+        a working bot, so the runs where a provider genuinely failed were
+        indistinguishable from the runs where nothing was scheduled.
+        """
+        engine = make_engine(settings, store, factory=make_verdict)
+        await engine.start()
+        try:
+            await engine.run_cycle(limit=1)
+            cooling = await engine.run_cycle(limit=1)
+        finally:
+            await engine.close()
+
+        assert cooling.skipped == 1
+        assert cooling.errors == 0
+        # Read this cycle's own run row rather than `latest_run()`: run stamps are
+        # second-precision, so two cycles in the same second tie and the ordering
+        # says nothing about which one you meant.
+        run = next(row for row in store.recent_runs(limit=5) if row["id"] == cooling.run_id)
+        assert run["status"] == "completed"
+        assert run["errors"] == 0
+
     async def test_force_bypasses_cooldown(self, settings, store, make_verdict, watchlist_file):
         pipeline = FakePipeline()
         engine = make_engine(settings, store, pipeline=pipeline, factory=make_verdict)

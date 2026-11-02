@@ -232,3 +232,72 @@ def test_the_health_flag_speaks_json_for_alerting(cli_env, capsys):
     payload = json.loads(out[out.index("{") :])  # logs share stdout with the report
     assert payload["healthy"] is True
     assert payload["reason"] == "no_runs_yet"
+
+
+# -- the second bound: producing, not merely running -----------------------------
+
+
+def add_run(store: HotStore, *, verdicts: int, hours_ago: float) -> str:
+    """A finished run stamped at a chosen time, so freshness can be dialled in."""
+    run_id = store.start_run("scan")
+    store.finish_run(run_id, tokens_scanned=1 if verdicts else 0, verdicts_written=verdicts)
+    stamp = iso(utcnow() - timedelta(hours=hours_ago))
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("UPDATE runs SET started_at = ?, finished_at = ? WHERE id = ?", (stamp, stamp, run_id))
+    return run_id
+
+
+def test_a_scheduler_that_produces_nothing_is_reported_stale(store, settings):
+    """The failure a cycle-freshness check cannot see.
+
+    A 6-hour cooldown makes empty cycles normal, so a daemon can keep finishing
+    them for a week and stay green while writing no verdict at all. The loop is
+    fine; the work is not, and only a bound on the last productive run says so.
+    """
+    add_run(store, verdicts=1, hours_ago=200)
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow() - timedelta(hours=200)))
+
+    report = evaluate(store, settings)
+
+    assert report.healthy is False
+    assert report.reason == "verdicts_stale"
+
+
+def test_a_fresh_volume_is_not_failed_for_having_produced_nothing_yet(store, settings):
+    """Same discipline as the cycle check: a new install must not flap the container."""
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow()))
+
+    assert evaluate(store, settings).healthy is True
+
+
+def test_a_boot_that_never_wrote_a_verdict_is_a_stall(store, settings):
+    """Cycles keep finishing, so only the boot marker says how long this has lasted."""
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow() - timedelta(hours=200)))
+
+    report = evaluate(store, settings)
+
+    assert report.healthy is False
+    assert report.reason == "no_verdict_since_boot"
+
+
+def test_the_verdict_bound_can_be_switched_off(store, settings):
+    """An operator whose cooldowns outlast the default window gets to opt out."""
+    disabled = replace(settings, scanners=replace(settings.scanners, health_max_stale_verdict_seconds=0))
+    add_run(store, verdicts=1, hours_ago=900)
+    add_run(store, verdicts=0, hours_ago=0)
+
+    assert evaluate(store, disabled).healthy is True
+
+
+def test_an_unreadable_verdict_history_fails_open(store, settings, monkeypatch):
+    """One read error is not evidence that the pipeline has stalled."""
+
+    def boom() -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "last_verdict_run", boom)
+
+    assert evaluate(store, settings).healthy is True
