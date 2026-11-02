@@ -127,11 +127,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="console log level (default INFO)",
+        help="console log level (default: LOG_LEVEL from the environment, else INFO)",
     )
-    parser.add_argument("--json-logs", action="store_true", help="emit structured JSON logs")
+    parser.add_argument(
+        "--json-logs",
+        action="store_true",
+        default=None,
+        help="emit structured JSON logs (default: LOG_JSON from the environment, else true)",
+    )
     return parser
 
 
@@ -302,6 +307,10 @@ def _refuse_invalid_config(settings: Settings, *, ops_only: bool) -> int | None:
 async def main(argv: list[str] | None = None) -> int:
     """Load the environment, refuse a bad one, then run, report or maintain."""
     args = build_parser().parse_args(argv)
+    # Both flags default to None on purpose. "Not given" has to be distinguishable
+    # from "given as the default", or the environment settings compose, the Docker
+    # image and the LaunchAgent all declare (LOG_JSON=true, LOG_LEVEL=...) are
+    # overridden by argparse's own defaults before anything can read them.
     configure_logging(level=args.log_level, json_output=args.json_logs)
     try:
         settings = Settings.load()
