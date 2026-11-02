@@ -22,7 +22,7 @@ pyarrow==17.0.0              # Parquet engine (zstd + predicate pushdown)
 # --- AI engine (any OpenAI-compatible endpoint: DeepSeek/OpenAI/Claude/...) --
 openai==3.41.0
 httpx==0.28.1
-pydantic==2.14.1
+pydantic==2.14.2
 tqdm==4.70.1
 
 # --- Dashboard ---------------------------------------------------------------
@@ -32,8 +32,8 @@ plotly==7.1.0
 # --- Config / cloud / utilities ---------------------------------------------
 python-dotenv==1.2.4
 PyYAML==6.0.3
-boto3==1.43.121               # S3-compatible client for Cloudflare R2
-botocore==1.43.121
+boto3==1.43.123               # S3-compatible client for Cloudflare R2
+botocore==1.43.123
 requests==2.34.2             # preflight / smoke-test tooling (scripts/)
 
 # --- Test & lint (installed in CI and locally) -------------------------------
