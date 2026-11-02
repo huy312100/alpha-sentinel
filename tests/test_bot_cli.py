@@ -230,3 +230,21 @@ def test_an_endpoint_overlay_inherited_from_the_host_is_cleared(monkeypatch, tmp
 
     assert "ENDPOINTS_FILE" not in os.environ
     assert Settings.load(load_dotenv_file=False).endpoints.paths == bundled_endpoints().paths
+
+
+def test_the_dotenv_file_is_read_before_logging_is_configured(monkeypatch, environment):
+    """Ordering, not values.
+
+    Both logging settings are read from ``os.environ``, and the file that carries
+    them was only loaded later, inside ``Settings.load()``. An operator who set
+    ``LOG_LEVEL`` in ``.env`` - which is exactly where the manual tells them to set
+    it - got the compiled-in default for the whole run, with no way to notice.
+    """
+    seen: list[str] = []
+
+    monkeypatch.setattr(bot_main, "load_dotenv_file", lambda: seen.append("dotenv"))
+    monkeypatch.setattr(bot_main, "configure_logging", lambda **kwargs: seen.append("logging"))
+
+    asyncio.run(bot_main.main(["--status"]))
+
+    assert seen == ["dotenv", "logging"]

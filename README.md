@@ -481,7 +481,7 @@ A nightly cron is enough, and it must run inside the container so the paths matc
 ## Tests
 
 ```bash
-make test                                   # 723 tests
+make test                                   # 745 tests
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
@@ -631,7 +631,10 @@ mode plus a file-sync daemon is how you end up restoring a conflict copy.
 * Cooldowns are per `(identity, venue)` — contract+chain for crypto, symbol+venue
   for listed instruments — and configurable per watchlist entry.
 * Logs are JSON by default (`LOG_JSON=true`) with stable `msg` keys — grep `cycle_finished`,
-  `verdict_persist_failed`, `cold_store_write_failed`, `alert_failed`.
+  `verdict_persist_failed`, `cold_store_write_failed`, `alert_failed`. `LOG_LEVEL` and
+  `LOG_JSON` are read from the environment unless `--log-level` / `--json-logs` is passed,
+  which pin the value for that invocation; a typo in `LOG_LEVEL` falls back to `INFO`
+  rather than stopping the service.
 
 ---
 

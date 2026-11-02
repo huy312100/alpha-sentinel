@@ -130,12 +130,60 @@ class ConsoleFormatter(logging.Formatter):
         return redact(super().format(record))
 
 
-def configure_logging(level: str = "INFO", json_output: bool | None = None, stream: Any = None) -> None:
-    """Idempotent root-logger setup. Safe to call from bot, CLI and dashboard."""
+#: Levels an operator may name in ``LOG_LEVEL``. Anything else falls back.
+_LOG_LEVELS: frozenset[str] = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+#: The boolean spellings an operator can write. Deliberately identical to
+#: ``config.settings._ENV_TRUE`` / ``_ENV_FALSE``, and a test asserts they stay
+#: equal - the two parsers disagreeing is how ``LOG_JSON=off`` meant "json" to
+#: Settings and "text" to the logger. This module owns the vocabulary rather than
+#: importing config.settings, which imports this one.
+ENV_TRUE: frozenset[str] = frozenset({"1", "true", "yes", "y", "on"})
+ENV_FALSE: frozenset[str] = frozenset({"0", "false", "no", "n", "off", ""})
+
+
+def env_flag(name: str, default: bool = True) -> bool:
+    """A boolean environment setting, or ``default`` when unset or unrecognised.
+
+    Unlike ``Settings``, which raises on a value it cannot parse, this falls back:
+    logging is configured before anything can report a mistake, so refusing to
+    start is not an option available here.
+    """
+    value = os.getenv(name, "").strip().lower()
+    if value in ENV_TRUE:
+        return True
+    if value in ENV_FALSE:
+        return False
+    return default
+
+
+def env_log_level(default: str = "INFO") -> str:
+    """The ``LOG_LEVEL`` environment setting, or ``default`` if it is unset or bogus.
+
+    A typo must not stop a service, and it must not be raised either - logging is
+    configured before anything can log, so the only honest channel is the level
+    itself. Falling back to INFO is what happened before this function existed, and
+    it is what will keep happening; the difference is that a correct value now works.
+    """
+    value = os.getenv("LOG_LEVEL", "").strip().upper()
+    return value if value in _LOG_LEVELS else default
+
+
+def configure_logging(level: str | None = None, json_output: bool | None = None, stream: Any = None) -> None:
+    """Idempotent root-logger setup. Safe to call from bot, CLI and dashboard.
+
+    Both settings resolve the same way: an explicit argument wins, otherwise the
+    environment decides. Leaving ``level`` as ``None`` is therefore meaningful - a
+    caller that passes ``"INFO"`` pins the level and silences ``LOG_LEVEL``, exactly
+    as passing ``json_output=False`` once silenced ``LOG_JSON`` on the daemon.
+    """
     global _CONFIGURED
 
+    if level is None:
+        level = env_log_level()
+
     if json_output is None:
-        json_output = os.getenv("LOG_JSON", "true").strip().lower() not in {"0", "false", "no"}
+        json_output = env_flag("LOG_JSON", default=True)
 
     root = logging.getLogger()
     root.setLevel(level.upper())
@@ -174,12 +222,16 @@ def log_duration(logger: logging.Logger, event: str, **fields: Any) -> Iterator[
 
 
 __all__ = [
+    "ENV_FALSE",
+    "ENV_TRUE",
     "ConsoleFormatter",
     "JsonFormatter",
     "REDACTED",
     "SecretRedactionFilter",
     "clear_secrets",
     "configure_logging",
+    "env_flag",
+    "env_log_level",
     "get_logger",
     "log_duration",
     "redact",
