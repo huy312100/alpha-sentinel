@@ -11,7 +11,7 @@ aiohttp==3.14.5
 aiosignal==1.4.0
 attrs==26.1.0
 frozenlist==1.8.0
-multidict==7.1.0
+multidict==7.2.1
 yarl==1.25.1
 
 # --- Data / time-series ------------------------------------------------------
@@ -20,7 +20,7 @@ pandas==2.3.3
 pyarrow==17.0.0              # Parquet engine (zstd + predicate pushdown)
 
 # --- AI engine (any OpenAI-compatible endpoint: DeepSeek/OpenAI/Claude/...) --
-openai==3.37.0
+openai==3.41.0
 httpx==0.28.1
 pydantic==2.14.1
 tqdm==4.70.1
@@ -37,6 +37,6 @@ botocore==1.43.121
 requests==2.34.2             # preflight / smoke-test tooling (scripts/)
 
 # --- Test & lint (installed in CI and locally) -------------------------------
-pytest==9.1.1
+pytest==9.2.0
 pytest-asyncio==1.4.1   # 1.x needs pytest>=8.4; keep the two in step
-flake8==7.4.1
+flake8==7.5.0
