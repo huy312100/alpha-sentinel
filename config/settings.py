@@ -821,6 +821,21 @@ def _maybe_load_dotenv() -> None:
     load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 
+def load_dotenv_file() -> None:
+    """Public entry to the ``.env`` load, for callers that run before ``Settings.load``.
+
+    Anything that reads the environment has to call this first or it reads a
+    different environment than the operator wrote. Logging is the case that
+    proved it: ``LOG_LEVEL`` and ``LOG_JSON`` set only in ``.env`` were resolved
+    from ``os.environ`` before the file had been loaded into it, so the settings
+    the manual documents were silently the settings the manual ignored.
+
+    Safe to call twice: ``override=False`` means a real environment variable always
+    wins, and an already-loaded value is never replaced.
+    """
+    _maybe_load_dotenv()
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Process-wide singleton. Call ``get_settings.cache_clear()`` in tests."""

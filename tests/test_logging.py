@@ -229,3 +229,60 @@ def test_the_cli_leaves_both_settings_unset_so_the_environment_can_answer():
     explicit = build_parser().parse_args(["--log-level", "ERROR", "--json-logs"])
     assert explicit.log_level == "ERROR"
     assert explicit.json_logs is True
+
+
+# -- where the settings are written, and what words mean ---------------------
+
+
+def test_values_written_in_the_dotenv_file_reach_the_logger(root_logging_restored, monkeypatch, tmp_path):
+    """`.env` is where the manual tells an operator to put these settings.
+
+    Reading them from ``os.environ`` is worthless if the file is loaded afterwards,
+    and that ordering was the first fix's remaining hole: ``Settings.load()`` loads
+    the file, and logging was configured before ``Settings.load()`` ran.
+    """
+    import config.settings as settings_module
+
+    (tmp_path / ".env").write_text("LOG_LEVEL=WARNING\nLOG_JSON=false\n", encoding="utf-8")
+    monkeypatch.setattr(settings_module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    monkeypatch.delenv("LOG_JSON", raising=False)
+
+    settings_module.load_dotenv_file()
+    app_logging.configure_logging(stream=io.StringIO())
+
+    assert logging.getLogger().level == logging.WARNING
+    assert app_logging.env_flag("LOG_JSON", default=True) is False
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "n", "off"])
+def test_every_false_spelling_disables_json(value, root_logging_restored, monkeypatch):
+    """``n`` and ``off`` were accepted by Settings and not by the logger.
+
+    One setting, two parsers, two vocabularies: the value was documented, parsed
+    by the settings layer, and ignored by the layer that actually formats output.
+    """
+    monkeypatch.setenv("LOG_JSON", value)
+    stream = io.StringIO()
+    app_logging.configure_logging("INFO", stream=stream)
+    logging.getLogger("tests.env").info("cycle_finished")
+
+    assert not stream.getvalue().lstrip().startswith("{")
+
+
+@pytest.mark.parametrize("value", ["true", "1", "yes", "y", "on"])
+def test_every_true_spelling_enables_json(value, root_logging_restored, monkeypatch):
+    monkeypatch.setenv("LOG_JSON", value)
+    stream = io.StringIO()
+    app_logging.configure_logging("INFO", stream=stream)
+    logging.getLogger("tests.env").info("cycle_finished")
+
+    assert json.loads(stream.getvalue().strip())["msg"] == "cycle_finished"
+
+
+def test_logging_and_settings_agree_on_boolean_spellings():
+    """The vocabularies are not allowed to drift apart silently."""
+    from config import settings as settings_module
+
+    assert app_logging.ENV_TRUE == frozenset(settings_module._ENV_TRUE)
+    assert app_logging.ENV_FALSE == frozenset(settings_module._ENV_FALSE)

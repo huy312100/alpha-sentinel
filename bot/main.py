@@ -35,7 +35,7 @@ from bot.engine import ScanEngine, ScanReport, day_spend_key
 from bot.health import evaluate
 from bot.watchlist import WatchToken, WatchlistBundle, WatchlistError, WatchlistLoader
 from config.errors import ConfigError
-from config.settings import Settings
+from config.settings import Settings, load_dotenv_file
 from core.logging import configure_logging, get_logger
 from storage import backup as hot_backup
 from storage.hot_store import HotStore
@@ -307,6 +307,12 @@ def _refuse_invalid_config(settings: Settings, *, ops_only: bool) -> int | None:
 async def main(argv: list[str] | None = None) -> int:
     """Load the environment, refuse a bad one, then run, report or maintain."""
     args = build_parser().parse_args(argv)
+    # `.env` first, logging second, in that order or the order is the bug: both
+    # settings are read from os.environ, and the file that carries them is not in
+    # os.environ until Settings.load() gets round to it. An operator who set
+    # LOG_LEVEL only in .env - which is where the manual tells them to put it -
+    # would still get the compiled-in defaults for the whole run.
+    load_dotenv_file()
     # Both flags default to None on purpose. "Not given" has to be distinguishable
     # from "given as the default", or the environment settings compose, the Docker
     # image and the LaunchAgent all declare (LOG_JSON=true, LOG_LEVEL=...) are
