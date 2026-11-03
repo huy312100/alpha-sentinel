@@ -104,6 +104,15 @@ class ScanReport:
     rejected: int = 0
     vetoed: int = 0
     errors: int = 0
+    #: Verdicts that actually reached the hot store. `verdicts` is a property over what
+    #: the pipeline *produced*, so a failed write still counts it, and `verdicts_written`
+    #: is the column `--health` measures productivity against. The two cannot share one
+    #: number: a total storage outage would look like a fully productive daemon.
+    persisted: int = 0
+    #: Persist failures, kept out of `errors` on purpose - storage blipping must not
+    #: kill a cycle or withhold a verdict - but they still make a run `partial`,
+    #: because nothing else records the loss anywhere an operator can see it.
+    persist_errors: int = 0
     alerts_sent: int = 0
     #: USD spent on this cycle's LLM calls. Reported even for dry runs, because a
     #: dry run still pays the provider - it only skips persistence.
@@ -136,6 +145,8 @@ class ScanReport:
             "verdicts": self.verdicts,
             "by_status": self.verdicts_by_status(),
             "errors": self.errors,
+            "persisted": self.persisted,
+            "persist_errors": self.persist_errors,
             "alerts_sent": self.alerts_sent,
             "llm_spend_usd": round(self.llm_spend_usd, 6),
             "dry_run": self.dry_run,
@@ -382,7 +393,7 @@ class ScanEngine:
                     report.results.append(result)
 
                     if not dry_run:
-                        self._persist_verdict(verdict)
+                        self._persist_verdict(report, verdict)
                         if self.settings.ml.write_training_rows:
                             self._collect_training_row(training, snapshot_result, result.outcome)
                         if result.outcome.degraded:
@@ -435,15 +446,25 @@ class ScanEngine:
         else:
             report.vetoed += 1
 
-    def _persist_verdict(self, verdict: FinalVerdict) -> None:
+    def _persist_verdict(self, report: ScanReport, verdict: FinalVerdict) -> None:
+        """Write the verdict, and count only what was actually written.
+
+        A failure is logged and tallied separately instead of raising: the cycle must
+        survive storage blipping, and the verdict has already been computed and
+        counted. But `report.persisted` is what reaches the run row's
+        `verdicts_written`, so it cannot simply mirror the verdicts produced.
+        """
         try:
             self.store.record_verdict(verdict)
             self.store.mark_seen(verdict.token_address, verdict.chain, asset_class=verdict.asset_class)
         except Exception as exc:  # noqa: BLE001 - storage hiccups must not kill the cycle
+            report.persist_errors += 1
             log.error(
                 "verdict_persist_failed",
                 extra={"token": verdict.token_address, "error": f"{type(exc).__name__}: {str(exc)[:200]}"},
             )
+        else:
+            report.persisted += 1
 
     @staticmethod
     def _signal_rows(collected: CollectedSnapshot) -> list[dict[str, Any]]:
@@ -545,14 +566,14 @@ class ScanEngine:
         status = "completed"
         if report.errors and not report.verdicts:
             status = "failed"
-        elif report.errors:
+        elif report.errors or report.persist_errors:
             status = "partial"
         try:
             self.store.finish_run(
                 report.run_id,
                 status=status,
                 tokens_scanned=report.collected,
-                verdicts_written=report.verdicts,
+                verdicts_written=report.persisted,
                 approved=report.approved,
                 vetoed=report.vetoed,
                 errors=report.errors,

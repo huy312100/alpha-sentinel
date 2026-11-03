@@ -295,6 +295,29 @@ class TestCycle:
         assert report.verdicts == 1
         assert report.errors == 0
         assert store.count_verdicts() == 0
+        # The run row must not claim work that never landed: `verdicts_written` is the
+        # column `--health` measures productivity against, and a verdict produced but
+        # not persisted would keep a storage outage looking productive forever.
+        assert report.persisted == 0
+        assert report.persist_errors == 1
+        run = store.latest_run()
+        assert run["verdicts_written"] == 0
+        assert run["status"] == "partial"
+
+    async def test_a_written_verdict_is_counted_as_productive(self, settings, store, make_verdict):
+        """The healthy path must still record production, not just the failure path."""
+        engine = make_engine(settings, store, factory=make_verdict)
+        await engine.start()
+        try:
+            report = await engine.run_cycle(tokens=[token()])
+        finally:
+            await engine.close()
+
+        assert report.persisted == report.verdicts == 1
+        assert report.persist_errors == 0
+        run = store.latest_run()
+        assert run["verdicts_written"] == 1
+        assert run["status"] == "completed"
 
     async def test_cold_store_failure_is_swallowed(self, settings, store, make_verdict, monkeypatch):
         engine = make_engine(settings, store, factory=make_verdict)

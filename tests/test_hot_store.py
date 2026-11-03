@@ -144,17 +144,24 @@ def test_last_verdict_run_skips_the_cycles_that_produced_nothing(store: HotStore
 
 
 def test_runs_stamped_in_the_same_second_still_order_by_insertion(store: HotStore):
-    """Second-precision stamps tie, so the query needs its own tiebreak.
+    """Second-precision stamps tie, so the query needs its own tie-break.
 
-    Without one, "the newest productive run" between two runs in the same second is
-    whatever the storage layer happens to return first.
+    Both rows have to be eligible: an empty second row would drop out of the
+    `verdicts_written > 0` filter and leave the secondary key with nothing to
+    resolve, which is how a tie-break test can pass while proving nothing.
     """
-    productive = store.start_run("scan")
-    store.finish_run(productive, tokens_scanned=1, verdicts_written=1)
-    empty = store.start_run("scan")
-    store.finish_run(empty, tokens_scanned=0, verdicts_written=0)
+    first = store.start_run("scan")
+    store.finish_run(first, tokens_scanned=1, verdicts_written=1)
+    second = store.start_run("scan")
+    store.finish_run(second, tokens_scanned=1, verdicts_written=2)
+    stamp = iso(utcnow() - timedelta(hours=1))  # identical for both rows, on purpose
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE runs SET started_at = ?, finished_at = ? WHERE id IN (?, ?)",
+            (stamp, stamp, first, second),
+        )
 
-    assert store.last_verdict_run()["id"] == productive
+    assert store.last_verdict_run()["id"] == second
 
 
 def test_last_verdict_run_is_none_before_any_work_happens(store: HotStore):
