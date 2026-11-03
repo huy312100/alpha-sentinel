@@ -388,9 +388,9 @@ class TestCycle:
 
         The spend ledger already refuses to persist for a dry run, for the same reason:
         what the cycle "accomplished" was never stored anywhere, so recording it as
-        production would be evidence invented by a rehearsal. The boot marker is the
-        exception - it states when a process ran, not what it achieved - and without it
-        a fresh volume whose first process is a dry run would fail its own healthcheck.
+        production would be evidence invented by a rehearsal. The boot marker goes the
+        same way, and for a sharper reason - it grants the "booting" grace in `--health`,
+        so refreshing it on a live store hides a daemon whose cycles are all stale.
         """
         stale = iso(utcnow() - timedelta(hours=200))
         store.put_state(PRODUCTIVE_RUN_KEY, stale)
@@ -405,8 +405,29 @@ class TestCycle:
         await engine.close()
 
         assert store.get_state(PRODUCTIVE_RUN_KEY) == stale  # untouched by a rehearsal
-        assert store.get_state(BOOT_STATE_KEY) is not None   # liveness is still recorded
+        assert store.get_state(BOOT_STATE_KEY) is None       # and neither is the boot stamp
         assert store.latest_run()["verdicts_written"] == 1   # the real history is unchanged
+
+    async def test_an_engine_built_as_a_rehearsal_persists_nothing(self, settings, store, make_verdict):
+        """`dry_run` is one intent, not two flags a caller has to remember.
+
+        `run_forever` invokes `run_cycle` without naming `dry_run`, so an engine built
+        as a rehearsal would otherwise write verdicts, run rows and cold partitions for
+        every cycle of itself - the flag would only hold for callers that repeated it.
+        """
+        engine = make_engine(settings, store, factory=make_verdict, dry_run=True)
+        await engine.start()
+        try:
+            report = await engine.run_cycle(tokens=[token()])
+        finally:
+            await engine.close()
+
+        assert report.dry_run is True
+        assert report.verdicts == 1               # the work still happens
+        assert store.count_verdicts() == 0        # and is stored nowhere
+        assert store.latest_run() is None
+        assert store.get_state(PRODUCTIVE_RUN_KEY) is None
+        assert store.get_state(BOOT_STATE_KEY) is None
 
     async def test_a_fresher_marker_is_not_dragged_back_to_old_run_history(self, settings, store, make_verdict):
         """The other direction: run rows pruned away must not shorten the marker.

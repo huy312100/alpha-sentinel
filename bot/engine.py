@@ -298,13 +298,19 @@ class ScanEngine:
         watchlists: Sequence[str] | None = None,
         limit: int | None = None,
         force: bool = False,
-        dry_run: bool = False,
+        dry_run: bool | None = None,
         tokens: Sequence[WatchToken] | None = None,
     ) -> ScanReport:
         """Run one full cycle. Always returns a report; never raises on token errors."""
         if not self._started:
             raise RuntimeError("ScanEngine.start() must be awaited before run_cycle()")
         assert self.pipeline is not None and self.audit is not None
+
+        # One intent, one flag. `run_forever` calls this without naming `dry_run`, so an
+        # engine built as a rehearsal would otherwise persist every cycle of itself and
+        # only skip the ones whose caller remembered to repeat the flag.
+        if dry_run is None:
+            dry_run = self.dry_run
 
         started = time.perf_counter()
         # Dry runs persist nothing - not even the run row.
@@ -608,16 +614,18 @@ class ScanEngine:
         the evidence it is acting on. Only a store that has never produced anything
         starts its count now, which is the genuine-new-install grace.
 
-        ``dry_run`` suppresses the productivity writes but not the boot marker: that
-        stamp is a fact about the process rather than a product of a cycle, and a
-        fresh volume whose first process is a dry run still has to answer ``--health``
-        instead of reporting "no_cycle".
+        ``dry_run`` suppresses every write, the boot marker included. That marker is what
+        grants the "booting" grace in :mod:`bot.health`: a store whose cycles are all
+        stale is called healthy while its boot stamp is young, so a rehearsal that
+        refreshed it would hide a stalled daemon. And a fresh volume does not need it -
+        with neither runs nor a marker, ``--health`` still answers ``no_runs_yet``, which
+        is healthy.
         """
+        if dry_run:
+            return
         now = iso(utcnow())
         try:
             self.store.put_state(BOOT_STATE_KEY, now)
-            if dry_run:
-                return
             landed = self._newest_productive_stamp()
             if landed:
                 if landed != str(self.store.get_state(PRODUCTIVE_RUN_KEY) or ""):
