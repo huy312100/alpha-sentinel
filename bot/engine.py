@@ -47,6 +47,14 @@ LLM_SPEND_KEY = "llm_spend_usd"
 #: Written when the engine starts so ``--health`` can tell a booting daemon from
 #: a stalled one (a fresh process legitimately has no finished cycle yet).
 BOOT_STATE_KEY = "bot_booted_at"
+#: When the last verdict actually landed, and when the current silence began. These
+#: live in `kv` rather than in `runs` or in the boot marker, because both of those
+#: reset on their own initiative: maintenance prunes run rows, so a verdict window
+#: longer than retention loses the evidence entirely, and every restart rewrites the
+#: boot marker - including the restarts a watchdog takes *because* health said
+#: unhealthy, which would hand a stalled bot a fresh deadline each time.
+PRODUCTIVE_RUN_KEY = "bot_last_productive_run_at"
+UNPRODUCTIVE_SINCE_KEY = "bot_unproductive_since"
 
 
 def day_spend_key(moment: Any | None = None) -> str:
@@ -580,6 +588,7 @@ class ScanEngine:
             )
         except Exception as exc:  # noqa: BLE001 - bookkeeping
             log.error("run_finish_failed", extra={"run_id": report.run_id, "error": str(exc)[:200]})
+        self._note_productivity(report)
 
     # -- spend ceilings -----------------------------------------------------
     def _mark_booted(self) -> None:
@@ -587,11 +596,47 @@ class ScanEngine:
 
         A bot that just came up legitimately has no finished cycle yet; without
         this marker ``--health`` could not tell "booting" from "wedged".
+
+        The silence clock is deliberately not restarted here. A process that has been
+        producing nothing for four days must still look four days silent after a
+        restart, or the watchdog that restarts an unhealthy bot would keep erasing
+        the evidence it is acting on. Only a store that has never produced anything
+        starts its count now, which is the genuine-new-install grace.
         """
+        now = iso(utcnow())
         try:
-            self.store.put_state(BOOT_STATE_KEY, iso(utcnow()))
+            self.store.put_state(BOOT_STATE_KEY, now)
+            if self.store.get_state(PRODUCTIVE_RUN_KEY) is None:
+                # A store that predates this marker still knows when it last produced
+                # something. Backfill it instead of starting the deadline now, which
+                # would under-report a silence already underway - and once retention
+                # prunes the run rows there would be nothing left to recover it from.
+                last = self.store.last_verdict_run()
+                landed = str(last.get("finished_at") or last.get("started_at") or "") if last else ""
+                if landed:
+                    self.store.put_state(PRODUCTIVE_RUN_KEY, landed)
+                elif self.store.get_state(UNPRODUCTIVE_SINCE_KEY) is None:
+                    self.store.put_state(UNPRODUCTIVE_SINCE_KEY, now)
         except Exception as exc:  # noqa: BLE001 - diagnostic only, never fatal
             log.warning("boot_marker_failed", extra={"error": str(exc)[:200]})
+
+    def _note_productivity(self, report: ScanReport) -> None:
+        """Stamp the last run that put a verdict in the database.
+
+        Counted from ``report.persisted`` rather than ``report.verdicts`` for the same
+        reason the run row does: a verdict produced but not written is not work the
+        bot accomplished.
+        """
+        if not report.persisted or report.dry_run:
+            return
+        try:
+            self.store.put_state(PRODUCTIVE_RUN_KEY, iso(utcnow()))
+            self.store.delete_state(UNPRODUCTIVE_SINCE_KEY)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping, never fatal
+            log.error(
+                "productivity_note_failed",
+                extra={"error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+            )
 
     def _day_spend_usd(self) -> float:
         """Today's ledgered spend, or ``0.0`` when it cannot be read.

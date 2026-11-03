@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 import bot.main as bot_main
-from bot.engine import BOOT_STATE_KEY, ScanEngine
+from bot.engine import BOOT_STATE_KEY, PRODUCTIVE_RUN_KEY, UNPRODUCTIVE_SINCE_KEY, ScanEngine
 from bot.health import MIN_STALE_SECONDS, evaluate, stale_window_seconds
 from core.models import iso, utcnow
 from storage.hot_store import HotStore
@@ -273,15 +273,51 @@ def test_a_fresh_volume_is_not_failed_for_having_produced_nothing_yet(store, set
     assert evaluate(store, settings).healthy is True
 
 
-def test_a_boot_that_never_wrote_a_verdict_is_a_stall(store, settings):
-    """Cycles keep finishing, so only the boot marker says how long this has lasted."""
+def test_a_silence_older_than_the_window_is_a_stall(store, settings):
+    """Cycles keep finishing, so only the silence anchor says how long this has lasted."""
     add_run(store, verdicts=0, hours_ago=0)
     store.put_state(BOOT_STATE_KEY, iso(utcnow() - timedelta(hours=200)))
 
     report = evaluate(store, settings)
 
     assert report.healthy is False
-    assert report.reason == "no_verdict_since_boot"
+    assert report.reason == "never_productive"
+
+
+def test_a_restart_does_not_extend_the_silence(store, settings):
+    """A watchdog restarts an unhealthy bot; that must not buy it a fresh deadline.
+
+    The boot marker is rewritten on every start, so silence measured from it resets
+    each time the supervisor acts on a stall - a bot restarted more often than the
+    window would stay green forever while producing nothing.
+    """
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow()))  # this process is minutes old
+    store.put_state(UNPRODUCTIVE_SINCE_KEY, iso(utcnow() - timedelta(hours=200)))  # the silence is not
+
+    report = evaluate(store, settings)
+
+    assert report.healthy is False
+    assert report.reason == "never_productive"
+
+
+def test_pruned_run_history_does_not_reset_the_productivity_clock(store, settings):
+    """Retention prunes `runs`, and the verdict window may be longer than retention.
+
+    Without durable evidence the check would lose the last productive run, fall back
+    to a younger number, and report a long-stalled bot as healthy again.
+    """
+    productive = add_run(store, verdicts=1, hours_ago=200)
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(PRODUCTIVE_RUN_KEY, iso(utcnow() - timedelta(hours=200)))
+    with sqlite3.connect(store.path) as conn:  # what maintenance would eventually do
+        conn.execute("DELETE FROM runs WHERE id = ?", (productive,))
+
+    report = evaluate(store, settings)
+
+    assert report.healthy is False
+    assert report.reason == "verdicts_stale"
+    assert report.verdict_run_at  # the evidence came from kv, not from a run row
 
 
 def test_the_verdict_bound_can_be_switched_off(store, settings):
@@ -315,7 +351,7 @@ def test_the_stale_verdict_report_names_the_bound_that_fired(store, settings):
 
 
 def test_the_boot_without_any_verdict_says_so_rather_than_printing_never_date(store, settings):
-    """`no_verdict_since_boot` has no verdict run to name, and must not invent one."""
+    """`never_productive` has no verdict run to name, and must not invent one."""
     add_run(store, verdicts=0, hours_ago=0)
     store.put_state(BOOT_STATE_KEY, iso(utcnow() - timedelta(hours=200)))
 
