@@ -176,6 +176,7 @@ class ScanEngine:
         audit: DualAuditFlow | None = None,
         alerter: TelegramAlerter | None = None,
         loader: WatchlistLoader | None = None,
+        dry_run: bool = False,
     ) -> None:
         self.settings = settings
         self.store = store or HotStore(settings.storage.hot_db_path)
@@ -196,6 +197,10 @@ class ScanEngine:
         self.loader = loader or WatchlistLoader(
             settings.scanners.watchlist_path, default_chain=settings.runtime.default_chain
         )
+        #: This process will only run dry cycles, so startup must not leave evidence
+        #: behind - the spend ledger already honours the same rule, because what a dry
+        #: run "accomplished" was never persisted anywhere.
+        self.dry_run = dry_run
         self._owns_pipeline = pipeline is None
         self._owns_audit = audit is None
         self._started = False
@@ -217,7 +222,7 @@ class ScanEngine:
         if self._started:
             return
         self.store.initialize()
-        self._mark_booted()
+        self._mark_booted(dry_run=self.dry_run)
         if self.pipeline is None:
             self.pipeline = ScanPipeline(self.settings)
             self._owns_pipeline = True
@@ -591,7 +596,7 @@ class ScanEngine:
         self._note_productivity(report)
 
     # -- spend ceilings -----------------------------------------------------
-    def _mark_booted(self) -> None:
+    def _mark_booted(self, *, dry_run: bool = False) -> None:
         """Record the process start so a fresh daemon is not reported as stalled.
 
         A bot that just came up legitimately has no finished cycle yet; without
@@ -602,10 +607,17 @@ class ScanEngine:
         restart, or the watchdog that restarts an unhealthy bot would keep erasing
         the evidence it is acting on. Only a store that has never produced anything
         starts its count now, which is the genuine-new-install grace.
+
+        ``dry_run`` suppresses the productivity writes but not the boot marker: that
+        stamp is a fact about the process rather than a product of a cycle, and a
+        fresh volume whose first process is a dry run still has to answer ``--health``
+        instead of reporting "no_cycle".
         """
         now = iso(utcnow())
         try:
             self.store.put_state(BOOT_STATE_KEY, now)
+            if dry_run:
+                return
             landed = self._newest_productive_stamp()
             if landed:
                 if landed != str(self.store.get_state(PRODUCTIVE_RUN_KEY) or ""):

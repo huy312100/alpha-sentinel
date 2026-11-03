@@ -10,7 +10,7 @@ import pytest
 
 from ai_engine.dual_audit_flow import AuditOutcome
 from bot.alerts import AlertResult
-from bot.engine import PRODUCTIVE_RUN_KEY, UNPRODUCTIVE_SINCE_KEY, ScanEngine
+from bot.engine import BOOT_STATE_KEY, PRODUCTIVE_RUN_KEY, UNPRODUCTIVE_SINCE_KEY, ScanEngine
 from bot.watchlist import WatchToken
 from core.models import VerdictStatus, iso, utcnow
 from core.scoring import Decision
@@ -383,13 +383,39 @@ class TestCycle:
 
         assert store.get_state(PRODUCTIVE_RUN_KEY) == fresh
 
+    async def test_a_dry_run_leaves_no_evidence_of_work(self, settings, store, make_verdict):
+        """A dry run must not write the productivity marker, even during startup.
+
+        The spend ledger already refuses to persist for a dry run, for the same reason:
+        what the cycle "accomplished" was never stored anywhere, so recording it as
+        production would be evidence invented by a rehearsal. The boot marker is the
+        exception - it states when a process ran, not what it achieved - and without it
+        a fresh volume whose first process is a dry run would fail its own healthcheck.
+        """
+        stale = iso(utcnow() - timedelta(hours=200))
+        store.put_state(PRODUCTIVE_RUN_KEY, stale)
+        run_id = store.start_run("scan")
+        fresh = iso(utcnow() - timedelta(hours=2))
+        store.finish_run(run_id, tokens_scanned=1, verdicts_written=1)
+        with sqlite3.connect(store.path) as conn:
+            conn.execute("UPDATE runs SET started_at = ?, finished_at = ? WHERE id = ?", (fresh, fresh, run_id))
+
+        engine = make_engine(settings, store, factory=make_verdict, dry_run=True)
+        await engine.start()
+        await engine.close()
+
+        assert store.get_state(PRODUCTIVE_RUN_KEY) == stale  # untouched by a rehearsal
+        assert store.get_state(BOOT_STATE_KEY) is not None   # liveness is still recorded
+        assert store.latest_run()["verdicts_written"] == 1   # the real history is unchanged
+
     async def test_a_fresher_marker_is_not_dragged_back_to_old_run_history(self, settings, store, make_verdict):
         """The other direction: run rows pruned away must not shorten the marker.
 
         Without both directions this is just a backfill, and the durable marker exists
         precisely because the run table stops being the whole record.
         """
-        store.put_state(PRODUCTIVE_RUN_KEY, iso(utcnow() - timedelta(hours=1)))
+        fresh = iso(utcnow() - timedelta(hours=1))
+        store.put_state(PRODUCTIVE_RUN_KEY, fresh)
         run_id = store.start_run("scan")
         old = iso(utcnow() - timedelta(hours=300))
         store.finish_run(run_id, tokens_scanned=1, verdicts_written=1)
@@ -400,7 +426,7 @@ class TestCycle:
         await engine.start()
         await engine.close()
 
-        assert store.get_state(PRODUCTIVE_RUN_KEY) != old
+        assert store.get_state(PRODUCTIVE_RUN_KEY) == fresh
 
     async def test_cold_store_failure_is_swallowed(self, settings, store, make_verdict, monkeypatch):
         engine = make_engine(settings, store, factory=make_verdict)
