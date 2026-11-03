@@ -381,7 +381,15 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         telegram = replace(settings.telegram, chat_id="") if args.no_alerts else settings.telegram
         alerter = TelegramAlerter(telegram, endpoints=settings.endpoints, store=store)
 
-        async with ScanEngine(settings, store=store, alerter=alerter, loader=loader) as engine:
+        async with ScanEngine(
+            settings,
+            store=store,
+            alerter=alerter,
+            loader=loader,
+            # Startup writes the productivity marker, and a dry run is not allowed to
+            # leave evidence of work it did not persist.
+            dry_run=args.dry_run,
+        ) as engine:
             _install_signal_handlers(engine)
             if args.maintenance:
                 result = await asyncio.to_thread(engine.maintenance, force=True)

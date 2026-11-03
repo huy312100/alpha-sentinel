@@ -151,10 +151,12 @@ def test_demo_mode_still_needs_no_key(environment, monkeypatch, capsys):
         """Stand-in for ``ScanEngine``: returns one local verdict, no provider I/O."""
 
         cycle_kwargs: dict = {}
+        ctor_kwargs: dict = {}
 
         def __init__(self, *args, **kwargs):
             self.args = args
             self.kwargs = kwargs
+            LocalEngine.ctor_kwargs = kwargs
 
         async def __aenter__(self):
             return self
@@ -177,6 +179,10 @@ def test_demo_mode_still_needs_no_key(environment, monkeypatch, capsys):
     assert exit_code == bot_main.EXIT_OK
     assert LocalEngine.cycle_kwargs["dry_run"] is True
     assert LocalEngine.cycle_kwargs["limit"] == 1
+    # Startup has to be told as well: the productivity marker is written in `start()`,
+    # before any cycle runs, so a flag that only reaches `run_cycle` would still let a
+    # rehearsal leave evidence of work it never persisted.
+    assert LocalEngine.ctor_kwargs["dry_run"] is True
     assert "run demo-cycle (dry-run)" in capsys.readouterr().out
 
 

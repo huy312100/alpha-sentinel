@@ -176,6 +176,7 @@ class ScanEngine:
         audit: DualAuditFlow | None = None,
         alerter: TelegramAlerter | None = None,
         loader: WatchlistLoader | None = None,
+        dry_run: bool = False,
     ) -> None:
         self.settings = settings
         self.store = store or HotStore(settings.storage.hot_db_path)
@@ -196,6 +197,10 @@ class ScanEngine:
         self.loader = loader or WatchlistLoader(
             settings.scanners.watchlist_path, default_chain=settings.runtime.default_chain
         )
+        #: This process will only run dry cycles, so startup must not leave evidence
+        #: behind - the spend ledger already honours the same rule, because what a dry
+        #: run "accomplished" was never persisted anywhere.
+        self.dry_run = dry_run
         self._owns_pipeline = pipeline is None
         self._owns_audit = audit is None
         self._started = False
@@ -217,7 +222,7 @@ class ScanEngine:
         if self._started:
             return
         self.store.initialize()
-        self._mark_booted()
+        self._mark_booted(dry_run=self.dry_run)
         if self.pipeline is None:
             self.pipeline = ScanPipeline(self.settings)
             self._owns_pipeline = True
@@ -293,13 +298,19 @@ class ScanEngine:
         watchlists: Sequence[str] | None = None,
         limit: int | None = None,
         force: bool = False,
-        dry_run: bool = False,
+        dry_run: bool | None = None,
         tokens: Sequence[WatchToken] | None = None,
     ) -> ScanReport:
         """Run one full cycle. Always returns a report; never raises on token errors."""
         if not self._started:
             raise RuntimeError("ScanEngine.start() must be awaited before run_cycle()")
         assert self.pipeline is not None and self.audit is not None
+
+        # One intent, one flag. `run_forever` calls this without naming `dry_run`, so an
+        # engine built as a rehearsal would otherwise persist every cycle of itself and
+        # only skip the ones whose caller remembered to repeat the flag.
+        if dry_run is None:
+            dry_run = self.dry_run
 
         started = time.perf_counter()
         # Dry runs persist nothing - not even the run row.
@@ -591,7 +602,7 @@ class ScanEngine:
         self._note_productivity(report)
 
     # -- spend ceilings -----------------------------------------------------
-    def _mark_booted(self) -> None:
+    def _mark_booted(self, *, dry_run: bool = False) -> None:
         """Record the process start so a fresh daemon is not reported as stalled.
 
         A bot that just came up legitimately has no finished cycle yet; without
@@ -602,23 +613,43 @@ class ScanEngine:
         restart, or the watchdog that restarts an unhealthy bot would keep erasing
         the evidence it is acting on. Only a store that has never produced anything
         starts its count now, which is the genuine-new-install grace.
+
+        ``dry_run`` suppresses every write, the boot marker included. That marker is what
+        grants the "booting" grace in :mod:`bot.health`: a store whose cycles are all
+        stale is called healthy while its boot stamp is young, so a rehearsal that
+        refreshed it would hide a stalled daemon. And a fresh volume does not need it -
+        with neither runs nor a marker, ``--health`` still answers ``no_runs_yet``, which
+        is healthy.
         """
+        if dry_run:
+            return
         now = iso(utcnow())
         try:
             self.store.put_state(BOOT_STATE_KEY, now)
-            if self.store.get_state(PRODUCTIVE_RUN_KEY) is None:
-                # A store that predates this marker still knows when it last produced
-                # something. Backfill it instead of starting the deadline now, which
-                # would under-report a silence already underway - and once retention
-                # prunes the run rows there would be nothing left to recover it from.
-                last = self.store.last_verdict_run()
-                landed = str(last.get("finished_at") or last.get("started_at") or "") if last else ""
-                if landed:
+            landed = self._newest_productive_stamp()
+            if landed:
+                if landed != str(self.store.get_state(PRODUCTIVE_RUN_KEY) or ""):
                     self.store.put_state(PRODUCTIVE_RUN_KEY, landed)
-                elif self.store.get_state(UNPRODUCTIVE_SINCE_KEY) is None:
-                    self.store.put_state(UNPRODUCTIVE_SINCE_KEY, now)
+            elif self.store.get_state(UNPRODUCTIVE_SINCE_KEY) is None:
+                self.store.put_state(UNPRODUCTIVE_SINCE_KEY, now)
         except Exception as exc:  # noqa: BLE001 - diagnostic only, never fatal
             log.warning("boot_marker_failed", extra={"error": str(exc)[:200]})
+
+    def _newest_productive_stamp(self) -> str | None:
+        """The latest evidence that a verdict landed, from either place it is recorded.
+
+        The run table is the only source for anything produced before this marker
+        existed - a process on older code produces verdicts without touching it - and
+        the marker is the only source once those rows have been pruned. Taking the
+        newer of the two is what stops either one from leaving the deadline measuring
+        a silence that has already ended. Both stamps come from ``core.models.iso``,
+        so they are fixed-width UTC strings and ``max`` compares them correctly.
+        """
+        stamps = [str(self.store.get_state(PRODUCTIVE_RUN_KEY) or "")]
+        last = self.store.last_verdict_run()
+        if last is not None:
+            stamps.append(str(last.get("finished_at") or last.get("started_at") or ""))
+        return max((stamp for stamp in stamps if stamp), default="") or None
 
     def _note_productivity(self, report: ScanReport) -> None:
         """Stamp the last run that put a verdict in the database.
