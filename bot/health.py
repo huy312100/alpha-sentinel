@@ -97,6 +97,12 @@ class HealthReport:
     status: str = ""
     last_run_at: str | None = None
     booted_at: str | None = None
+    #: Which measurement ``window_seconds`` / ``age_seconds`` describe: ``cycle`` for
+    #: the scheduler bound, ``verdict`` for the production bound. The two windows age
+    #: against different runs, so printing them without naming the one that fired lets
+    #: an operator read a verdict window next to a cycle age and see nothing wrong.
+    bound: str = "cycle"
+    verdict_run_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -107,21 +113,25 @@ class HealthReport:
             "last_run_status": self.status or None,
             "last_run_at": self.last_run_at,
             "booted_at": self.booted_at,
+            "bound": self.bound,
+            "verdict_run_at": self.verdict_run_at,
         }
 
     def format(self) -> str:
         head = "AlphaSentinel health: OK" if self.healthy else "AlphaSentinel health: UNHEALTHY"
         last = f"{self.status or 'unknown'} at {self.last_run_at}" if self.last_run_at else "none"
         age = f"{self.age_seconds:.0f}s" if self.age_seconds is not None else "n/a"
-        return "\n".join(
-            [
-                head,
-                f"  reason: {self.reason}",
-                f"  window: {self.window_seconds}s",
-                f"  last run: {last} (age {age})",
-                f"  booted: {self.booted_at or 'unknown'}",
-            ]
-        )
+        lines = [head, f"  reason: {self.reason}", f"  window: {self.window_seconds}s ({self.bound})"]
+        if self.bound == "verdict":
+            # State the cycle without its age: the number that tripped the check
+            # belongs to another run, and pairing a verdict window with a cycle age is
+            # how a stalled pipeline prints as if it were fine.
+            lines.append(f"  last run: {last}")
+            lines.append(f"  last verdict: {self.verdict_run_at or 'never'} (age {age})")
+        else:
+            lines.append(f"  last run: {last} (age {age})")
+        lines.append(f"  booted: {self.booted_at or 'unknown'}")
+        return "\n".join(lines)
 
 
 def _booted_at(store: HotStore) -> str | None:
@@ -243,6 +253,9 @@ def _productivity_check(
         return report
 
     if last is None:
+        # No run has ever written a verdict. That is normal only while the process is
+        # young: once the boot itself has outlasted the window, the same stall is
+        # visible from the other side and nothing but the boot marker can say so.
         boot_age = _age(_parse(report.booted_at), moment)
         if boot_age is not None and boot_age > window:
             log.warning(
@@ -252,6 +265,7 @@ def _productivity_check(
             return HealthReport(
                 healthy=False, reason="no_verdict_since_boot", window_seconds=window, age_seconds=boot_age,
                 status=report.status, last_run_at=report.last_run_at, booted_at=report.booted_at,
+                bound="verdict",
             )
         return report
 
@@ -265,6 +279,7 @@ def _productivity_check(
         return HealthReport(
             healthy=False, reason="verdicts_stale", window_seconds=window, age_seconds=age,
             status=report.status, last_run_at=report.last_run_at, booted_at=report.booted_at,
+            bound="verdict", verdict_run_at=last.get("finished_at") or last.get("started_at"),
         )
     return report
 

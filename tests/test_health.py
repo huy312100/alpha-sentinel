@@ -170,6 +170,7 @@ def test_the_report_is_machine_readable(store, settings):
     assert payload["healthy"] is True
     assert payload["window_seconds"] == MIN_STALE_SECONDS
     assert payload["last_run_status"] == "completed"
+    assert payload["bound"] == "cycle"
     assert json.dumps(payload)  # must be serialisable for --health --json
 
 
@@ -290,6 +291,39 @@ def test_the_verdict_bound_can_be_switched_off(store, settings):
     add_run(store, verdicts=0, hours_ago=0)
 
     assert evaluate(store, disabled).healthy is True
+
+
+def test_the_stale_verdict_report_names_the_bound_that_fired(store, settings):
+    """Two windows now measure two different runs, so the output has to say which.
+
+    Printing the verdict window next to the newest cycle's age reads as if nothing is
+    wrong - 172800s against 240s looks enormously slack - while the run that actually
+    tripped the check sits unreported. The age has to belong to the bound that fired.
+    """
+    add_run(store, verdicts=1, hours_ago=200)
+    add_run(store, verdicts=0, hours_ago=0)
+
+    report = evaluate(store, settings)
+
+    assert report.bound == "verdict"
+    assert report.verdict_run_at is not None
+    assert report.verdict_run_at != report.last_run_at  # the fresh cycle is not the stale one
+    line = report.format()
+    assert "(verdict)" in line
+    assert "last verdict:" in line
+    assert "last run: completed at" in line
+
+
+def test_the_boot_without_any_verdict_says_so_rather_than_printing_never_date(store, settings):
+    """`no_verdict_since_boot` has no verdict run to name, and must not invent one."""
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow() - timedelta(hours=200)))
+
+    report = evaluate(store, settings)
+
+    assert report.bound == "verdict"
+    assert report.verdict_run_at is None
+    assert "last verdict: never" in report.format()
 
 
 def test_an_unreadable_verdict_history_fails_open(store, settings, monkeypatch):
