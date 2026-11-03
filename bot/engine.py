@@ -606,19 +606,30 @@ class ScanEngine:
         now = iso(utcnow())
         try:
             self.store.put_state(BOOT_STATE_KEY, now)
-            if self.store.get_state(PRODUCTIVE_RUN_KEY) is None:
-                # A store that predates this marker still knows when it last produced
-                # something. Backfill it instead of starting the deadline now, which
-                # would under-report a silence already underway - and once retention
-                # prunes the run rows there would be nothing left to recover it from.
-                last = self.store.last_verdict_run()
-                landed = str(last.get("finished_at") or last.get("started_at") or "") if last else ""
-                if landed:
+            landed = self._newest_productive_stamp()
+            if landed:
+                if landed != str(self.store.get_state(PRODUCTIVE_RUN_KEY) or ""):
                     self.store.put_state(PRODUCTIVE_RUN_KEY, landed)
-                elif self.store.get_state(UNPRODUCTIVE_SINCE_KEY) is None:
-                    self.store.put_state(UNPRODUCTIVE_SINCE_KEY, now)
+            elif self.store.get_state(UNPRODUCTIVE_SINCE_KEY) is None:
+                self.store.put_state(UNPRODUCTIVE_SINCE_KEY, now)
         except Exception as exc:  # noqa: BLE001 - diagnostic only, never fatal
             log.warning("boot_marker_failed", extra={"error": str(exc)[:200]})
+
+    def _newest_productive_stamp(self) -> str | None:
+        """The latest evidence that a verdict landed, from either place it is recorded.
+
+        The run table is the only source for anything produced before this marker
+        existed - a process on older code produces verdicts without touching it - and
+        the marker is the only source once those rows have been pruned. Taking the
+        newer of the two is what stops either one from leaving the deadline measuring
+        a silence that has already ended. Both stamps come from ``core.models.iso``,
+        so they are fixed-width UTC strings and ``max`` compares them correctly.
+        """
+        stamps = [str(self.store.get_state(PRODUCTIVE_RUN_KEY) or "")]
+        last = self.store.last_verdict_run()
+        if last is not None:
+            stamps.append(str(last.get("finished_at") or last.get("started_at") or ""))
+        return max((stamp for stamp in stamps if stamp), default="") or None
 
     def _note_productivity(self, report: ScanReport) -> None:
         """Stamp the last run that put a verdict in the database.

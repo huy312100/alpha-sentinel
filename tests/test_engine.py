@@ -363,6 +363,45 @@ class TestCycle:
         assert store.get_state(PRODUCTIVE_RUN_KEY) == stamp
         assert store.get_state(UNPRODUCTIVE_SINCE_KEY) is None
 
+    async def test_a_marker_outrun_by_newer_history_is_reconciled(self, settings, store, make_verdict):
+        """A process on older code produces verdicts without touching the marker.
+
+        Left alone, the marker then measures a silence that ended hours ago and the
+        deadline can alarm on a bot that is working, so boot has to prefer whichever
+        source is newer rather than whichever was written last.
+        """
+        store.put_state(PRODUCTIVE_RUN_KEY, iso(utcnow() - timedelta(hours=200)))
+        run_id = store.start_run("scan")
+        fresh = iso(utcnow() - timedelta(hours=2))
+        store.finish_run(run_id, tokens_scanned=1, verdicts_written=1)
+        with sqlite3.connect(store.path) as conn:
+            conn.execute("UPDATE runs SET started_at = ?, finished_at = ? WHERE id = ?", (fresh, fresh, run_id))
+
+        engine = make_engine(settings, store, factory=make_verdict)
+        await engine.start()
+        await engine.close()
+
+        assert store.get_state(PRODUCTIVE_RUN_KEY) == fresh
+
+    async def test_a_fresher_marker_is_not_dragged_back_to_old_run_history(self, settings, store, make_verdict):
+        """The other direction: run rows pruned away must not shorten the marker.
+
+        Without both directions this is just a backfill, and the durable marker exists
+        precisely because the run table stops being the whole record.
+        """
+        store.put_state(PRODUCTIVE_RUN_KEY, iso(utcnow() - timedelta(hours=1)))
+        run_id = store.start_run("scan")
+        old = iso(utcnow() - timedelta(hours=300))
+        store.finish_run(run_id, tokens_scanned=1, verdicts_written=1)
+        with sqlite3.connect(store.path) as conn:
+            conn.execute("UPDATE runs SET started_at = ?, finished_at = ? WHERE id = ?", (old, old, run_id))
+
+        engine = make_engine(settings, store, factory=make_verdict)
+        await engine.start()
+        await engine.close()
+
+        assert store.get_state(PRODUCTIVE_RUN_KEY) != old
+
     async def test_cold_store_failure_is_swallowed(self, settings, store, make_verdict, monkeypatch):
         engine = make_engine(settings, store, factory=make_verdict)
 
