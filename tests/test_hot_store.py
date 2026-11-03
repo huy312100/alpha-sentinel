@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import timedelta
 
-from core.models import Severity, VerdictStatus, utcnow
+from core.models import Severity, VerdictStatus, iso, utcnow
 from storage.hot_store import HotStore
 from tests.conftest import OTHER_TOKEN, TOKEN
 
@@ -111,6 +111,64 @@ def test_run_lifecycle(store: HotStore):
     assert latest["tokens_scanned"] == 3
     assert latest["duration_ms"] >= 0.0
     assert len(store.recent_runs()) == 1
+
+
+def _pin_run_times(store: HotStore, ages: dict[str, timedelta]) -> None:
+    """Stamp runs at chosen ages.
+
+    Run stamps are second-precision, so two runs created inside one test share a
+    stamp and any ordering assertion would depend on the clock instead of the query.
+    """
+    with sqlite3.connect(store.path) as conn:
+        for run_id, age in ages.items():
+            stamp = iso(utcnow() - age)
+            conn.execute("UPDATE runs SET started_at = ?, finished_at = ? WHERE id = ?", (stamp, stamp, run_id))
+
+
+def test_last_verdict_run_skips_the_cycles_that_produced_nothing(store: HotStore):
+    """Work-freshness is a different question from loop-freshness.
+
+    The health check needs the age of the last run that wrote a verdict, because a
+    daemon on a long cooldown finishes empty cycles continuously and `latest_run`
+    would report it as brand new work.
+    """
+    productive = store.start_run("scan")
+    store.finish_run(productive, tokens_scanned=2, verdicts_written=3)
+    empty = store.start_run("scan")
+    store.finish_run(empty, tokens_scanned=0, verdicts_written=0)
+    _pin_run_times(store, {productive: timedelta(hours=2), empty: timedelta(0)})
+
+    assert store.latest_run()["id"] == empty
+    assert store.last_verdict_run()["id"] == productive
+    assert store.last_verdict_run()["verdicts_written"] == 3
+
+
+def test_runs_stamped_in_the_same_second_still_order_by_insertion(store: HotStore):
+    """Second-precision stamps tie, so the query needs its own tie-break.
+
+    Both rows have to be eligible: an empty second row would drop out of the
+    `verdicts_written > 0` filter and leave the secondary key with nothing to
+    resolve, which is how a tie-break test can pass while proving nothing.
+    """
+    first = store.start_run("scan")
+    store.finish_run(first, tokens_scanned=1, verdicts_written=1)
+    second = store.start_run("scan")
+    store.finish_run(second, tokens_scanned=1, verdicts_written=2)
+    stamp = iso(utcnow() - timedelta(hours=1))  # identical for both rows, on purpose
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            "UPDATE runs SET started_at = ?, finished_at = ? WHERE id IN (?, ?)",
+            (stamp, stamp, first, second),
+        )
+
+    assert store.last_verdict_run()["id"] == second
+
+
+def test_last_verdict_run_is_none_before_any_work_happens(store: HotStore):
+    run_id = store.start_run("scan")
+    store.finish_run(run_id, tokens_scanned=0, verdicts_written=0)
+
+    assert store.last_verdict_run() is None
 
 
 def test_stale_runs_are_abandoned(store: HotStore):

@@ -47,6 +47,14 @@ LLM_SPEND_KEY = "llm_spend_usd"
 #: Written when the engine starts so ``--health`` can tell a booting daemon from
 #: a stalled one (a fresh process legitimately has no finished cycle yet).
 BOOT_STATE_KEY = "bot_booted_at"
+#: When the last verdict actually landed, and when the current silence began. These
+#: live in `kv` rather than in `runs` or in the boot marker, because both of those
+#: reset on their own initiative: maintenance prunes run rows, so a verdict window
+#: longer than retention loses the evidence entirely, and every restart rewrites the
+#: boot marker - including the restarts a watchdog takes *because* health said
+#: unhealthy, which would hand a stalled bot a fresh deadline each time.
+PRODUCTIVE_RUN_KEY = "bot_last_productive_run_at"
+UNPRODUCTIVE_SINCE_KEY = "bot_unproductive_since"
 
 
 def day_spend_key(moment: Any | None = None) -> str:
@@ -104,6 +112,15 @@ class ScanReport:
     rejected: int = 0
     vetoed: int = 0
     errors: int = 0
+    #: Verdicts that actually reached the hot store. `verdicts` is a property over what
+    #: the pipeline *produced*, so a failed write still counts it, and `verdicts_written`
+    #: is the column `--health` measures productivity against. The two cannot share one
+    #: number: a total storage outage would look like a fully productive daemon.
+    persisted: int = 0
+    #: Persist failures, kept out of `errors` on purpose - storage blipping must not
+    #: kill a cycle or withhold a verdict - but they still make a run `partial`,
+    #: because nothing else records the loss anywhere an operator can see it.
+    persist_errors: int = 0
     alerts_sent: int = 0
     #: USD spent on this cycle's LLM calls. Reported even for dry runs, because a
     #: dry run still pays the provider - it only skips persistence.
@@ -136,6 +153,8 @@ class ScanReport:
             "verdicts": self.verdicts,
             "by_status": self.verdicts_by_status(),
             "errors": self.errors,
+            "persisted": self.persisted,
+            "persist_errors": self.persist_errors,
             "alerts_sent": self.alerts_sent,
             "llm_spend_usd": round(self.llm_spend_usd, 6),
             "dry_run": self.dry_run,
@@ -382,7 +401,7 @@ class ScanEngine:
                     report.results.append(result)
 
                     if not dry_run:
-                        self._persist_verdict(verdict)
+                        self._persist_verdict(report, verdict)
                         if self.settings.ml.write_training_rows:
                             self._collect_training_row(training, snapshot_result, result.outcome)
                         if result.outcome.degraded:
@@ -435,15 +454,25 @@ class ScanEngine:
         else:
             report.vetoed += 1
 
-    def _persist_verdict(self, verdict: FinalVerdict) -> None:
+    def _persist_verdict(self, report: ScanReport, verdict: FinalVerdict) -> None:
+        """Write the verdict, and count only what was actually written.
+
+        A failure is logged and tallied separately instead of raising: the cycle must
+        survive storage blipping, and the verdict has already been computed and
+        counted. But `report.persisted` is what reaches the run row's
+        `verdicts_written`, so it cannot simply mirror the verdicts produced.
+        """
         try:
             self.store.record_verdict(verdict)
             self.store.mark_seen(verdict.token_address, verdict.chain, asset_class=verdict.asset_class)
         except Exception as exc:  # noqa: BLE001 - storage hiccups must not kill the cycle
+            report.persist_errors += 1
             log.error(
                 "verdict_persist_failed",
                 extra={"token": verdict.token_address, "error": f"{type(exc).__name__}: {str(exc)[:200]}"},
             )
+        else:
+            report.persisted += 1
 
     @staticmethod
     def _signal_rows(collected: CollectedSnapshot) -> list[dict[str, Any]]:
@@ -536,23 +565,30 @@ class ScanEngine:
             )
 
     def _finish_run(self, report: ScanReport) -> None:
+        # Cooldown skips are the schedule working, not a deficiency. `select_targets`
+        # only ever marks a token skipped for cooldown, so with a 6-hour cooldown and
+        # a 5-minute interval nearly every cycle has them - and counting them here
+        # made `partial` the permanent status of a healthy daemon. A run where three
+        # providers genuinely failed then looked identical to one where nothing was
+        # due, which is the one thing the run history exists to distinguish.
         status = "completed"
         if report.errors and not report.verdicts:
             status = "failed"
-        elif report.errors or report.skipped:
+        elif report.errors or report.persist_errors:
             status = "partial"
         try:
             self.store.finish_run(
                 report.run_id,
                 status=status,
                 tokens_scanned=report.collected,
-                verdicts_written=report.verdicts,
+                verdicts_written=report.persisted,
                 approved=report.approved,
                 vetoed=report.vetoed,
                 errors=report.errors,
             )
         except Exception as exc:  # noqa: BLE001 - bookkeeping
             log.error("run_finish_failed", extra={"run_id": report.run_id, "error": str(exc)[:200]})
+        self._note_productivity(report)
 
     # -- spend ceilings -----------------------------------------------------
     def _mark_booted(self) -> None:
@@ -560,11 +596,47 @@ class ScanEngine:
 
         A bot that just came up legitimately has no finished cycle yet; without
         this marker ``--health`` could not tell "booting" from "wedged".
+
+        The silence clock is deliberately not restarted here. A process that has been
+        producing nothing for four days must still look four days silent after a
+        restart, or the watchdog that restarts an unhealthy bot would keep erasing
+        the evidence it is acting on. Only a store that has never produced anything
+        starts its count now, which is the genuine-new-install grace.
         """
+        now = iso(utcnow())
         try:
-            self.store.put_state(BOOT_STATE_KEY, iso(utcnow()))
+            self.store.put_state(BOOT_STATE_KEY, now)
+            if self.store.get_state(PRODUCTIVE_RUN_KEY) is None:
+                # A store that predates this marker still knows when it last produced
+                # something. Backfill it instead of starting the deadline now, which
+                # would under-report a silence already underway - and once retention
+                # prunes the run rows there would be nothing left to recover it from.
+                last = self.store.last_verdict_run()
+                landed = str(last.get("finished_at") or last.get("started_at") or "") if last else ""
+                if landed:
+                    self.store.put_state(PRODUCTIVE_RUN_KEY, landed)
+                elif self.store.get_state(UNPRODUCTIVE_SINCE_KEY) is None:
+                    self.store.put_state(UNPRODUCTIVE_SINCE_KEY, now)
         except Exception as exc:  # noqa: BLE001 - diagnostic only, never fatal
             log.warning("boot_marker_failed", extra={"error": str(exc)[:200]})
+
+    def _note_productivity(self, report: ScanReport) -> None:
+        """Stamp the last run that put a verdict in the database.
+
+        Counted from ``report.persisted`` rather than ``report.verdicts`` for the same
+        reason the run row does: a verdict produced but not written is not work the
+        bot accomplished.
+        """
+        if not report.persisted or report.dry_run:
+            return
+        try:
+            self.store.put_state(PRODUCTIVE_RUN_KEY, iso(utcnow()))
+            self.store.delete_state(UNPRODUCTIVE_SINCE_KEY)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping, never fatal
+            log.error(
+                "productivity_note_failed",
+                extra={"error": f"{type(exc).__name__}: {str(exc)[:200]}"},
+            )
 
     def _day_spend_usd(self) -> float:
         """Today's ledgered spend, or ``0.0`` when it cannot be read.

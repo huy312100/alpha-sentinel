@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 
 from ai_engine.dual_audit_flow import AuditOutcome
 from bot.alerts import AlertResult
-from bot.engine import ScanEngine
+from bot.engine import PRODUCTIVE_RUN_KEY, UNPRODUCTIVE_SINCE_KEY, ScanEngine
 from bot.watchlist import WatchToken
-from core.models import VerdictStatus, utcnow
+from core.models import VerdictStatus, iso, utcnow
 from core.scoring import Decision
 from scanners.pipeline import CollectedSnapshot
 from storage.parquet_store import StorageError
@@ -295,6 +297,71 @@ class TestCycle:
         assert report.verdicts == 1
         assert report.errors == 0
         assert store.count_verdicts() == 0
+        # The run row must not claim work that never landed: `verdicts_written` is the
+        # column `--health` measures productivity against, and a verdict produced but
+        # not persisted would keep a storage outage looking productive forever.
+        assert report.persisted == 0
+        assert report.persist_errors == 1
+        run = store.latest_run()
+        assert run["verdicts_written"] == 0
+        assert run["status"] == "partial"
+        # The durable productivity marker must not be stamped either: it is what
+        # `--health` measures against, and a verdict that never landed is not
+        # production no matter how the cycle finished.
+        assert store.get_state(PRODUCTIVE_RUN_KEY) is None
+
+    async def test_a_written_verdict_is_counted_as_productive(self, settings, store, make_verdict):
+        """The healthy path must still record production, not just the failure path."""
+        engine = make_engine(settings, store, factory=make_verdict)
+        await engine.start()
+        try:
+            report = await engine.run_cycle(tokens=[token()])
+        finally:
+            await engine.close()
+
+        assert report.persisted == report.verdicts == 1
+        assert report.persist_errors == 0
+        run = store.latest_run()
+        assert run["verdicts_written"] == 1
+        assert run["status"] == "completed"
+        # Productivity is recorded durably as well as in the run row, because the run
+        # table is pruned and the boot marker is rewritten by every restart.
+        assert store.get_state(PRODUCTIVE_RUN_KEY) is not None
+        assert store.get_state(UNPRODUCTIVE_SINCE_KEY) is None
+
+    async def test_a_restart_keeps_the_silence_it_inherited(self, settings, store, make_verdict):
+        """Starting again must not erase how long the bot has been producing nothing.
+
+        The supervisor restarts precisely the bots that look unhealthy, so a start
+        that reset the silence clock would keep extending the deadline it missed.
+        """
+        silence = iso(utcnow() - timedelta(hours=200))
+        store.put_state(UNPRODUCTIVE_SINCE_KEY, silence)
+        engine = make_engine(settings, store, factory=make_verdict)
+        await engine.start()
+        await engine.close()
+
+        assert store.get_state(UNPRODUCTIVE_SINCE_KEY) == silence
+
+    async def test_an_upgraded_store_does_not_get_a_fresh_deadline(self, settings, store, make_verdict):
+        """Backfill the productive marker from history the engine can still see.
+
+        A store upgraded into this marker would otherwise start counting silence from
+        the upgrade, while the verdict history that proves it was productive ages out
+        of `runs` entirely - and the deadline would then have nothing left to correct it.
+        """
+        run_id = store.start_run("scan")
+        stamp = iso(utcnow() - timedelta(hours=200))
+        store.finish_run(run_id, tokens_scanned=1, verdicts_written=1)
+        with sqlite3.connect(store.path) as conn:
+            conn.execute("UPDATE runs SET started_at = ?, finished_at = ? WHERE id = ?", (stamp, stamp, run_id))
+
+        engine = make_engine(settings, store, factory=make_verdict)
+        await engine.start()
+        await engine.close()
+
+        assert store.get_state(PRODUCTIVE_RUN_KEY) == stamp
+        assert store.get_state(UNPRODUCTIVE_SINCE_KEY) is None
 
     async def test_cold_store_failure_is_swallowed(self, settings, store, make_verdict, monkeypatch):
         engine = make_engine(settings, store, factory=make_verdict)
@@ -350,6 +417,34 @@ class TestTargetSelection:
         assert second.results[0].skip_reason == "cooldown"
         assert second.results[0].skipped is True
         assert len(pipeline.calls) == 1
+
+    async def test_a_cycle_where_everything_is_cooling_down_is_completed(
+        self, settings, store, make_verdict, watchlist_file
+    ):
+        """`partial` has to mean something, and the schedule is not it.
+
+        With a 6-hour cooldown and a 5-minute interval, nearly every cycle of a
+        healthy daemon is this one: nothing due, nothing collected, nothing wrong.
+        Counting those skips as a deficiency made `partial` the permanent status of
+        a working bot, so the runs where a provider genuinely failed were
+        indistinguishable from the runs where nothing was scheduled.
+        """
+        engine = make_engine(settings, store, factory=make_verdict)
+        await engine.start()
+        try:
+            await engine.run_cycle(limit=1)
+            cooling = await engine.run_cycle(limit=1)
+        finally:
+            await engine.close()
+
+        assert cooling.skipped == 1
+        assert cooling.errors == 0
+        # Read this cycle's own run row rather than `latest_run()`: run stamps are
+        # second-precision, so two cycles in the same second tie and the ordering
+        # says nothing about which one you meant.
+        run = next(row for row in store.recent_runs(limit=5) if row["id"] == cooling.run_id)
+        assert run["status"] == "completed"
+        assert run["errors"] == 0
 
     async def test_force_bypasses_cooldown(self, settings, store, make_verdict, watchlist_file):
         pipeline = FakePipeline()

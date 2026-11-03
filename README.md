@@ -635,6 +635,20 @@ mode plus a file-sync daemon is how you end up restoring a conflict copy.
   `LOG_JSON` are read from the environment unless `--log-level` / `--json-logs` is passed,
   which pin the value for that invocation; a typo in `LOG_LEVEL` falls back to `INFO`
   rather than stopping the service.
+* `SCAN_INTERVAL_SECONDS` and the cooldown are not the same knob: the interval only decides
+  how often due-ness is re-checked, while `cooldown_hours` per watchlist entry decides how
+  often an instrument is actually scanned. Setting the interval far below the cooldown fills
+  the run history with cycles that scanned nothing.
+* `--health` bounds both halves of that. The cycle window (`max(3 x SCAN_INTERVAL_SECONDS,
+  1800)`) says the loop is turning; `HEALTH_MAX_STALE_VERDICT_SECONDS` (two days, `0` to
+  disable) says the loop is producing. Without the second, a daemon whose instruments are
+  all cooling down stays green indefinitely. The evidence for it is kept in the `kv` table,
+  not in `runs` and not in the boot marker: maintenance prunes run rows, and a restart
+  rewrites the boot marker — including the restart a watchdog takes because health said
+  unhealthy, which would otherwise hand a stalled bot a fresh deadline every time.
+  Reasons to look for: `verdicts_stale`, `never_productive`. Restart-on-unhealthy is
+  opt-in: `WATCHDOG_MODE=off` by default, because the probes run inside the healthcheck
+  itself.
 
 ---
 

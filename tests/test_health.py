@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 import bot.main as bot_main
-from bot.engine import BOOT_STATE_KEY, ScanEngine
+from bot.engine import BOOT_STATE_KEY, PRODUCTIVE_RUN_KEY, UNPRODUCTIVE_SINCE_KEY, ScanEngine
 from bot.health import MIN_STALE_SECONDS, evaluate, stale_window_seconds
 from core.models import iso, utcnow
 from storage.hot_store import HotStore
@@ -170,6 +170,7 @@ def test_the_report_is_machine_readable(store, settings):
     assert payload["healthy"] is True
     assert payload["window_seconds"] == MIN_STALE_SECONDS
     assert payload["last_run_status"] == "completed"
+    assert payload["bound"] == "cycle"
     assert json.dumps(payload)  # must be serialisable for --health --json
 
 
@@ -232,3 +233,141 @@ def test_the_health_flag_speaks_json_for_alerting(cli_env, capsys):
     payload = json.loads(out[out.index("{") :])  # logs share stdout with the report
     assert payload["healthy"] is True
     assert payload["reason"] == "no_runs_yet"
+
+
+# -- the second bound: producing, not merely running -----------------------------
+
+
+def add_run(store: HotStore, *, verdicts: int, hours_ago: float) -> str:
+    """A finished run stamped at a chosen time, so freshness can be dialled in."""
+    run_id = store.start_run("scan")
+    store.finish_run(run_id, tokens_scanned=1 if verdicts else 0, verdicts_written=verdicts)
+    stamp = iso(utcnow() - timedelta(hours=hours_ago))
+    with sqlite3.connect(store.path) as conn:
+        conn.execute("UPDATE runs SET started_at = ?, finished_at = ? WHERE id = ?", (stamp, stamp, run_id))
+    return run_id
+
+
+def test_a_scheduler_that_produces_nothing_is_reported_stale(store, settings):
+    """The failure a cycle-freshness check cannot see.
+
+    A 6-hour cooldown makes empty cycles normal, so a daemon can keep finishing
+    them for a week and stay green while writing no verdict at all. The loop is
+    fine; the work is not, and only a bound on the last productive run says so.
+    """
+    add_run(store, verdicts=1, hours_ago=200)
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow() - timedelta(hours=200)))
+
+    report = evaluate(store, settings)
+
+    assert report.healthy is False
+    assert report.reason == "verdicts_stale"
+
+
+def test_a_fresh_volume_is_not_failed_for_having_produced_nothing_yet(store, settings):
+    """Same discipline as the cycle check: a new install must not flap the container."""
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow()))
+
+    assert evaluate(store, settings).healthy is True
+
+
+def test_a_silence_older_than_the_window_is_a_stall(store, settings):
+    """Cycles keep finishing, so only the silence anchor says how long this has lasted."""
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow() - timedelta(hours=200)))
+
+    report = evaluate(store, settings)
+
+    assert report.healthy is False
+    assert report.reason == "never_productive"
+
+
+def test_a_restart_does_not_extend_the_silence(store, settings):
+    """A watchdog restarts an unhealthy bot; that must not buy it a fresh deadline.
+
+    The boot marker is rewritten on every start, so silence measured from it resets
+    each time the supervisor acts on a stall - a bot restarted more often than the
+    window would stay green forever while producing nothing.
+    """
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow()))  # this process is minutes old
+    store.put_state(UNPRODUCTIVE_SINCE_KEY, iso(utcnow() - timedelta(hours=200)))  # the silence is not
+
+    report = evaluate(store, settings)
+
+    assert report.healthy is False
+    assert report.reason == "never_productive"
+
+
+def test_pruned_run_history_does_not_reset_the_productivity_clock(store, settings):
+    """Retention prunes `runs`, and the verdict window may be longer than retention.
+
+    Without durable evidence the check would lose the last productive run, fall back
+    to a younger number, and report a long-stalled bot as healthy again.
+    """
+    productive = add_run(store, verdicts=1, hours_ago=200)
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(PRODUCTIVE_RUN_KEY, iso(utcnow() - timedelta(hours=200)))
+    with sqlite3.connect(store.path) as conn:  # what maintenance would eventually do
+        conn.execute("DELETE FROM runs WHERE id = ?", (productive,))
+
+    report = evaluate(store, settings)
+
+    assert report.healthy is False
+    assert report.reason == "verdicts_stale"
+    assert report.verdict_run_at  # the evidence came from kv, not from a run row
+
+
+def test_the_verdict_bound_can_be_switched_off(store, settings):
+    """An operator whose cooldowns outlast the default window gets to opt out."""
+    disabled = replace(settings, scanners=replace(settings.scanners, health_max_stale_verdict_seconds=0))
+    add_run(store, verdicts=1, hours_ago=900)
+    add_run(store, verdicts=0, hours_ago=0)
+
+    assert evaluate(store, disabled).healthy is True
+
+
+def test_the_stale_verdict_report_names_the_bound_that_fired(store, settings):
+    """Two windows now measure two different runs, so the output has to say which.
+
+    Printing the verdict window next to the newest cycle's age reads as if nothing is
+    wrong - 172800s against 240s looks enormously slack - while the run that actually
+    tripped the check sits unreported. The age has to belong to the bound that fired.
+    """
+    add_run(store, verdicts=1, hours_ago=200)
+    add_run(store, verdicts=0, hours_ago=0)
+
+    report = evaluate(store, settings)
+
+    assert report.bound == "verdict"
+    assert report.verdict_run_at is not None
+    assert report.verdict_run_at != report.last_run_at  # the fresh cycle is not the stale one
+    line = report.format()
+    assert "(verdict)" in line
+    assert "last verdict:" in line
+    assert "last run: completed at" in line
+
+
+def test_the_boot_without_any_verdict_says_so_rather_than_printing_never_date(store, settings):
+    """`never_productive` has no verdict run to name, and must not invent one."""
+    add_run(store, verdicts=0, hours_ago=0)
+    store.put_state(BOOT_STATE_KEY, iso(utcnow() - timedelta(hours=200)))
+
+    report = evaluate(store, settings)
+
+    assert report.bound == "verdict"
+    assert report.verdict_run_at is None
+    assert "last verdict: never" in report.format()
+
+
+def test_an_unreadable_verdict_history_fails_open(store, settings, monkeypatch):
+    """One read error is not evidence that the pipeline has stalled."""
+
+    def boom() -> None:
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "last_verdict_run", boom)
+
+    assert evaluate(store, settings).healthy is True
