@@ -198,7 +198,6 @@ def configure_logging(level: str | None = None, json_output: bool | None = None,
     # Third-party noise control.
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("openai").setLevel(logging.WARNING)
     logging.getLogger("botocore").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     _CONFIGURED = True
