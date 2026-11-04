@@ -23,9 +23,11 @@ pyarrow==17.0.0              # Parquet engine (zstd + predicate pushdown)
 # No vendor SDK here on purpose: ai_engine/llm_client.py speaks the chat-completions
 # HTTP API over aiohttp, and the `openai` LLM_PROVIDER is a preset of base_url plus
 # model names - not the package. Adding an SDK would be a second transport nobody uses.
+#
+# httpx stays because `streamlit` requires it, not because any code here imports it.
+# Pinning it keeps the image byte-reproducible; deleting the line would not delete the
+# package, it would only let the resolver pick an unpinned version of it.
 httpx==0.28.1
-pydantic==2.14.2
-tqdm==4.70.1
 
 # --- Dashboard ---------------------------------------------------------------
 streamlit==1.66.1
@@ -36,7 +38,7 @@ python-dotenv==1.2.4
 PyYAML==6.0.3
 boto3==1.43.123               # S3-compatible client for Cloudflare R2
 botocore==1.43.123
-requests==2.34.2             # preflight / smoke-test tooling (scripts/)
+requests==2.34.2             # transitive requirement of streamlit + plotly + pytest
 
 # --- Test & lint (installed in CI and locally) -------------------------------
 pytest==9.2.0
