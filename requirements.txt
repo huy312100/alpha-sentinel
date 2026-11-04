@@ -20,14 +20,15 @@ pandas==2.3.3
 pyarrow==17.0.0              # Parquet engine (zstd + predicate pushdown)
 
 # --- AI engine (any OpenAI-compatible endpoint: DeepSeek/OpenAI/Claude/...) --
-# No vendor SDK here on purpose: ai_engine/llm_client.py speaks the chat-completions
-# HTTP API over aiohttp, and the `openai` LLM_PROVIDER is a preset of base_url plus
-# model names - not the package. Adding an SDK would be a second transport nobody uses.
+# No vendor SDK and no second HTTP stack here on purpose: ai_engine/llm_client.py
+# speaks the chat-completions API over aiohttp, and the `openai` LLM_PROVIDER is a
+# preset of base_url plus model names - not the package.
 #
-# httpx stays because `streamlit` requires it, not because any code here imports it.
-# Pinning it keeps the image byte-reproducible; deleting the line would not delete the
-# package, it would only let the resolver pick an unpinned version of it.
-httpx==0.28.1
+# `httpx` is deliberately absent, even though it is installed in dev venvs: the only
+# thing that ever pulled it was streamlit's optional `auth` extra, which this project
+# does not install - the dashboard gates itself with a password form
+# (dashboard/app.py:authentication_gate) - and streamlit 1.66.1 contains no
+# `import httpx` anywhere.
 
 # --- Dashboard ---------------------------------------------------------------
 streamlit==1.66.1
@@ -38,7 +39,7 @@ python-dotenv==1.2.4
 PyYAML==6.0.3
 boto3==1.43.123               # S3-compatible client for Cloudflare R2
 botocore==1.43.123
-requests==2.34.2             # transitive requirement of streamlit + plotly + pytest
+requests==2.34.2             # required by streamlit (plotly and pytest list it only under extras)
 
 # --- Test & lint (installed in CI and locally) -------------------------------
 pytest==9.2.0
