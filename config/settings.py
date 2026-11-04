@@ -335,6 +335,15 @@ class StorageSettings:
     #: longer than the operational window: deleting the training corpus is not
     #: recoverable, and nobody notices until the next training run.
     training_retention_days: int = 1095
+    #: Snapshot the hot store on this cadence from inside maintenance. Snapshots used to
+    #: exist only as a make target, so the newest copy was "however long ago someone last
+    #: remembered to run it" - measured in days on a machine that writes verdicts every
+    #: six hours. ``0`` leaves snapshots entirely to the operator or to cron.
+    backup_interval_seconds: int = 21_600
+    #: How many snapshots to keep. The constraint is not disk - a copy is a few hundred
+    #: kilobytes - it is having enough history to roll back past a bad deploy that ran
+    #: for a day before anyone noticed, which is the case a single copy cannot serve.
+    backup_keep: int = 7
     r2: R2Settings = R2Settings()
 
     def dataset_retention(self) -> dict[str, int]:
@@ -531,6 +540,13 @@ class Settings:
                 "HEALTH_MAX_STALE_VERDICT_SECONDS must be 0 (off) or >= 3600: below an hour "
                 "it fires on ordinary cooldowns instead of on a stalled pipeline"
             )
+        if 0 < self.storage.backup_interval_seconds < 600:
+            problems.append(
+                "BACKUP_INTERVAL_SECONDS must be 0 (snapshots left to the operator) or >= 600: "
+                "a sub-ten-minute cadence turns a maintenance loop into a snapshot generator"
+            )
+        if self.storage.backup_keep < 1:
+            problems.append("BACKUP_KEEP must be >= 1: 0 would delete every snapshot it takes")
         unknown_layers = [
             name
             for name in self.scanners.enabled_layers
@@ -578,6 +594,7 @@ class Settings:
             "scan_interval_seconds": self.scanners.scan_interval_seconds,
             "health_max_stale_seconds": self.scanners.health_max_stale_seconds,
             "health_max_stale_verdict_seconds": self.scanners.health_max_stale_verdict_seconds,
+            "backup_interval_seconds": self.storage.backup_interval_seconds,
             "llm_max_usd_per_cycle": self.llm.max_usd_per_cycle,
             "llm_max_usd_per_day": self.llm.max_usd_per_day,
             "alpha_predictor": self.ml.alpha_predictor,
@@ -651,6 +668,8 @@ class Settings:
             # unreachable from the only surface an operator has: the environment.
             local_retention_days=_env_int(env, "LOCAL_RETENTION_DAYS", 90, minimum=0),
             remote_retention_days=_env_int(env, "REMOTE_RETENTION_DAYS", 365, minimum=0),
+            backup_interval_seconds=_env_int(env, "BACKUP_INTERVAL_SECONDS", 21_600, minimum=0),
+            backup_keep=_env_int(env, "BACKUP_KEEP", 7, minimum=1),
             training_retention_days=_env_int(env, "TRAINING_RETENTION_DAYS", 1095, minimum=0),
             r2=r2,
         )

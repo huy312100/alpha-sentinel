@@ -3,18 +3,28 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
 from ai_engine.dual_audit_flow import AuditOutcome
 from bot.alerts import AlertResult
-from bot.engine import BOOT_STATE_KEY, PRODUCTIVE_RUN_KEY, UNPRODUCTIVE_SINCE_KEY, ScanEngine
+from bot.engine import (
+    BOOT_STATE_KEY,
+    LAST_BACKUP_KEY,
+    PRODUCTIVE_RUN_KEY,
+    UNPRODUCTIVE_SINCE_KEY,
+    ScanEngine,
+)
 from bot.watchlist import WatchToken
 from core.models import VerdictStatus, iso, utcnow
 from core.scoring import Decision
 from scanners.pipeline import CollectedSnapshot
+from storage import backup as hot_backup
+from storage.hot_store import SCHEMA_VERSION
 from storage.parquet_store import StorageError
 from tests.conftest import OTHER_TOKEN, TOKEN
 
@@ -557,3 +567,94 @@ class TestTargetSelection:
         assert report.requested == 1
         assert report.results[0].token.symbol == "WSOL"
         assert report.results[0].token.chain == "solana"
+
+
+class TestScheduledBackups:
+    """Maintenance takes the snapshot that makes a rollback more than a hope.
+
+    `make backup` was the only path to a copy, so the newest snapshot was a function of
+    someone remembering to run it. The two tables with no second copy anywhere else -
+    the scan schedule in `seen_tokens` and the spend ledger in `kv` - were unprotected
+    for exactly as long as nobody remembered, and the one on disk here was two days old
+    when this was found.
+    """
+
+    @staticmethod
+    def _snapshots(settings) -> list[Path]:
+        directory = Path(hot_backup.default_backup_dir(settings.storage.data_dir))
+        return sorted(directory.glob("*.db"))
+
+    def test_maintenance_snapshots_the_hot_store(self, settings, store):
+        engine = make_engine(settings, store)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup_error" not in result
+        assert len(self._snapshots(settings)) == 1
+        assert result["backup"]["schema_version"] == SCHEMA_VERSION
+        assert store.get_state(LAST_BACKUP_KEY) > 0
+
+    def test_the_cadence_is_honoured_within_one_process(self, settings, store):
+        engine = make_engine(settings, store)
+
+        engine.maintenance(force=True)
+        second = engine.maintenance(force=True)
+
+        assert "backup" not in second  # `force` means maintenance, not "snapshot again"
+        assert len(self._snapshots(settings)) == 1
+
+    def test_the_deadline_survives_a_restart(self, settings, store):
+        """A restarted daemon does not get to reset the backup clock.
+
+        The supervisor restarts exactly the services that are misbehaving, so a cadence
+        held in memory would be postponed by every restart - and an unhealthy loop could
+        keep running without ever producing a second copy.
+        """
+        make_engine(settings, store).maintenance(force=True)
+        marker = store.get_state(LAST_BACKUP_KEY)
+
+        result = make_engine(settings, store).maintenance(force=True)
+
+        assert "backup" not in result
+        assert store.get_state(LAST_BACKUP_KEY) == marker
+
+    def test_an_expired_deadline_is_taken_again(self, settings, store):
+        engine = make_engine(settings, store)
+        engine.maintenance(force=True)
+        store.put_state(LAST_BACKUP_KEY, time.time() - 99_999.0)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" in result
+        assert store.get_state(LAST_BACKUP_KEY) > 0
+
+    def test_the_cadence_can_be_switched_off(self, settings, store):
+        """`0` leaves snapshots to cron, and takes none itself."""
+        offline = replace(settings, storage=replace(settings.storage, backup_interval_seconds=0))
+
+        result = make_engine(offline, store).maintenance(force=True)
+
+        assert "backup" not in result
+        assert self._snapshots(offline) == []
+
+    def test_a_failed_snapshot_does_not_break_maintenance(self, settings, store, monkeypatch):
+        """Unprotected is not the same as broken.
+
+        Maintenance prunes and trims the lake before it snapshots; refusing to report
+        that work, or stopping the scanner, would turn a backup problem into an outage -
+        the trade this project has already refused for provider failures.
+        """
+
+        def boom(*args, **kwargs):
+            raise hot_backup.BackupError("disk full")
+
+        monkeypatch.setattr(hot_backup, "snapshot", boom)
+        engine = make_engine(settings, store)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup_error" in result
+        assert result["stale_runs"] == 0
+        assert "pruned" in result
+        assert self._snapshots(settings) == []
+        assert store.get_state(LAST_BACKUP_KEY, 0.0) == 0.0  # deadline not advanced

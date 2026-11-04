@@ -33,6 +33,7 @@ from core.logging import get_logger
 from core.models import FinalVerdict, VerdictStatus, iso, json_safe, utcnow
 from ml.dataset import training_row, write_training_rows
 from scanners.pipeline import CollectedSnapshot, ScanPipeline
+from storage import backup as hot_backup
 from storage.hot_store import HotStore
 from storage.parquet_store import ParquetStore, StorageError
 
@@ -55,6 +56,10 @@ BOOT_STATE_KEY = "bot_booted_at"
 #: unhealthy, which would hand a stalled bot a fresh deadline each time.
 PRODUCTIVE_RUN_KEY = "bot_last_productive_run_at"
 UNPRODUCTIVE_SINCE_KEY = "bot_unproductive_since"
+#: Epoch seconds of the last snapshot maintenance took. Kept in ``kv`` rather than in
+#: memory so that restarting a daemon cannot postpone the backup indefinitely - the
+#: supervisor restarts the service precisely when it is misbehaving.
+LAST_BACKUP_KEY = "bot_last_backup_at"
 
 
 def day_spend_key(moment: Any | None = None) -> str:
@@ -757,8 +762,60 @@ class ScanEngine:
                 result["remote_partitions_removed"] = self.cold.apply_remote_retention()
         except (StorageError, OSError, ValueError) as exc:
             result["cold_error"] = str(exc)[:200]
+        self._maybe_backup(result)
         log.info("maintenance_finished", extra=result)
         return result
+
+    def _maybe_backup(self, result: dict[str, Any]) -> None:
+        """Snapshot the hot store when its own cadence says so.
+
+        Snapshots used to exist only as a make target, which made the newest copy
+        "however long ago someone last remembered". The consequence is concrete: the two
+        tables with no second copy anywhere else - the scan schedule in ``seen_tokens``
+        and the spend ledger in ``kv`` - were one disk failure away from being rebuilt by
+        re-scanning, and a rollback had whatever stale file happened to be on disk. This
+        is the difference between a rehearsed restore and a hope.
+
+        A failure is recorded, never raised. The store still works when a snapshot fails;
+        it is merely unprotected, and stopping the scanner would trade a backup problem
+        for an outage.
+        """
+        interval = int(self.settings.storage.backup_interval_seconds or 0)
+        if interval <= 0:
+            return
+        try:
+            last = float(self.store.get_state(LAST_BACKUP_KEY, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if last and (time.time() - last) < interval:
+            return
+
+        directory = hot_backup.default_backup_dir(self.settings.storage.data_dir)
+        try:
+            taken = hot_backup.snapshot(self.settings.storage.hot_db_path, directory / hot_backup.backup_name())
+        except Exception as exc:  # noqa: BLE001 - unprotected is not the same as broken
+            result["backup_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            log.error("backup_failed", extra={"error": result["backup_error"]})
+            return
+
+        remote_key = None
+        pruned = []
+        try:
+            # The snapshot is already on disk and verified, so an upload or retention
+            # problem cannot invalidate it - record it and move on.
+            remote_key = hot_backup.upload(taken, self.settings.storage.r2)
+            pruned = hot_backup.prune(directory, keep=self.settings.storage.backup_keep)
+        except Exception as exc:  # noqa: BLE001 - the local copy stands regardless
+            result["backup_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+        self.store.put_state(LAST_BACKUP_KEY, time.time())
+        result["backup"] = {
+            "name": taken.path.name,
+            "rows": taken.rows,
+            "schema_version": taken.schema_version,
+            "remote_key": remote_key,
+            "pruned": len(pruned),
+        }
 
     # -- daemon -------------------------------------------------------------
     async def run_forever(
