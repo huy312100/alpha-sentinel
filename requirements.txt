@@ -20,7 +20,9 @@ pandas==2.3.3
 pyarrow==17.0.0              # Parquet engine (zstd + predicate pushdown)
 
 # --- AI engine (any OpenAI-compatible endpoint: DeepSeek/OpenAI/Claude/...) --
-openai==3.41.0
+# No vendor SDK here on purpose: ai_engine/llm_client.py speaks the chat-completions
+# HTTP API over aiohttp, and the `openai` LLM_PROVIDER is a preset of base_url plus
+# model names - not the package. Adding an SDK would be a second transport nobody uses.
 httpx==0.28.1
 pydantic==2.14.2
 tqdm==4.70.1
