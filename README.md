@@ -477,7 +477,10 @@ rather than in memory, so restarting the bot cannot postpone it - which matters 
 supervisor restarts precisely the service that is misbehaving. A failed snapshot is
 recorded in the maintenance result and never stops a cycle: an unprotected store still
 works, and taking the scanner down over a backup problem would trade one outage for
-another.
+another. `--maintenance --dry-run` takes no snapshot and moves no deadline, and a failed
+upload or a file retention could not delete is reported (`upload_error` in the JSON from
+`--backup`, `backup_error` in the maintenance result) rather than looking like "no
+off-site copy was wanted".
 
 `make backup` remains for an explicit copy before a risky operation. Cron is still the
 right shape when something other than the bot should own the schedule - set
@@ -493,7 +496,7 @@ paths match:
 ## Tests
 
 ```bash
-make test                                   # 777 tests
+make test                                   # 783 tests
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
