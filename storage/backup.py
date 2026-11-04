@@ -312,16 +312,33 @@ def rehearse(path: str | Path) -> Rehearsal:
     return report
 
 
+def snapshots_in(directory: str | Path) -> list[Path]:
+    """The snapshots a folder holds, oldest name first.
+
+    One definition, because retention has to count exactly what it deletes. A caller
+    that globs differently from :func:`prune` can report "nothing to remove" about a
+    folder that is quietly growing.
+    """
+    folder = Path(directory).expanduser().resolve()
+    if not folder.is_dir():
+        return []
+    return sorted(folder.glob(f"{BACKUP_PREFIX}-*{BACKUP_SUFFIX}"))
+
+
 def prune(directory: str | Path, *, keep: int = DEFAULT_KEEP) -> list[Path]:
     """Delete all but the newest ``keep`` snapshots; returns what was removed.
 
     ``keep <= 0`` is treated as "remove nothing" rather than "remove everything":
     a typo in a cron flag must not be able to destroy the only remaining copies.
+
+    A file that cannot be deleted is logged and left out of the return value, so a
+    caller that cares whether retention actually worked compares `snapshots_in` with
+    what it asked to keep.
     """
     folder = Path(directory).expanduser().resolve()
-    if keep <= 0 or not folder.is_dir():
+    if keep <= 0:
         return []
-    snapshots = sorted(folder.glob(f"{BACKUP_PREFIX}-*{BACKUP_SUFFIX}"))
+    snapshots = snapshots_in(folder)
     removed: list[Path] = []
     for path in snapshots[:-keep] if len(snapshots) > keep else []:
         try:
@@ -338,16 +355,32 @@ def prune(directory: str | Path, *, keep: int = DEFAULT_KEEP) -> list[Path]:
     return removed
 
 
-def upload(taken: Snapshot, r2: R2Settings, *, overwrite: bool = False) -> str | None:
-    """Copy a snapshot to S3-compatible storage; returns the key, or ``None``.
+@dataclass(frozen=True)
+class UploadOutcome:
+    """Whether the off-site copy landed - and what happened if it did not.
 
-    Best-effort by design: the local file is the product, so a failed upload must
-    not fail the job that produced it or delete a good snapshot. It is logged at
-    warning level instead, because a backup routine that silently stops uploading
-    is indistinguishable from no backup routine at all.
+    This used to be ``str | None``, where ``None`` meant both "R2 is not configured,
+    nothing was attempted" and "the upload failed". Those are different facts, and the
+    second one is the whole reason an off-site copy exists: a backup routine that
+    quietly stops uploading is indistinguishable from no backup routine at all.
+    """
+
+    attempted: bool = False
+    key: str | None = None
+    error: str | None = None
+
+
+def upload(taken: Snapshot, r2: R2Settings, *, overwrite: bool = False) -> UploadOutcome:
+    """Copy a snapshot to S3-compatible storage and report which of the three
+    outcomes happened: not attempted, uploaded, or attempted and failed.
+
+    Best-effort by design - the local file is the product, so a failed upload must not
+    fail the job that produced it or delete a good snapshot - but "best effort" is a
+    promise about not raising, not a licence to be unreportable. Callers decide what to
+    do with ``error``; the daemon records it in its maintenance result.
     """
     if not r2.is_configured():
-        return None
+        return UploadOutcome()
     prefix = (r2.prefix or "").strip("/")
     key = "/".join(part for part in (prefix, REMOTE_FOLDER, taken.path.name) if part)
     try:
@@ -363,22 +396,22 @@ def upload(taken: Snapshot, r2: R2Settings, *, overwrite: bool = False) -> str |
         if not overwrite:
             # upload_file has no "create only" mode, and a snapshot name carries a
             # second-resolution timestamp: a second run in the same second would
-            # silently replace the first, so the collision is checked explicitly.
+            # silently replace the first, so the collision is checked explicitly. A
+            # collision means the copy is already off-site, which is success, not an
+            # error - the object under that key is this snapshot under this name.
             try:
                 client.head_object(Bucket=r2.bucket, Key=key)
-                log.warning("backup_upload_exists", extra={"key": key})
-                return None
+                log.info("backup_upload_exists", extra={"key": key})
+                return UploadOutcome(attempted=True, key=key)
             except Exception:  # noqa: BLE001 - a missing key is the expected path
                 pass
         client.upload_file(str(taken.path), r2.bucket, key, ExtraArgs=extra)
     except Exception as exc:  # noqa: BLE001 - boto3 raises ClientError / NoCredentialsError / ImportError
-        log.warning(
-            "backup_upload_failed",
-            extra={"key": key, "error": f"{type(exc).__name__}: {str(exc)[:300]}"},
-        )
-        return None
+        message = f"{type(exc).__name__}: {str(exc)[:300]}"
+        log.warning("backup_upload_failed", extra={"key": key, "error": message})
+        return UploadOutcome(attempted=True, error=message)
     log.info("backup_uploaded", extra={"key": key, "bucket": r2.bucket})
-    return key
+    return UploadOutcome(attempted=True, key=key)
 
 
 __all__ = [
@@ -388,6 +421,7 @@ __all__ = [
     "BackupError",
     "Rehearsal",
     "Snapshot",
+    "UploadOutcome",
     "backup_name",
     "default_backup_dir",
     "inspect",
@@ -395,6 +429,7 @@ __all__ = [
     "prune",
     "rehearse",
     "snapshot",
+    "snapshots_in",
     "table_counts",
     "upload",
 ]

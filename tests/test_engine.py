@@ -24,6 +24,7 @@ from core.models import VerdictStatus, iso, utcnow
 from core.scoring import Decision
 from scanners.pipeline import CollectedSnapshot
 from storage import backup as hot_backup
+from storage.backup import UploadOutcome
 from storage.hot_store import SCHEMA_VERSION
 from storage.parquet_store import StorageError
 from tests.conftest import OTHER_TOKEN, TOKEN
@@ -636,6 +637,78 @@ class TestScheduledBackups:
 
         assert "backup" not in result
         assert self._snapshots(offline) == []
+
+    def test_a_dry_run_takes_no_snapshot_and_moves_no_deadline(self, settings, store):
+        """`--maintenance --dry-run` is a rehearsal, and a rehearsal persists nothing.
+
+        Without this guard a dry run would copy the store, offer it to R2, and advance
+        the backup deadline - after which the real schedule waits a full interval for a
+        snapshot that was never meant to count.
+        """
+        engine = make_engine(settings, store, dry_run=True)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" not in result
+        assert self._snapshots(settings) == []
+        assert store.get_state(LAST_BACKUP_KEY, 0.0) == 0.0
+
+    def test_a_failed_upload_is_reported_without_losing_the_snapshot(self, settings, store, monkeypatch):
+        """The local copy is the product; the off-site mirror still has to be honest.
+
+        `upload` used to return ``None`` for both "not configured" and "failed", so a
+        daemon with broken credentials looked exactly like one that never had R2.
+        """
+        monkeypatch.setattr(
+            hot_backup, "upload", lambda taken, r2, **kw: UploadOutcome(attempted=True, error="boom")
+        )
+        engine = make_engine(settings, store)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" in result and result["backup"]["remote_key"] is None
+        assert "upload: boom" in result["backup_error"]
+        assert len(self._snapshots(settings)) == 1  # the local copy stands
+        assert store.get_state(LAST_BACKUP_KEY) > 0  # and the deadline advanced
+
+    def test_retention_that_cannot_delete_is_reported(self, settings, store, monkeypatch):
+        """`prune` skips a file it cannot delete, so its return value cannot be trusted.
+
+        Disk creep on a machine sized around free space is the failure this whole
+        feature is meant to avoid, so the folder is counted rather than believed.
+        """
+        stale = Path(hot_backup.default_backup_dir(settings.storage.data_dir)) / "alpha_sentinel-20260101T000000Z.db"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"x")
+        monkeypatch.setattr(hot_backup, "prune", lambda directory, *, keep: [])
+        tight = replace(settings, storage=replace(settings.storage, backup_keep=1))
+
+        result = make_engine(tight, store).maintenance(force=True)
+
+        assert "retention:" in result["backup_error"]
+        assert result["backup"]["pruned"] == 0
+
+    def test_a_kv_failure_after_a_good_snapshot_does_not_break_maintenance(self, settings, store, monkeypatch):
+        """The snapshot is already safe on disk; a counter must not undo that.
+
+        Writing the deadline is the last step, and a locked `kv` row there would
+        otherwise escape the method and abort maintenance - losing the report of work
+        that genuinely happened. The deadline is deliberately left unadvanced so the
+        next pass retries, rather than trusting a snapshot nobody recorded.
+        """
+        engine = make_engine(settings, store)
+
+        def refuse(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(store, "put_state", refuse)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" not in result
+        assert "database is locked" in result["backup_error"]
+        assert len(self._snapshots(settings)) == 1  # the copy still exists
+        assert result["stale_runs"] == 0  # and maintenance still reported normally
 
     def test_a_failed_snapshot_does_not_break_maintenance(self, settings, store, monkeypatch):
         """Unprotected is not the same as broken.

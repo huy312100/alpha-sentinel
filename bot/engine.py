@@ -779,9 +779,13 @@ class ScanEngine:
         A failure is recorded, never raised. The store still works when a snapshot fails;
         it is merely unprotected, and stopping the scanner would trade a backup problem
         for an outage.
+
+        Dry runs are excluded. `--maintenance --dry-run` would otherwise move the backup
+        deadline and push a copy off-site, and a rehearsal is not allowed to persist or
+        send anything - the rule `test_budget.py` already enforces for the ledger.
         """
         interval = int(self.settings.storage.backup_interval_seconds or 0)
-        if interval <= 0:
+        if interval <= 0 or self.dry_run:
             return
         try:
             last = float(self.store.get_state(LAST_BACKUP_KEY, 0.0) or 0.0)
@@ -790,6 +794,7 @@ class ScanEngine:
         if last and (time.time() - last) < interval:
             return
 
+        keep = max(int(self.settings.storage.backup_keep or 1), 1)
         directory = hot_backup.default_backup_dir(self.settings.storage.data_dir)
         try:
             taken = hot_backup.snapshot(self.settings.storage.hot_db_path, directory / hot_backup.backup_name())
@@ -798,23 +803,35 @@ class ScanEngine:
             log.error("backup_failed", extra={"error": result["backup_error"]})
             return
 
-        remote_key = None
-        pruned = []
+        # Everything below is bookkeeping around a snapshot that is already on disk and
+        # verified, so none of it may escape: the copy exists either way, and losing the
+        # deadline advance to a locked `kv` row would be worse than the failure it
+        # reports - the next pass would then re-snapshot on every maintenance call.
         try:
-            # The snapshot is already on disk and verified, so an upload or retention
-            # problem cannot invalidate it - record it and move on.
-            remote_key = hot_backup.upload(taken, self.settings.storage.r2)
-            pruned = hot_backup.prune(directory, keep=self.settings.storage.backup_keep)
-        except Exception as exc:  # noqa: BLE001 - the local copy stands regardless
+            outcome = hot_backup.upload(taken, self.settings.storage.r2)
+            removed = hot_backup.prune(directory, keep=keep)
+            # Retention skips a file it cannot delete instead of raising, and a prune
+            # that silently fails is disk creep on the machine whose free space sized
+            # this whole design. So ask the folder what it holds, not the return value.
+            holding = len(hot_backup.snapshots_in(directory))
+            self.store.put_state(LAST_BACKUP_KEY, time.time())
+        except Exception as exc:  # noqa: BLE001 - the local snapshot stands regardless
             result["backup_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            log.error("backup_bookkeeping_failed", extra={"error": result["backup_error"]})
+            return
 
-        self.store.put_state(LAST_BACKUP_KEY, time.time())
+        if outcome.error:
+            # The off-site mirror is the one thing a local copy cannot prove, so a failed
+            # upload is reported rather than folded into the absence of a key.
+            result["backup_error"] = f"upload: {outcome.error}"
+        elif holding > keep:
+            result["backup_error"] = f"retention: {holding} snapshots on disk, asked to keep {keep}"
         result["backup"] = {
             "name": taken.path.name,
             "rows": taken.rows,
             "schema_version": taken.schema_version,
-            "remote_key": remote_key,
-            "pruned": len(pruned),
+            "remote_key": outcome.key,
+            "pruned": len(removed),
         }
 
     # -- daemon -------------------------------------------------------------

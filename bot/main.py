@@ -450,11 +450,23 @@ def _run_backup(args: argparse.Namespace, settings: Settings) -> int:
         print(f"backup failed: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
-    key = None if args.no_upload else hot_backup.upload(taken, settings.storage.r2)
+    outcome = (
+        hot_backup.UploadOutcome()
+        if args.no_upload
+        else hot_backup.upload(taken, settings.storage.r2)
+    )
     removed = hot_backup.prune(directory, keep=args.keep)
     print(
         json.dumps(
-            {**taken.to_dict(), "remote_key": key, "pruned": [path.name for path in removed]},
+            {
+                **taken.to_dict(),
+                "remote_key": outcome.key,
+                # A failed upload still exits 0 - the local file is the product - but it
+                # has to be visible in the output, or a cron job that stopped copying
+                # off-site looks identical to one that never had an off-site copy.
+                "upload_error": outcome.error,
+                "pruned": [path.name for path in removed],
+            },
             indent=2,
             default=str,
         )

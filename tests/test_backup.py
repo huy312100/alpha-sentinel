@@ -22,6 +22,7 @@ from storage.backup import (
     inspect,
     missing_rows,
     prune,
+    snapshots_in,
     rehearse,
     snapshot,
     upload,
@@ -345,7 +346,51 @@ def test_upload_is_a_no_op_when_r2_is_not_configured(store, settings, make_verdi
     store.record_verdict(make_verdict())
     taken = snapshot(settings.storage.hot_db_path, tmp_path / "copy.db")
 
-    assert upload(taken, R2Settings()) is None
+    outcome = upload(taken, R2Settings())
+
+    assert outcome.attempted is False
+    assert outcome.key is None and outcome.error is None
+
+
+def test_a_failed_upload_is_told_apart_from_an_absent_one(store, settings, make_verdict, tmp_path, monkeypatch):
+    """The two used to return the same value, which is how a mirror breaks quietly.
+
+    `upload` returned ``None`` both for "no bucket configured" and "the copy failed".
+    A daemon with R2 configured and credentials wrong would report the same result as
+    one that never intended to upload - and the off-site copy is the one thing a local
+    file cannot prove.
+    """
+    from types import SimpleNamespace
+
+    import boto3
+
+    store.record_verdict(make_verdict())
+    taken = snapshot(settings.storage.hot_db_path, tmp_path / "copy.db")
+    r2 = SimpleNamespace(is_configured=lambda: True, client_kwargs=lambda: {}, bucket="snapshots", prefix="")
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError("bad credentials")
+
+    monkeypatch.setattr(boto3, "client", refuse)
+
+    outcome = upload(taken, r2)
+
+    assert outcome.attempted is True
+    assert outcome.key is None
+    assert outcome.error and "bad credentials" in outcome.error
+
+
+def test_snapshots_in_counts_exactly_what_prune_deletes(tmp_path):
+    """Retention is judged by the folder, so the folder must be read the same way."""
+    for name in ("alpha_sentinel-20260101T000000Z.db", "alpha_sentinel-20260102T000000Z.db", "notes.txt"):
+        (tmp_path / name).write_bytes(b"x")
+
+    assert [path.name for path in snapshots_in(tmp_path)] == [
+        "alpha_sentinel-20260101T000000Z.db",
+        "alpha_sentinel-20260102T000000Z.db",
+    ]
+    assert prune(tmp_path, keep=1) == [tmp_path / "alpha_sentinel-20260101T000000Z.db"]
+    assert len(snapshots_in(tmp_path)) == 1
 
 
 def test_the_makefile_asks_where_snapshots_live_instead_of_guessing():
