@@ -48,11 +48,18 @@ serve the data the new code wrote". Rehearse it in a worktree, never by moving t
 deployment checkout, and against a **copy** of a snapshot — not the live database.
 
 ```bash
+set -euo pipefail
 repo=$PWD
 prev=/tmp/as-prev
 restore=/tmp/rollback-copy.db
 git worktree add "$prev" <previous-tag>
 install -m 600 "$(ls -1t "$repo"/data/backups/*.db | head -1)" "$restore"
+# Without this the block can continue against an older copy from a previous rehearsal -
+# or, worse, HotStore.initialize() happily creates an empty store at that path and the
+# rehearsal reports a total data loss that never happened.
+test -s "$restore"
+copy_rows=$(sqlite3 "$restore" 'SELECT COUNT(*) FROM verdicts')
+echo "restored copy holds $copy_rows verdicts"
 
 # Export once. A `VAR=x cmd` prefix applies to that one command only, so a second
 # command in the same block would silently read the live store instead.
@@ -73,8 +80,9 @@ restored data genuinely is old, and a check that called it fresh would be the bu
 Rolling the live daemon back afterwards, from the deployment checkout and only there:
 
 ```bash
-cd "$repo" || exit 1                 # the worktree above is a different directory
-git checkout <previous-tag>
+set -euo pipefail
+cd "$repo"                         # the worktree above is a different directory
+git checkout <previous-tag>        # if this fails, the next line must not run
 launchctl kickstart -k "gui/$(id -u)/com.alphasentinel.bot"
 ```
 
@@ -93,8 +101,9 @@ live path, by design. The live restore is this, and it is the one procedure here
 can destroy data if the order is wrong:
 
 ```bash
+set -euo pipefail
 uid=$(id -u); repo=/Users/nguyenngocduchuy/Projects/alpha-sentinel
-cd "$repo" || exit 1
+cd "$repo"
 
 # 1. Stop the supervisor first. It kickstarts a bot it considers unhealthy, which
 #    mid-restore means a half-copied database served to a live cycle.
@@ -102,11 +111,14 @@ launchctl bootout "gui/$uid/com.alphasentinel.watchdog"
 launchctl bootout "gui/$uid/com.alphasentinel.bot"
 
 # 2. Keep the broken store; it is the only evidence of what the failure looked like.
-install -m 600 data/hot/alpha_sentinel.db "$repo/../failed-store.db" 2>/dev/null || true
+#    Skippable on purpose (|| true): a store unreadable enough to copy is the case
+#    where this step has nothing to offer.
+cp -p data/hot/alpha_sentinel.db "/tmp/failed-store-$(date -u +%Y%m%dT%H%M%SZ).db" 2>/dev/null || true
 
 # 3. Restore the newest verified snapshot, and remove its stale sidecars. A leftover
 #    -wal replays *on top of* the file you just restored.
 new=$(ls -1t data/backups/*.db | head -1)
+test -s "$new"                      # an empty or missing snapshot must not be installed
 install -m 600 "$new" data/hot/alpha_sentinel.db
 rm -f data/hot/alpha_sentinel.db-wal data/hot/alpha_sentinel.db-shm
 
@@ -128,13 +140,19 @@ Pass conditions, all measured from the store — not from uptime vibes. `cd` to 
 deployment checkout first; every path below is relative to it:
 
 ```bash
-cd /Users/nguyenngocduchuy/Projects/alpha-sentinel || exit 1
+cd /Users/nguyenngocduchuy/Projects/alpha-sentinel
 .venv/bin/python -m bot.main --health                # exit 0 throughout
 .venv/bin/python -m bot.main --status                # cycles advancing, verdicts landing
 sqlite3 data/hot/alpha_sentinel.db "SELECT status, COUNT(*) FROM runs GROUP BY status"
 sqlite3 data/hot/alpha_sentinel.db "SELECT key, value_json FROM kv"   # backup + productive markers fresh
 ls -1t data/backups | head -1                        # newest snapshot < BACKUP_INTERVAL_SECONDS + slack
 ```
+
+These paths are the checked-in defaults. If `DATA_DIR` or `HOT_DB_PATH` is overridden in
+the environment (`.env`, the LaunchAgent, or a volume mount in Docker), read the real
+location from the binary rather than guessing it: `sqlite3 "$(.venv/bin/python -m
+bot.main --print-backup-dir)/..."` for snapshots, and `--status` prints the hot store
+path it resolved.
 
 - no manual restart for the full seven days (a restart resets the watchdog's budget and
   the meaning of "unattended");
