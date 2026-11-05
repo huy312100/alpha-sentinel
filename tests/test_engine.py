@@ -709,6 +709,9 @@ class TestScheduledBackups:
         assert "database is locked" in result["backup_error"]
         assert len(self._snapshots(settings)) == 1  # the copy still exists
         assert result["stale_runs"] == 0  # and maintenance still reported normally
+        # The deadline is deliberately left where it was, so the next pass retries
+        # instead of trusting a snapshot that nothing recorded.
+        assert store.get_state(LAST_BACKUP_KEY, 0.0) == 0.0
 
     def test_a_kv_read_failure_is_reported_not_raised(self, settings, store, monkeypatch):
         """A locked counter skips this pass; it does not swallow the maintenance report.
@@ -732,11 +735,13 @@ class TestScheduledBackups:
         assert self._snapshots(settings) == []
         assert result["stale_runs"] == 0
 
-    def test_upload_and_retention_failures_are_reported_together(self, settings, store, monkeypatch):
-        """Two problems, two reports - the second one is the one that fills the disk.
+    def test_upload_and_retention_failures_are_reported_together(self, settings, store, monkeypatch, caplog):
+        """Two problems, two reports - and both loud enough to grep for.
 
         An `elif` let a recurring upload failure hide unbounded snapshot growth, which
-        is the faster failure on a machine whose free space sized this design.
+        is the faster failure on a machine whose free space sized this design. And a
+        failure carried only inside `maintenance_finished` at INFO sits among the
+        routine counters, where nobody looks for it.
         """
         stale = Path(hot_backup.default_backup_dir(settings.storage.data_dir)) / "alpha_sentinel-20260101T000000Z.db"
         stale.parent.mkdir(parents=True, exist_ok=True)
@@ -745,10 +750,13 @@ class TestScheduledBackups:
         monkeypatch.setattr(hot_backup, "prune", lambda directory, *, keep: [])
         tight = replace(settings, storage=replace(settings.storage, backup_keep=1))
 
-        result = make_engine(tight, store).maintenance(force=True)
+        with caplog.at_level("WARNING", logger="bot.engine"):
+            result = make_engine(tight, store).maintenance(force=True)
 
         assert "upload: boom" in result["backup_error"]
         assert "retention:" in result["backup_error"]
+        warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+        assert "backup_incomplete" in warnings, warnings
 
     def test_an_existing_remote_key_is_not_claimed_as_this_run_upload(self, settings, store, monkeypatch):
         """The key exists; whether it holds these bytes is a different question.

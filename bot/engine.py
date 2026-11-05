@@ -845,8 +845,17 @@ class ScanEngine:
         if problems:
             # Both, never one-or-the-other: a recurring upload failure that masks
             # unbounded disk growth hides the failure with the shorter fuse on a
-            # machine whose free space sized this whole design.
+            # machine whose free space sized this design.
             result["backup_error"] = "; ".join(problems)
+            # Logged as a warning in its own right. `maintenance_finished` carries this
+            # at INFO among the routine counters, and "the off-site copy stopped" or
+            # "the snapshots stopped shrinking" has to be greppable as a failure, not
+            # found by reading a successful maintenance line.
+            log.warning(
+                "backup_incomplete",
+                extra={"error": result["backup_error"], "remote": outcome.state,
+                       "snapshots": holding, "keep": keep},
+            )
         result["backup"] = {
             "name": taken.path.name,
             "rows": taken.rows,
