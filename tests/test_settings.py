@@ -188,6 +188,27 @@ def test_a_ceiling_can_be_set_once_spend_is_measurable():
     assert priced.llm.max_usd_per_cycle == 0.50
 
 
+def test_the_backup_cadence_is_configurable_and_defaults_to_six_hours():
+    """Snapshots need a schedule, and the schedule needs an off switch."""
+    assert load().storage.backup_interval_seconds == 21_600
+    assert load().storage.backup_keep == 7
+    assert load(BACKUP_INTERVAL_SECONDS="86400").storage.backup_interval_seconds == 86_400
+    assert load(BACKUP_INTERVAL_SECONDS="0").storage.backup_interval_seconds == 0
+    assert load(BACKUP_KEEP="14").storage.backup_keep == 14
+
+
+def test_validate_rejects_a_backup_cadence_below_ten_minutes():
+    """A minute-scale cadence is a snapshot generator, not a backup schedule.
+
+    Every pass would copy the store and prune the previous copies; the retention
+    window would fill with near-identical files while the failure the schedule exists
+    to survive stays uncovered. An operator who wants manual control sets 0.
+    """
+    settings = load(BACKUP_INTERVAL_SECONDS="120")
+
+    assert any("BACKUP_INTERVAL_SECONDS" in problem for problem in settings.validate())
+
+
 def test_the_verdict_window_is_configurable_and_defaults_to_two_days():
     """A bound on unproductive time has to outlast ordinary cooldowns by default."""
     assert load().scanners.health_max_stale_verdict_seconds == 172_800

@@ -3,18 +3,29 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
 from ai_engine.dual_audit_flow import AuditOutcome
 from bot.alerts import AlertResult
-from bot.engine import BOOT_STATE_KEY, PRODUCTIVE_RUN_KEY, UNPRODUCTIVE_SINCE_KEY, ScanEngine
+from bot.engine import (
+    BOOT_STATE_KEY,
+    LAST_BACKUP_KEY,
+    PRODUCTIVE_RUN_KEY,
+    UNPRODUCTIVE_SINCE_KEY,
+    ScanEngine,
+)
 from bot.watchlist import WatchToken
 from core.models import VerdictStatus, iso, utcnow
 from core.scoring import Decision
 from scanners.pipeline import CollectedSnapshot
+from storage import backup as hot_backup
+from storage.backup import UploadOutcome
+from storage.hot_store import SCHEMA_VERSION
 from storage.parquet_store import StorageError
 from tests.conftest import OTHER_TOKEN, TOKEN
 
@@ -557,3 +568,247 @@ class TestTargetSelection:
         assert report.requested == 1
         assert report.results[0].token.symbol == "WSOL"
         assert report.results[0].token.chain == "solana"
+
+
+class TestScheduledBackups:
+    """Maintenance takes the snapshot that makes a rollback more than a hope.
+
+    `make backup` was the only path to a copy, so the newest snapshot was a function of
+    someone remembering to run it. The two tables with no second copy anywhere else -
+    the scan schedule in `seen_tokens` and the spend ledger in `kv` - were unprotected
+    for exactly as long as nobody remembered, and the one on disk here was two days old
+    when this was found.
+    """
+
+    @staticmethod
+    def _snapshots(settings) -> list[Path]:
+        directory = Path(hot_backup.default_backup_dir(settings.storage.data_dir))
+        return sorted(directory.glob("*.db"))
+
+    def test_maintenance_snapshots_the_hot_store(self, settings, store):
+        engine = make_engine(settings, store)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup_error" not in result
+        assert len(self._snapshots(settings)) == 1
+        assert result["backup"]["schema_version"] == SCHEMA_VERSION
+        assert store.get_state(LAST_BACKUP_KEY) > 0
+
+    def test_the_cadence_is_honoured_within_one_process(self, settings, store):
+        engine = make_engine(settings, store)
+
+        engine.maintenance(force=True)
+        second = engine.maintenance(force=True)
+
+        assert "backup" not in second  # `force` means maintenance, not "snapshot again"
+        assert len(self._snapshots(settings)) == 1
+
+    def test_the_deadline_survives_a_restart(self, settings, store):
+        """A restarted daemon does not get to reset the backup clock.
+
+        The supervisor restarts exactly the services that are misbehaving, so a cadence
+        held in memory would be postponed by every restart - and an unhealthy loop could
+        keep running without ever producing a second copy.
+        """
+        make_engine(settings, store).maintenance(force=True)
+        marker = store.get_state(LAST_BACKUP_KEY)
+
+        result = make_engine(settings, store).maintenance(force=True)
+
+        assert "backup" not in result
+        assert store.get_state(LAST_BACKUP_KEY) == marker
+
+    def test_an_expired_deadline_is_taken_again(self, settings, store):
+        engine = make_engine(settings, store)
+        engine.maintenance(force=True)
+        store.put_state(LAST_BACKUP_KEY, time.time() - 99_999.0)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" in result
+        assert store.get_state(LAST_BACKUP_KEY) > 0
+
+    def test_the_cadence_can_be_switched_off(self, settings, store):
+        """`0` leaves snapshots to cron, and takes none itself."""
+        offline = replace(settings, storage=replace(settings.storage, backup_interval_seconds=0))
+
+        result = make_engine(offline, store).maintenance(force=True)
+
+        assert "backup" not in result
+        assert self._snapshots(offline) == []
+
+    def test_a_dry_run_takes_no_snapshot_and_moves_no_deadline(self, settings, store):
+        """`--maintenance --dry-run` is a rehearsal, and a rehearsal persists nothing.
+
+        Without this guard a dry run would copy the store, offer it to R2, and advance
+        the backup deadline - after which the real schedule waits a full interval for a
+        snapshot that was never meant to count.
+        """
+        engine = make_engine(settings, store, dry_run=True)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" not in result
+        assert self._snapshots(settings) == []
+        assert store.get_state(LAST_BACKUP_KEY, 0.0) == 0.0
+
+    def test_a_failed_upload_is_reported_without_losing_the_snapshot(self, settings, store, monkeypatch):
+        """The local copy is the product; the off-site mirror still has to be honest.
+
+        `upload` used to return ``None`` for both "not configured" and "failed", so a
+        daemon with broken credentials looked exactly like one that never had R2.
+        """
+        monkeypatch.setattr(
+            hot_backup, "upload", lambda taken, r2, **kw: UploadOutcome(attempted=True, error="boom")
+        )
+        engine = make_engine(settings, store)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" in result and result["backup"]["remote_key"] is None
+        assert "upload: boom" in result["backup_error"]
+        assert len(self._snapshots(settings)) == 1  # the local copy stands
+        assert store.get_state(LAST_BACKUP_KEY) > 0  # and the deadline advanced
+
+    def test_retention_that_cannot_delete_is_reported(self, settings, store, monkeypatch):
+        """`prune` skips a file it cannot delete, so its return value cannot be trusted.
+
+        Disk creep on a machine sized around free space is the failure this whole
+        feature is meant to avoid, so the folder is counted rather than believed.
+        """
+        stale = Path(hot_backup.default_backup_dir(settings.storage.data_dir)) / "alpha_sentinel-20260101T000000Z.db"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"x")
+        monkeypatch.setattr(hot_backup, "prune", lambda directory, *, keep: [])
+        tight = replace(settings, storage=replace(settings.storage, backup_keep=1))
+
+        result = make_engine(tight, store).maintenance(force=True)
+
+        assert "retention:" in result["backup_error"]
+        assert result["backup"]["pruned"] == 0
+
+    def test_a_kv_failure_after_a_good_snapshot_does_not_break_maintenance(self, settings, store, monkeypatch):
+        """The snapshot is already safe on disk; a counter must not undo that.
+
+        Writing the deadline is the last step, and a locked `kv` row there would
+        otherwise escape the method and abort maintenance - losing the report of work
+        that genuinely happened. The deadline is deliberately left unadvanced so the
+        next pass retries, rather than trusting a snapshot nobody recorded.
+        """
+        engine = make_engine(settings, store)
+
+        def refuse(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(store, "put_state", refuse)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" not in result
+        assert "database is locked" in result["backup_error"]
+        assert len(self._snapshots(settings)) == 1  # the copy still exists
+        assert result["stale_runs"] == 0  # and maintenance still reported normally
+        # The deadline is deliberately left where it was, so the next pass retries
+        # instead of trusting a snapshot that nothing recorded.
+        assert store.get_state(LAST_BACKUP_KEY, 0.0) == 0.0
+
+    def test_a_kv_read_failure_is_reported_not_raised(self, settings, store, monkeypatch):
+        """A locked counter skips this pass; it does not swallow the maintenance report.
+
+        The read of the backup deadline sits at the top of the method, outside the
+        block that guards the write, so without its own guard a SQLite error here
+        would propagate and lose `stale_runs` / `pruned` for a pass that had already
+        done that work. The deadline is left unadvanced, so the next pass retries.
+        """
+        engine = make_engine(settings, store)
+
+        def refuse(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(store, "get_state", refuse)
+
+        result = engine.maintenance(force=True)
+
+        assert "state read:" in result["backup_error"]
+        assert "backup" not in result
+        assert self._snapshots(settings) == []
+        assert result["stale_runs"] == 0
+
+    def test_upload_and_retention_failures_are_reported_together(self, settings, store, monkeypatch, caplog):
+        """Two problems, two reports - and both loud enough to grep for.
+
+        An `elif` let a recurring upload failure hide unbounded snapshot growth, which
+        is the faster failure on a machine whose free space sized this design. And a
+        failure carried only inside `maintenance_finished` at INFO sits among the
+        routine counters, where nobody looks for it.
+        """
+        stale = Path(hot_backup.default_backup_dir(settings.storage.data_dir)) / "alpha_sentinel-20260101T000000Z.db"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"x")
+        monkeypatch.setattr(hot_backup, "upload", lambda taken, r2, **kw: UploadOutcome(attempted=True, error="boom"))
+        monkeypatch.setattr(hot_backup, "prune", lambda directory, *, keep: [])
+        tight = replace(settings, storage=replace(settings.storage, backup_keep=1))
+
+        with caplog.at_level("WARNING", logger="bot.engine"):
+            result = make_engine(tight, store).maintenance(force=True)
+
+        assert "upload: boom" in result["backup_error"]
+        assert "retention:" in result["backup_error"]
+        warnings = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+        assert "backup_incomplete" in warnings, warnings
+
+    def test_an_existing_remote_key_is_not_claimed_as_this_run_upload(self, settings, store, monkeypatch):
+        """The key exists; whether it holds these bytes is a different question.
+
+        Snapshot names are second-precise, so a manual and a scheduled backup can collide
+        on one key. The maintenance result must say `exists` and must not hand the
+        operator a `remote_key` that implies this run's copy is off-site.
+        """
+        monkeypatch.setattr(
+            hot_backup, "upload", lambda taken, r2, **kw: UploadOutcome(attempted=True, key="pre/key", skipped="exists")
+        )
+
+        result = make_engine(settings, store).maintenance(force=True)
+
+        assert result["backup"]["remote"] == "exists"
+        assert result["backup"]["remote_key"] is None
+        assert "backup_error" not in result  # not a failure, just not this run's upload
+
+    def test_a_corrupt_backup_marker_is_treated_as_no_backup_yet(self, settings, store):
+        """A garbage counter must not stop backups or crash the pass.
+
+        The value comes from `kv`, where a half-written row or a hand edit can leave
+        anything at all. Converting it is inside the guard, so the worst case is the
+        one for an absent marker: take a snapshot now, and overwrite the garbage.
+        """
+        store.put_state(LAST_BACKUP_KEY, "not-a-number")
+        engine = make_engine(settings, store)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" in result and "backup_error" not in result
+        assert len(self._snapshots(settings)) == 1
+        assert float(store.get_state(LAST_BACKUP_KEY)) > 0  # the garbage was replaced
+
+    def test_a_failed_snapshot_does_not_break_maintenance(self, settings, store, monkeypatch):
+        """Unprotected is not the same as broken.
+
+        Maintenance prunes and trims the lake before it snapshots; refusing to report
+        that work, or stopping the scanner, would turn a backup problem into an outage -
+        the trade this project has already refused for provider failures.
+        """
+
+        def boom(*args, **kwargs):
+            raise hot_backup.BackupError("disk full")
+
+        monkeypatch.setattr(hot_backup, "snapshot", boom)
+        engine = make_engine(settings, store)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup_error" in result
+        assert result["stale_runs"] == 0
+        assert "pruned" in result
+        assert self._snapshots(settings) == []
+        assert store.get_state(LAST_BACKUP_KEY, 0.0) == 0.0  # deadline not advanced

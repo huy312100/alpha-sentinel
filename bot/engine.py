@@ -33,6 +33,7 @@ from core.logging import get_logger
 from core.models import FinalVerdict, VerdictStatus, iso, json_safe, utcnow
 from ml.dataset import training_row, write_training_rows
 from scanners.pipeline import CollectedSnapshot, ScanPipeline
+from storage import backup as hot_backup
 from storage.hot_store import HotStore
 from storage.parquet_store import ParquetStore, StorageError
 
@@ -55,6 +56,10 @@ BOOT_STATE_KEY = "bot_booted_at"
 #: unhealthy, which would hand a stalled bot a fresh deadline each time.
 PRODUCTIVE_RUN_KEY = "bot_last_productive_run_at"
 UNPRODUCTIVE_SINCE_KEY = "bot_unproductive_since"
+#: Epoch seconds of the last snapshot maintenance took. Kept in ``kv`` rather than in
+#: memory so that restarting a daemon cannot postpone the backup indefinitely - the
+#: supervisor restarts the service precisely when it is misbehaving.
+LAST_BACKUP_KEY = "bot_last_backup_at"
 
 
 def day_spend_key(moment: Any | None = None) -> str:
@@ -757,8 +762,110 @@ class ScanEngine:
                 result["remote_partitions_removed"] = self.cold.apply_remote_retention()
         except (StorageError, OSError, ValueError) as exc:
             result["cold_error"] = str(exc)[:200]
+        self._maybe_backup(result)
         log.info("maintenance_finished", extra=result)
         return result
+
+    def _backup_is_due(self, result: dict[str, Any]) -> bool:
+        """Whether the cadence says to snapshot now, recording any failure to ask.
+
+        Kept apart from the snapshot itself because a locked `kv` row on this read is a
+        reason to skip the pass, not a reason to lose the maintenance report that the
+        caller is about to return. The deadline stays unadvanced either way, so the next
+        pass retries.
+        """
+        try:
+            last = float(self.store.get_state(LAST_BACKUP_KEY, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        except Exception as exc:  # noqa: BLE001 - a read failure must not abort maintenance
+            result["backup_error"] = f"state read: {type(exc).__name__}: {str(exc)[:200]}"
+            log.error("backup_state_read_failed", extra={"error": result["backup_error"]})
+            return False
+        interval = int(self.settings.storage.backup_interval_seconds or 0)
+        return not last or (time.time() - last) >= interval
+
+    def _maybe_backup(self, result: dict[str, Any]) -> None:
+        """Snapshot the hot store when its own cadence says so.
+
+        Snapshots used to exist only as a make target, which made the newest copy
+        "however long ago someone last remembered". The consequence is concrete: the two
+        tables with no second copy anywhere else - the scan schedule in ``seen_tokens``
+        and the spend ledger in ``kv`` - were one disk failure away from being rebuilt by
+        re-scanning, and a rollback had whatever stale file happened to be on disk. This
+        is the difference between a rehearsed restore and a hope.
+
+        A failure is recorded, never raised. The store still works when a snapshot fails;
+        it is merely unprotected, and stopping the scanner would trade a backup problem
+        for an outage.
+
+        Dry runs are excluded. `--maintenance --dry-run` would otherwise move the backup
+        deadline and push a copy off-site, and a rehearsal is not allowed to persist or
+        send anything - the rule `test_budget.py` already enforces for the ledger.
+        """
+        interval = int(self.settings.storage.backup_interval_seconds or 0)
+        if interval <= 0 or self.dry_run:
+            return
+        if not self._backup_is_due(result):
+            return
+
+        keep = max(int(self.settings.storage.backup_keep or 1), 1)
+        directory = hot_backup.default_backup_dir(self.settings.storage.data_dir)
+        try:
+            taken = hot_backup.snapshot(self.settings.storage.hot_db_path, directory / hot_backup.backup_name())
+        except Exception as exc:  # noqa: BLE001 - unprotected is not the same as broken
+            result["backup_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            log.error("backup_failed", extra={"error": result["backup_error"]})
+            return
+
+        # Everything below is bookkeeping around a snapshot that is already on disk and
+        # verified, so none of it may escape: the copy exists either way, and losing the
+        # deadline advance to a locked `kv` row would be worse than the failure it
+        # reports - the next pass would then re-snapshot on every maintenance call.
+        try:
+            outcome = hot_backup.upload(taken, self.settings.storage.r2)
+            removed = hot_backup.prune(directory, keep=keep)
+            # Retention skips a file it cannot delete instead of raising, and a prune
+            # that silently fails is disk creep on the machine whose free space sized
+            # this whole design. So ask the folder what it holds, not the return value.
+            holding = len(hot_backup.snapshots_in(directory))
+            self.store.put_state(LAST_BACKUP_KEY, time.time())
+        except Exception as exc:  # noqa: BLE001 - the local snapshot stands regardless
+            result["backup_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            log.error("backup_bookkeeping_failed", extra={"error": result["backup_error"]})
+            return
+
+        problems = []
+        if outcome.error:
+            # The off-site mirror is the one thing a local copy cannot prove, so a failed
+            # upload is reported rather than folded into the absence of a key.
+            problems.append(f"upload: {outcome.error}")
+        if holding > keep:
+            problems.append(f"retention: {holding} snapshots on disk, asked to keep {keep}")
+        if problems:
+            # Both, never one-or-the-other: a recurring upload failure that masks
+            # unbounded disk growth hides the failure with the shorter fuse on a
+            # machine whose free space sized this design.
+            result["backup_error"] = "; ".join(problems)
+            # Logged as a warning in its own right. `maintenance_finished` carries this
+            # at INFO among the routine counters, and "the off-site copy stopped" or
+            # "the snapshots stopped shrinking" has to be greppable as a failure, not
+            # found by reading a successful maintenance line.
+            log.warning(
+                "backup_incomplete",
+                extra={"error": result["backup_error"], "remote": outcome.state,
+                       "snapshots": holding, "keep": keep},
+            )
+        result["backup"] = {
+            "name": taken.path.name,
+            "rows": taken.rows,
+            "schema_version": taken.schema_version,
+            # Only this run's own copy counts as a key: an existing object under the
+            # same second-precision name was placed there by someone else.
+            "remote_key": outcome.key if outcome.uploaded else None,
+            "remote": outcome.state,
+            "pruned": len(removed),
+        }
 
     # -- daemon -------------------------------------------------------------
     async def run_forever(

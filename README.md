@@ -470,7 +470,22 @@ same migrations a real restore would - and fails if any table comes back with
 fewer rows. Uploads to `<R2_PREFIX>/hot-backups/` happen when `R2_*` is
 configured, best-effort: the local file is the product.
 
-A nightly cron is enough, and it must run inside the container so the paths match:
+The daemon now takes these itself: `engine.maintenance()` snapshots the store whenever
+`BACKUP_INTERVAL_SECONDS` (default six hours) has passed since the last one, uploads when
+`R2_*` is configured, and keeps `BACKUP_KEEP` copies. The deadline lives in the `kv` table
+rather than in memory, so restarting the bot cannot postpone it - which matters because a
+supervisor restarts precisely the service that is misbehaving. A failed snapshot is
+recorded in the maintenance result and never stops a cycle: an unprotected store still
+works, and taking the scanner down over a backup problem would trade one outage for
+another. `--maintenance --dry-run` takes no snapshot and moves no deadline, and a failed
+upload or a file retention could not delete is reported (`upload_error` in the JSON from
+`--backup`, `backup_error` in the maintenance result) rather than looking like "no
+off-site copy was wanted".
+
+`make backup` remains for an explicit copy before a risky operation. Cron is still the
+right shape when something other than the bot should own the schedule - set
+`BACKUP_INTERVAL_SECONDS=0` in that case - and it must run inside the container so the
+paths match:
 
 ```cron
 15 3 * * * cd /opt/alpha-sentinel && docker compose exec -T bot python -m bot.main --backup
@@ -481,7 +496,7 @@ A nightly cron is enough, and it must run inside the container so the paths matc
 ## Tests
 
 ```bash
-make test                                   # 745 tests
+make test                                   # 789 tests
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
