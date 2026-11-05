@@ -3,12 +3,16 @@
 <!--
   AlphaSentinel keep-awake guard: keeps the collector's clock honest.
 
-  Install:
+  Install (or just `make mac-install`, which writes all three units):
     REPO=$HOME/Projects/alpha-sentinel
+    mkdir -p ~/Library/LaunchAgents ~/Library/Logs/alpha-sentinel
     sed -e "s|__HOME__|$HOME|g" \
         ops/com.alphasentinel.hold-awake.plist > ~/Library/LaunchAgents/com.alphasentinel.hold-awake.plist
-    mkdir -p ~/Library/Logs/alpha-sentinel
-    launchctl load ~/Library/LaunchAgents/com.alphasentinel.hold-awake.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.alphasentinel.hold-awake.plist
+
+  The mkdir line is not decoration: on a fresh account ~/Library/LaunchAgents does not
+  exist, so the redirection fails with "No such file or directory" and the operator is
+  left with no unit installed and a message that reads like a permissions problem.
 
   Why this exists. launchd intervals do not fire while the machine sleeps, so a
   sleeping host does not slow the collector down, it deletes the time. Measured on

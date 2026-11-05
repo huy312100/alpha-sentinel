@@ -117,8 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--keep",
         type=int,
-        default=hot_backup.DEFAULT_KEEP,
-        help=f"snapshots to retain after a successful backup (default {hot_backup.DEFAULT_KEEP})",
+        default=None,
+        help=(
+            "snapshots to retain after a successful backup "
+            f"(default: BACKUP_KEEP, currently {hot_backup.DEFAULT_KEEP})"
+        ),
     )
     parser.add_argument(
         "--no-upload",
@@ -455,7 +458,12 @@ def _run_backup(args: argparse.Namespace, settings: Settings) -> int:
         if args.no_upload
         else hot_backup.upload(taken, settings.storage.r2)
     )
-    removed = hot_backup.prune(directory, keep=args.keep)
+    # Retention is one setting, read the same way by both paths that apply it. The
+    # daemon's maintenance pass prunes to `BACKUP_KEEP`; a plain `make backup` that
+    # fell back to the argparse default would quietly cut a 14-copy policy down to 7
+    # and delete the history the wider window was configured to preserve.
+    keep = args.keep if args.keep is not None else int(settings.storage.backup_keep or hot_backup.DEFAULT_KEEP)
+    removed = hot_backup.prune(directory, keep=keep)
     print(
         json.dumps(
             {

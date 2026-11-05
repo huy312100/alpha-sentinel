@@ -12,9 +12,17 @@ health that answers two separate questions (is the loop turning / is it producin
 Verify a release candidate before tagging it:
 
 ```bash
-make ci                       # lint + 791 hermetic tests + byte-compile + smoke
-git push origin main && gh pr checks    # CI is the deployment proof, not local runs
+make ci                     # lint + hermetic tests + byte-compile + smoke
+git push origin main
+sha=$(git rev-parse origin/main)
+gh api "repos/huy312100/alpha-sentinel/commits/$sha/check-runs" \
+  --jq '.check_runs[] | "\(.status)  \(.conclusion // "-")  \(.name)"'
 ```
+
+The checks are queried **by commit**, not with `gh pr checks`: that command resolves a
+pull request from the current branch, so on `main` it either finds no PR or reports the
+checks of some unrelated one, and a green read-out can be a wrong read-out about the
+commit you are about to release.
 
 CI covers what this machine cannot: the image build, ARM64 wheel resolution for every
 pin, CodeQL, and CircleCI's boot gates. There is no Docker daemon on the deployment
@@ -36,35 +44,91 @@ Rehearsed at v0.1.0: 279 rows, `schema_version: 3`, `problems: []`.
 ## Rehearsing a rollback
 
 The question a rollback asks is not "does the old code run" but "can the old code
-serve the data the new code wrote". Check that with a worktree, never by moving the
-deployment checkout:
+serve the data the new code wrote". Rehearse it in a worktree, never by moving the
+deployment checkout, and against a **copy** of a snapshot — not the live database.
 
 ```bash
-git worktree add ../as-prev <previous-tag>
-cd ../as-prev
-HOT_DB_PATH=$OLD_STORE_COPY \
-  python -m bot.main --status && python -m bot.main --health
+repo=$PWD
+prev=/tmp/as-prev
+restore=/tmp/rollback-copy.db
+git worktree add "$prev" <previous-tag>
+install -m 600 "$(ls -1t "$repo"/data/backups/*.db | head -1)" "$restore"
+
+# Export once. A `VAR=x cmd` prefix applies to that one command only, so a second
+# command in the same block would silently read the live store instead.
+export HOT_DB_PATH="$restore" DATA_DIR=/tmp/rollback-home PARQUET_ROOT=/tmp/rollback-lake
+export WATCHLIST_PATH="$prev/config/watchlists.yaml" DEMO_MODE=true
+( cd "$prev" && "$repo"/.venv/bin/python -m bot.main --status )
+( cd "$prev" && "$repo"/.venv/bin/python -m bot.main --health )
 ```
 
-`--health` on a restored store copied from before the current run **should** report
-`cycle_stale`: the restored data really is old. That is the check working, not failing.
+Both commands must see `$restore`; if `HOT_DB_PATH` is unset or empty the settings fall
+back to the configured live database and the rehearsal inspects production while
+reporting on the copy.
 
-Rolling the live daemon back:
+What you should see: `--status` prints the snapshot's verdicts, and `--health` reports
+`cycle_stale` or `verdicts_stale`. Those are correct answers, not failures — the
+restored data genuinely is old, and a check that called it fresh would be the bug.
+
+Rolling the live daemon back afterwards, from the deployment checkout and only there:
 
 ```bash
+cd "$repo" || exit 1                 # the worktree above is a different directory
 git checkout <previous-tag>
-launchctl kickstart -k gui/$(id -u)/com.alphasentinel.bot
+launchctl kickstart -k "gui/$(id -u)/com.alphasentinel.bot"
 ```
+
+Leaving the shell inside `$prev` and running `git checkout` there changes the rehearsal
+worktree while the daemon keeps running the unmodified deployment code — the two
+commands look like they belong together and do not.
 
 `SCHEMA_VERSION` is 3 at v0.1.0 and has not moved, so an older build opens a newer
 store. If a future release raises it, the rollback above stops being safe and this
 section must say so.
 
-## Seven-day soak
+## Restoring for real (after a failure, not a rehearsal)
 
-Pass conditions, all measured from the store — not from uptime vibes:
+`backup-verify` restores into a temporary directory and deletes it; it never touches the
+live path, by design. The live restore is this, and it is the one procedure here that
+can destroy data if the order is wrong:
 
 ```bash
+uid=$(id -u); repo=/Users/nguyenngocduchuy/Projects/alpha-sentinel
+cd "$repo" || exit 1
+
+# 1. Stop the supervisor first. It kickstarts a bot it considers unhealthy, which
+#    mid-restore means a half-copied database served to a live cycle.
+launchctl bootout "gui/$uid/com.alphasentinel.watchdog"
+launchctl bootout "gui/$uid/com.alphasentinel.bot"
+
+# 2. Keep the broken store; it is the only evidence of what the failure looked like.
+install -m 600 data/hot/alpha_sentinel.db "$repo/../failed-store.db" 2>/dev/null || true
+
+# 3. Restore the newest verified snapshot, and remove its stale sidecars. A leftover
+#    -wal replays *on top of* the file you just restored.
+new=$(ls -1t data/backups/*.db | head -1)
+install -m 600 "$new" data/hot/alpha_sentinel.db
+rm -f data/hot/alpha_sentinel.db-wal data/hot/alpha_sentinel.db-shm
+
+# 4. Prove it before it has writers on it.
+.venv/bin/python -m bot.main --status
+
+# 5. Bot back, then the supervisor, and only in that order.
+launchctl bootstrap "gui/$uid" ~/Library/LaunchAgents/com.alphasentinel.bot.plist
+launchctl bootstrap "gui/$uid" ~/Library/LaunchAgents/com.alphasentinel.watchdog.plist
+```
+
+Expect to lose at most one `BACKUP_INTERVAL_SECONDS` window of verdicts, plus whatever
+`seen_tokens` and the spend ledger recorded since that snapshot. Those two are the
+reason the cadence exists: nothing else holds a copy of them.
+
+## Seven-day soak
+
+Pass conditions, all measured from the store — not from uptime vibes. `cd` to the
+deployment checkout first; every path below is relative to it:
+
+```bash
+cd /Users/nguyenngocduchuy/Projects/alpha-sentinel || exit 1
 .venv/bin/python -m bot.main --health                # exit 0 throughout
 .venv/bin/python -m bot.main --status                # cycles advancing, verdicts landing
 sqlite3 data/hot/alpha_sentinel.db "SELECT status, COUNT(*) FROM runs GROUP BY status"
