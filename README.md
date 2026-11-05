@@ -238,7 +238,7 @@ unchanged.
 | `--backup` | snapshot the hot store, verify the copy, upload if `R2_*` is set, prune old ones |
 | `--verify-backup PATH` | rehearse restoring a snapshot: integrity, migrations, row counts |
 | `--print-backup-dir` | print where snapshots go, resolved from the same settings as `--backup` |
-| `--backup-dir`, `--keep`, `--no-upload` | where snapshots go, how many to retain (default 7), skip the upload |
+| `--backup-dir`, `--keep`, `--no-upload` | where snapshots go, how many to retain (default: `BACKUP_KEEP`), skip the upload |
 | `--dry-run` | collect + audit, persist nothing, send nothing |
 | `--no-alerts` | run normally but suppress Telegram |
 | `--watchlist NAME` | restrict to one or more named lists (repeatable) |
@@ -496,7 +496,7 @@ paths match:
 ## Tests
 
 ```bash
-make test                                   # 789 tests
+make test                                   # 792 tests
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```
@@ -637,6 +637,9 @@ mode plus a file-sync daemon is how you end up restoring a conflict copy.
 ---
 
 ## Operational notes
+
+Releases, restore and rollback rehearsals, the soak pass/fail conditions and the
+pre-live checklist live in [`docs/RELEASE.md`](docs/RELEASE.md).
 
 * **Nothing here is investment advice.** The output is a research note with a score.
 * A `degraded` flag on a verdict means an agent answered but the pair was incomplete;

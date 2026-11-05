@@ -55,6 +55,16 @@
     <string>__HOME__/Library/Logs/alpha-sentinel/bot.json.log</string>
     <string>--log-file</string>
     <string>__HOME__/Library/Logs/alpha-sentinel/bot.err.log</string>
+    <string>--log-file</string>
+    <string>__HOME__/Library/Logs/alpha-sentinel/hold-awake.err.log</string>
+    <!-- Its own two files. Written by launchd's redirection rather than by the
+         process, so nothing else trims them, and the supervisor appends to one of
+         them on every pass it takes - the loudest log in the directory belongs to
+         the thing that polices the others. -->
+    <string>--log-file</string>
+    <string>__HOME__/Library/Logs/alpha-sentinel/watchdog.log</string>
+    <string>--log-file</string>
+    <string>__HOME__/Library/Logs/alpha-sentinel/watchdog.err.log</string>
     <string>--max-log-mb</string>
     <string>20</string>
   </array>

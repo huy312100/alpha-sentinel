@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  AlphaSentinel keep-awake guard: keeps the collector's clock honest.
+
+  Install (or just `make mac-install`, which writes all three units):
+    REPO=$HOME/Projects/alpha-sentinel
+    mkdir -p ~/Library/LaunchAgents ~/Library/Logs/alpha-sentinel
+    sed -e "s|__HOME__|$HOME|g" \
+        ops/com.alphasentinel.hold-awake.plist > ~/Library/LaunchAgents/com.alphasentinel.hold-awake.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.alphasentinel.hold-awake.plist
+
+  The mkdir line is not decoration: on a fresh account ~/Library/LaunchAgents does not
+  exist, so the redirection fails with "No such file or directory" and the operator is
+  left with no unit installed and a message that reads like a permissions problem.
+
+  Why this exists. launchd intervals do not fire while the machine sleeps, so a
+  sleeping host does not slow the collector down, it deletes the time. Measured on
+  the deployment Mac mini after one night: cycle spacing of 70-77 minutes against a
+  configured 60, and a due pass that had not run 7 minutes after it was owed. Every
+  schedule in this project is derived from that interval - a 6-hour cooldown, the
+  3-hour cycle-stale window, the 2-day productivity window, the seven-day soak - so
+  sleep drift does not merely delay them, it invalidates the soak: seven days on a
+  machine that naps for hours is not seven days of evidence.
+
+  Why caffeinate rather than pmset. `pmset -c sleep 0` is the other fix and needs
+  sudo plus a policy decision about someone's computer. `caffeinate -s` is a
+  per-process assertion held only while this job runs and only while the machine is
+  on AC power: unload the unit and the Mac sleeps exactly as it did before, no
+  settings changed, nothing to remember to revert. A lid-closed sleep on a laptop is
+  still a sleep; this is for a desktop on mains power.
+
+  Verify it is holding (the assertion is owned by the tool, not this label):
+    pmset -g assertions | grep -i caffeinate      # "caffeinate asserting forever"
+    launchctl print gui/$(id -u)/com.alphasentinel.hold-awake
+
+  No timeout flag is passed on purpose: `-s` alone asserts indefinitely, which is the
+  behaviour verified against `pmset -g assertions` before this unit was written.
+
+  Option flags in this comment carry no leading double hyphen because XML forbids one
+  inside a comment.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.alphasentinel.hold-awake</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/alpha-sentinel/hold-awake.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

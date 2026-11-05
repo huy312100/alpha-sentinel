@@ -132,7 +132,7 @@ backup-push: ## Copy snapshots off the machine (needs rclone; override BACKUP_RE
 
 mac-install: ## Write the macOS LaunchAgents for this checkout (loads nothing itself)
 	@mkdir -p $(LAUNCH_DIR) $(LOG_DIR)
-	@for unit in bot watchdog; do \
+	@for unit in bot watchdog hold-awake; do \
 		sed -e "s|__REPO__|$(CURDIR)|g" -e "s|__HOME__|$(HOME)|g" \
 			ops/com.alphasentinel.$$unit.plist > $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist || exit 1; \
 		echo "wrote $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist"; \
@@ -140,9 +140,10 @@ mac-install: ## Write the macOS LaunchAgents for this checkout (loads nothing it
 	@echo "nothing is running yet. When ready:"
 	@echo "  launchctl load $(LAUNCH_DIR)/com.alphasentinel.bot.plist"
 	@echo "  launchctl load $(LAUNCH_DIR)/com.alphasentinel.watchdog.plist"
+	@echo "  launchctl load $(LAUNCH_DIR)/com.alphasentinel.hold-awake.plist"
 
 mac-uninstall: ## Stop and remove the LaunchAgents this target wrote
-	@for unit in bot watchdog; do \
+	@for unit in bot watchdog hold-awake; do \
 		launchctl unload $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist 2>/dev/null || true; \
 		rm -f $(LAUNCH_DIR)/com.alphasentinel.$$unit.plist; \
 	done

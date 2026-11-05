@@ -82,6 +82,37 @@ def test_the_snapshot_directory_is_answered_on_a_broken_environment(misconfigure
     assert capsys.readouterr().out.strip().endswith("backups")
 
 
+def test_manual_backup_prunes_to_the_configured_retention(environment, tmp_path, monkeypatch, capsys):
+    """Two paths apply retention; they must read one setting.
+
+    The daemon's maintenance pass prunes to ``BACKUP_KEEP``. The CLI defaulted to the
+    argparse constant instead, so an operator who widened retention to fourteen copies
+    would have `make backup` delete down to seven - the history the setting exists to
+    keep, removed by the command the operator runs by hand.
+    """
+    from storage import backup as hot_backup
+
+    seen: list[int] = []
+
+    monkeypatch.setattr(
+        hot_backup, "snapshot",
+        lambda source, destination: hot_backup.Snapshot(
+            path=Path(destination), size_bytes=8, schema_version=3, tables={"runs": 1}
+        ),
+    )
+    monkeypatch.setattr(hot_backup, "upload", lambda taken, r2, **kwargs: hot_backup.UploadOutcome())
+    monkeypatch.setattr(hot_backup, "prune", lambda directory, *, keep: seen.append(keep) or [])
+
+    environment(BACKUP_KEEP="14")
+    assert asyncio.run(bot_main.main(["--backup"])) == bot_main.EXIT_OK
+    assert seen == [14]
+
+    # An explicit flag still decides, and decides against the setting.
+    assert asyncio.run(bot_main.main(["--backup", "--keep", "3"])) == bot_main.EXIT_OK
+    assert seen == [14, 3]
+    capsys.readouterr()
+
+
 def test_a_cycle_refuses_to_start_without_the_llm_key(misconfigured_env, capsys):
     """A run mode must die on the gate, before the watchlist or store is touched."""
     exit_code = asyncio.run(bot_main.main(["--once", "--limit", "1"]))
