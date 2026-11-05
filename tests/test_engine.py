@@ -710,6 +710,63 @@ class TestScheduledBackups:
         assert len(self._snapshots(settings)) == 1  # the copy still exists
         assert result["stale_runs"] == 0  # and maintenance still reported normally
 
+    def test_a_kv_read_failure_is_reported_not_raised(self, settings, store, monkeypatch):
+        """A locked counter skips this pass; it does not swallow the maintenance report.
+
+        The read of the backup deadline sits at the top of the method, outside the
+        block that guards the write, so without its own guard a SQLite error here
+        would propagate and lose `stale_runs` / `pruned` for a pass that had already
+        done that work. The deadline is left unadvanced, so the next pass retries.
+        """
+        engine = make_engine(settings, store)
+
+        def refuse(*args, **kwargs):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(store, "get_state", refuse)
+
+        result = engine.maintenance(force=True)
+
+        assert "state read:" in result["backup_error"]
+        assert "backup" not in result
+        assert self._snapshots(settings) == []
+        assert result["stale_runs"] == 0
+
+    def test_upload_and_retention_failures_are_reported_together(self, settings, store, monkeypatch):
+        """Two problems, two reports - the second one is the one that fills the disk.
+
+        An `elif` let a recurring upload failure hide unbounded snapshot growth, which
+        is the faster failure on a machine whose free space sized this design.
+        """
+        stale = Path(hot_backup.default_backup_dir(settings.storage.data_dir)) / "alpha_sentinel-20260101T000000Z.db"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"x")
+        monkeypatch.setattr(hot_backup, "upload", lambda taken, r2, **kw: UploadOutcome(attempted=True, error="boom"))
+        monkeypatch.setattr(hot_backup, "prune", lambda directory, *, keep: [])
+        tight = replace(settings, storage=replace(settings.storage, backup_keep=1))
+
+        result = make_engine(tight, store).maintenance(force=True)
+
+        assert "upload: boom" in result["backup_error"]
+        assert "retention:" in result["backup_error"]
+
+    def test_an_existing_remote_key_is_not_claimed_as_this_run_upload(self, settings, store, monkeypatch):
+        """The key exists; whether it holds these bytes is a different question.
+
+        Snapshot names are second-precise, so a manual and a scheduled backup can collide
+        on one key. The maintenance result must say `exists` and must not hand the
+        operator a `remote_key` that implies this run's copy is off-site.
+        """
+        monkeypatch.setattr(
+            hot_backup, "upload", lambda taken, r2, **kw: UploadOutcome(attempted=True, key="pre/key", skipped="exists")
+        )
+
+        result = make_engine(settings, store).maintenance(force=True)
+
+        assert result["backup"]["remote"] == "exists"
+        assert result["backup"]["remote_key"] is None
+        assert "backup_error" not in result  # not a failure, just not this run's upload
+
     def test_a_failed_snapshot_does_not_break_maintenance(self, settings, store, monkeypatch):
         """Unprotected is not the same as broken.
 

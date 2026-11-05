@@ -766,6 +766,25 @@ class ScanEngine:
         log.info("maintenance_finished", extra=result)
         return result
 
+    def _backup_is_due(self, result: dict[str, Any]) -> bool:
+        """Whether the cadence says to snapshot now, recording any failure to ask.
+
+        Kept apart from the snapshot itself because a locked `kv` row on this read is a
+        reason to skip the pass, not a reason to lose the maintenance report that the
+        caller is about to return. The deadline stays unadvanced either way, so the next
+        pass retries.
+        """
+        try:
+            last = float(self.store.get_state(LAST_BACKUP_KEY, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        except Exception as exc:  # noqa: BLE001 - a read failure must not abort maintenance
+            result["backup_error"] = f"state read: {type(exc).__name__}: {str(exc)[:200]}"
+            log.error("backup_state_read_failed", extra={"error": result["backup_error"]})
+            return False
+        interval = int(self.settings.storage.backup_interval_seconds or 0)
+        return not last or (time.time() - last) >= interval
+
     def _maybe_backup(self, result: dict[str, Any]) -> None:
         """Snapshot the hot store when its own cadence says so.
 
@@ -787,11 +806,7 @@ class ScanEngine:
         interval = int(self.settings.storage.backup_interval_seconds or 0)
         if interval <= 0 or self.dry_run:
             return
-        try:
-            last = float(self.store.get_state(LAST_BACKUP_KEY, 0.0) or 0.0)
-        except (TypeError, ValueError):
-            last = 0.0
-        if last and (time.time() - last) < interval:
+        if not self._backup_is_due(result):
             return
 
         keep = max(int(self.settings.storage.backup_keep or 1), 1)
@@ -820,17 +835,26 @@ class ScanEngine:
             log.error("backup_bookkeeping_failed", extra={"error": result["backup_error"]})
             return
 
+        problems = []
         if outcome.error:
             # The off-site mirror is the one thing a local copy cannot prove, so a failed
             # upload is reported rather than folded into the absence of a key.
-            result["backup_error"] = f"upload: {outcome.error}"
-        elif holding > keep:
-            result["backup_error"] = f"retention: {holding} snapshots on disk, asked to keep {keep}"
+            problems.append(f"upload: {outcome.error}")
+        if holding > keep:
+            problems.append(f"retention: {holding} snapshots on disk, asked to keep {keep}")
+        if problems:
+            # Both, never one-or-the-other: a recurring upload failure that masks
+            # unbounded disk growth hides the failure with the shorter fuse on a
+            # machine whose free space sized this whole design.
+            result["backup_error"] = "; ".join(problems)
         result["backup"] = {
             "name": taken.path.name,
             "rows": taken.rows,
             "schema_version": taken.schema_version,
-            "remote_key": outcome.key,
+            # Only this run's own copy counts as a key: an existing object under the
+            # same second-precision name was placed there by someone else.
+            "remote_key": outcome.key if outcome.uploaded else None,
+            "remote": outcome.state,
             "pruned": len(removed),
         }
 

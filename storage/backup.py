@@ -363,11 +363,33 @@ class UploadOutcome:
     nothing was attempted" and "the upload failed". Those are different facts, and the
     second one is the whole reason an off-site copy exists: a backup routine that
     quietly stops uploading is indistinguishable from no backup routine at all.
+
+    ``skipped`` guards a third state that must not be folded into success: the key
+    already existed, so whatever bytes are off-site were placed there by someone
+    else - typically a second snapshot taken in the same second, under the same
+    second-precision name, from a store that has since changed.
     """
 
     attempted: bool = False
     key: str | None = None
     error: str | None = None
+    skipped: str | None = None
+
+    @property
+    def uploaded(self) -> bool:
+        """True only when this snapshot's own bytes are now off-site."""
+        return self.attempted and self.key is not None and self.error is None and self.skipped is None
+
+    @property
+    def state(self) -> str:
+        """One word an operator or a log line can group by."""
+        if not self.attempted:
+            return "disabled"
+        if self.error:
+            return "failed"
+        if self.skipped:
+            return self.skipped
+        return "uploaded"
 
 
 def upload(taken: Snapshot, r2: R2Settings, *, overwrite: bool = False) -> UploadOutcome:
@@ -396,13 +418,14 @@ def upload(taken: Snapshot, r2: R2Settings, *, overwrite: bool = False) -> Uploa
         if not overwrite:
             # upload_file has no "create only" mode, and a snapshot name carries a
             # second-resolution timestamp: a second run in the same second would
-            # silently replace the first, so the collision is checked explicitly. A
-            # collision means the copy is already off-site, which is success, not an
-            # error - the object under that key is this snapshot under this name.
+            # silently replace the first, so the collision is checked explicitly. It
+            # is reported as skipped, not success - `head_object` proves a key exists,
+            # not that the object under it is this snapshot, and the two can differ
+            # whenever a manual and a scheduled backup land in one second.
             try:
                 client.head_object(Bucket=r2.bucket, Key=key)
-                log.info("backup_upload_exists", extra={"key": key})
-                return UploadOutcome(attempted=True, key=key)
+                log.warning("backup_upload_exists", extra={"key": key})
+                return UploadOutcome(attempted=True, key=key, skipped="exists")
             except Exception:  # noqa: BLE001 - a missing key is the expected path
                 pass
         client.upload_file(str(taken.path), r2.bucket, key, ExtraArgs=extra)

@@ -9,6 +9,7 @@ someone needs it.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -378,6 +379,59 @@ def test_a_failed_upload_is_told_apart_from_an_absent_one(store, settings, make_
     assert outcome.attempted is True
     assert outcome.key is None
     assert outcome.error and "bad credentials" in outcome.error
+
+
+def test_an_existing_remote_key_is_not_reported_as_this_upload(store, settings, make_verdict, tmp_path, monkeypatch):
+    """`head_object` proves a key exists, not that it holds these bytes.
+
+    Snapshot names carry second-resolution timestamps, so a manual backup and a
+    scheduled one can collide on one key. Reporting that as "uploaded" would tell the
+    operator this run's copy is off-site when someone else's is.
+    """
+    from types import SimpleNamespace
+
+    import boto3
+
+    store.record_verdict(make_verdict())
+    taken = snapshot(settings.storage.hot_db_path, tmp_path / "copy.db")
+    r2 = SimpleNamespace(is_configured=lambda: True, client_kwargs=lambda: {}, bucket="snapshots", prefix="")
+
+    class _Client:
+        def head_object(self, **kwargs):
+            return {"ContentLength": 1}
+
+        def upload_file(self, *args, **kwargs):
+            raise AssertionError("an existing key must not be silently replaced")
+
+    monkeypatch.setattr(boto3, "client", lambda *args, **kwargs: _Client())
+
+    outcome = upload(taken, r2)
+
+    assert outcome.attempted is True
+    assert outcome.skipped == "exists" and outcome.state == "exists"
+    assert outcome.uploaded is False and outcome.error is None
+
+
+def test_a_missing_boto3_is_reported_rather_than_raised(store, settings, make_verdict, tmp_path, monkeypatch):
+    """The dependency can be absent while the configuration says otherwise.
+
+    That combination is reachable now the SDK-era pins are gone: `R2_*` still set,
+    boto3 simply not installed in whatever environment is running the backup.
+    """
+    from types import SimpleNamespace
+
+    store.record_verdict(make_verdict())
+    taken = snapshot(settings.storage.hot_db_path, tmp_path / "copy.db")
+    r2 = SimpleNamespace(is_configured=lambda: True, client_kwargs=lambda: {}, bucket="snapshots", prefix="")
+    monkeypatch.setitem(sys.modules, "boto3", None)
+
+    outcome = upload(taken, r2)
+
+    assert outcome.attempted is True and outcome.state == "failed"
+    # A halted import raises ModuleNotFoundError, the subclass every real missing
+    # dependency produces on this interpreter - the point is that it is reported,
+    # not that it is named exactly.
+    assert "ModuleNotFoundError" in (outcome.error or "")
 
 
 def test_snapshots_in_counts_exactly_what_prune_deletes(tmp_path):

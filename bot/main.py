@@ -460,7 +460,11 @@ def _run_backup(args: argparse.Namespace, settings: Settings) -> int:
         json.dumps(
             {
                 **taken.to_dict(),
-                "remote_key": outcome.key,
+                "remote_key": outcome.key if outcome.uploaded else None,
+                # "disabled" | "uploaded" | "exists" | "failed". The last two are not
+                # interchangeable: an existing key proves someone put an object there,
+                # not that it holds this snapshot's bytes.
+                "upload_state": outcome.state,
                 # A failed upload still exits 0 - the local file is the product - but it
                 # has to be visible in the output, or a cron job that stopped copying
                 # off-site looks identical to one that never had an off-site copy.
