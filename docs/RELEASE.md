@@ -111,6 +111,29 @@ pmset -g assertions | grep -i caffeinate                # "caffeinate asserting 
 `caffeinate -s` holds system sleep only while the job runs and only on AC power, so
 `make mac-uninstall` removes the behaviour completely.
 
+## Reloading a unit after editing its plist
+
+`kickstart -k` restarts a process with the config launchd already loaded; it does **not**
+re-read the file. To apply an edited plist you must boot out and bootstrap:
+
+```bash
+uid=$(id -u)
+launchctl bootout   gui/$uid/com.alphasentinel.watchdog
+launchctl bootstrap gui/$uid ~/Library/LaunchAgents/com.alphasentinel.watchdog.plist
+launchctl print     gui/$uid/com.alphasentinel.watchdog | grep -E "state|pid"
+```
+
+Two traps, both hit for real while writing this. Bootstrapping immediately after a
+bootout can fail with `Bootstrap failed: 5: Input/output error` — the label is still
+draining, so wait a few seconds and retry, and until it succeeds **that unit is not
+running**: supervision being off looks exactly like supervision being quiet. Check
+`launchctl list | grep alphasentinel` shows every unit you expect, not just the one you
+touched. Then confirm any assertion a unit exists to hold:
+
+```bash
+pmset -g assertions | grep -i caffeinate     # "caffeinate asserting forever"
+```
+
 ## Log files
 
 Everything under `~/Library/Logs/alpha-sentinel/` is bounded by the supervisor's
