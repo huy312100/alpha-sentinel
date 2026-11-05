@@ -496,7 +496,7 @@ paths match:
 ## Tests
 
 ```bash
-make test                                   # 788 tests
+make test                                   # 789 tests
 .venv/bin/python -m pytest tests/ -q -k engine
 .venv/bin/python -m flake8 . --count        # must print 0
 ```

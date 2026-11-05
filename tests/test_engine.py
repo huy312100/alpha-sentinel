@@ -775,6 +775,22 @@ class TestScheduledBackups:
         assert result["backup"]["remote_key"] is None
         assert "backup_error" not in result  # not a failure, just not this run's upload
 
+    def test_a_corrupt_backup_marker_is_treated_as_no_backup_yet(self, settings, store):
+        """A garbage counter must not stop backups or crash the pass.
+
+        The value comes from `kv`, where a half-written row or a hand edit can leave
+        anything at all. Converting it is inside the guard, so the worst case is the
+        one for an absent marker: take a snapshot now, and overwrite the garbage.
+        """
+        store.put_state(LAST_BACKUP_KEY, "not-a-number")
+        engine = make_engine(settings, store)
+
+        result = engine.maintenance(force=True)
+
+        assert "backup" in result and "backup_error" not in result
+        assert len(self._snapshots(settings)) == 1
+        assert float(store.get_state(LAST_BACKUP_KEY)) > 0  # the garbage was replaced
+
     def test_a_failed_snapshot_does_not_break_maintenance(self, settings, store, monkeypatch):
         """Unprotected is not the same as broken.
 
