@@ -16,6 +16,8 @@ from pathlib import Path
 OPS = Path(__file__).resolve().parents[1] / "ops"
 BOT_LABEL = "com.alphasentinel.bot"
 WATCHDOG_LABEL = "com.alphasentinel.watchdog"
+HOLD_AWAKE_LABEL = "com.alphasentinel.hold-awake"
+ALL_UNITS = (BOT_LABEL, WATCHDOG_LABEL, HOLD_AWAKE_LABEL)
 
 
 def unit(name: str) -> dict:
@@ -41,6 +43,22 @@ def test_each_unit_declares_the_label_its_filename_implies():
     something else and the old copy is never replaced."""
     assert unit(BOT_LABEL)["Label"] == BOT_LABEL
     assert unit(WATCHDOG_LABEL)["Label"] == WATCHDOG_LABEL
+    assert unit(HOLD_AWAKE_LABEL)["Label"] == HOLD_AWAKE_LABEL
+
+
+def test_every_log_a_unit_writes_is_bounded_by_the_supervisor():
+    """One unbounded file under the log directory defeats the whole cap.
+
+    The original check covered only the bot's two paths, so a third unit arriving
+    with its own stderr would have grown in silence - which is exactly what a soak
+    on a small disk is exposed to.
+    """
+    written = set()
+    for name in ALL_UNITS:
+        document = unit(name)
+        written.update(document[key] for key in ("StandardOutPath", "StandardErrorPath") if key in document)
+
+    assert written <= set(flagged(WATCHDOG_LABEL, "--log-file")), sorted(written - set(flagged(WATCHDOG_LABEL, "--log-file")))
 
 
 def test_the_supervisor_kickstarts_the_label_the_bot_actually_uses():
@@ -65,7 +83,7 @@ def test_both_units_start_with_the_session_and_throttle_a_failing_job():
     survives a reboot unattended, which needs automatic login or a root-level
     LaunchDaemon, and the second is the wrong privilege for a process holding keys.
     """
-    for name in (BOT_LABEL, WATCHDOG_LABEL):
+    for name in (BOT_LABEL, WATCHDOG_LABEL, HOLD_AWAKE_LABEL):
         document = unit(name)
         assert document["RunAtLoad"] is True, name
         assert document["KeepAlive"] is True, name
@@ -95,9 +113,28 @@ def test_the_log_cap_matches_the_compose_file_ceiling():
     assert float(flagged(WATCHDOG_LABEL, "--max-log-mb")[0]) == 20.0
 
 
+def test_the_keep_awake_guard_holds_indefinitely_and_only_system_sleep():
+    """A timed assertion is worse than none: sleep returns mid-soak, quietly.
+
+    `-s` is the system-sleep assertion, valid on AC power only, which is the
+    measured problem here - launchd intervals do not fire while the host sleeps,
+    so an eight-hour nap deletes eight hours of due cycles and the drift lands on
+    every schedule derived from the interval: the cooldown, both health windows,
+    the soak itself.
+    """
+    argv = arguments(HOLD_AWAKE_LABEL)
+
+    assert argv[0] == "/usr/bin/caffeinate"
+    assert "-s" in argv
+    # No timeout, and no display/disk-idle assertions: this is about the collector
+    # keeping time, not about keeping a screen lit.
+    assert "-t" not in argv and "-u" not in argv and "-d" not in argv and "-i" not in argv
+    assert unit(HOLD_AWAKE_LABEL).get("WorkingDirectory") is None  # needs no repo path
+
+
 def test_installing_replaces_every_placeholder():
     """A leftover ``__REPO__`` is a path that cannot exist, discovered at load."""
-    for name in (BOT_LABEL, WATCHDOG_LABEL):
+    for name in ALL_UNITS:
         text = (OPS / f"{name}.plist").read_text(encoding="utf-8")
         assert "__HOME__/" in text or "__REPO__/" in text, name
 

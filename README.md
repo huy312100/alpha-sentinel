@@ -638,6 +638,9 @@ mode plus a file-sync daemon is how you end up restoring a conflict copy.
 
 ## Operational notes
 
+Releases, restore and rollback rehearsals, the soak pass/fail conditions and the
+pre-live checklist live in [`docs/RELEASE.md`](docs/RELEASE.md).
+
 * **Nothing here is investment advice.** The output is a research note with a score.
 * A `degraded` flag on a verdict means an agent answered but the pair was incomplete;
   the engine counts it as an error so a run with degraded audits reports `partial`.
