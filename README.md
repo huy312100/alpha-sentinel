@@ -87,11 +87,17 @@ DeepSeek — optionally `GOPLUS_APP_KEY`, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID
 ```bash
 make status                  # what the hot store knows right now
 make health                  # is the scan loop still turning? (exit 1 if not)
+make coverage                # what the agents were actually told, per layer (live calls)
 make dry-run                 # one cycle, nothing persisted
 make once                    # one real cycle
 make bot                     # the daemon loop (SCAN_INTERVAL_SECONDS)
 make dashboard               # Streamlit on 127.0.0.1:8501
 ```
+
+`make coverage` is the one to run before believing a verdict. A thin instrument is not
+a thin opinion: the risk auditor is told to treat missing data as unverified risk, so
+the layer mix decides whether the answer is a judgement or a refusal. `make health`
+answers "is the loop turning" and stays green through both.
 
 ### Markets
 
