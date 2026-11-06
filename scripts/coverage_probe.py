@@ -79,8 +79,18 @@ def _reasons(signals: Sequence[LayerSignal]) -> list[str]:
     return sorted(seen.values())
 
 
-async def collect(settings: Settings, tokens: Sequence[TokenSnapshot]) -> tuple[list[Sequence[LayerSignal]], float]:
-    """One production batch: same pipeline, session, concurrency and buckets as a cycle."""
+async def collect(
+    settings: Settings, tokens: Sequence[TokenSnapshot]
+) -> tuple[list[Sequence[LayerSignal]], int, float]:
+    """One production batch: same pipeline, session, concurrency and buckets as a cycle.
+
+    Returns the *collected* signal groups, the *requested* instrument count, and the
+    wall clock. The two counts are kept apart on purpose: ``collect_many`` drops an
+    instrument whose collection fails, so a table built only from what came back
+    reports coverage of a smaller batch than the one asked for - and a coverage report
+    that silently shrinks its denominator is the one that tells an operator everything
+    is fine.
+    """
     started = time.perf_counter()
     per_token: list[Sequence[LayerSignal]] = []
     async with ScanPipeline(settings) as pipeline:
@@ -88,7 +98,18 @@ async def collect(settings: Settings, tokens: Sequence[TokenSnapshot]) -> tuple[
     for item in collected:
         if item is not None:
             per_token.append(item.snapshot.signals)
-    return per_token, time.perf_counter() - started
+    return per_token, len(tokens), time.perf_counter() - started
+
+
+def denominator_note(collected: int, requested: int) -> list[str]:
+    """Lines stating what the matrix below is a fraction *of*."""
+    lines = [f"  instruments collected: {collected} of {requested}"]
+    missing = requested - collected
+    if missing > 0:
+        lines.append(f"  WARNING: {missing} instrument(s) failed collection and are absent from the table")
+    if collected == 0:
+        lines.append("  the table below describes nothing; treat it as a failed run, not as zero coverage")
+    return lines
 
 
 async def run(*, asset_classes: Sequence[str] = (), limit: int | None = None) -> int:
@@ -108,7 +129,7 @@ async def run(*, asset_classes: Sequence[str] = (), limit: int | None = None) ->
 
     print(f"  {len(tokens)} instruments | concurrency {settings.scanners.token_concurrency} "
           f"| LAYER_TIMEOUT_SECONDS {settings.scanners.layer_timeout_seconds:g}s")
-    per_token, wall = await collect(settings, tokens)
+    per_token, requested, wall = await collect(settings, tokens)
 
     counts: collections.Counter = collections.Counter()
     reasons: dict[str, str] = {}
@@ -119,7 +140,10 @@ async def run(*, asset_classes: Sequence[str] = (), limit: int | None = None) ->
         for line in _reasons(signals):
             reasons.setdefault(line.split(" [", 1)[0], line)
 
-    print(f"  batch wall {wall:.1f}s\n")
+    print(f"  batch wall {wall:.1f}s")
+    for line in denominator_note(len(per_token), requested):
+        print(line)
+    print()
     print(format_table(counts, rows=rows))
     if reasons:
         print("\n  what the auditor was not told, and why:")

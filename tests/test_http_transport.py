@@ -65,6 +65,20 @@ class FakeSession:
         return FakeResponse(outcome[0], headers=outcome[1])
 
 
+class RecordingLimiter:
+    """A bucket that reports what was asked of it, for the pacing-contract tests."""
+
+    def __init__(self) -> None:
+        self.acquires = 0
+        self.penalties: list[float] = []
+
+    async def acquire(self) -> None:
+        self.acquires += 1
+
+    def penalize(self, seconds: float) -> None:
+        self.penalties.append(seconds)
+
+
 @pytest.fixture
 def sleeps(monkeypatch) -> list[float]:
     """Record every backoff the transport asks for, without waiting for it."""
@@ -272,3 +286,31 @@ class TestThrottleAwareRetry:
 
         assert sleeps[0] >= 25.0
         assert limiter.blocked_for >= 24.0
+
+    async def test_a_retry_is_another_request_and_paces_itself(self, sleeps):
+        """The half of a rate limit that spacing only the first attempt is not.
+
+        Measured on this head before the fix: a bucket set to 9 requests/minute put
+        14/minute on the vendor at 2.00 HTTP attempts per logical request, because
+        retries bypassed the bucket. ``penalize`` was still recorded, so nothing in the
+        logs looked wrong - the pacing simply was not applied to the traffic.
+        """
+        session = FakeSession([(429, {"Retry-After": "2"}), (429, {"Retry-After": "2"}), (200, {})])
+        limiter = RecordingLimiter()
+
+        await request_json(session, URL, retries=2, limiter=limiter)
+
+        # The caller acquires for attempt 1 outside this function; attempts 2 and 3
+        # must acquire here, so 2 is the whole of the transport's responsibility.
+        assert limiter.acquires == 2, limiter.acquires
+        assert all(penalty >= DEFAULT_THROTTLE_WAIT_SECONDS for penalty in limiter.penalties), limiter.penalties
+
+    async def test_a_clean_first_attempt_acquires_nothing_extra(self, sleeps):
+        """The retry pacing must not become a second tax on requests that worked."""
+        session = FakeSession([(200, {})])
+        limiter = RecordingLimiter()
+
+        await request_json(session, URL, retries=2, limiter=limiter)
+
+        assert limiter.acquires == 0
+        assert limiter.penalties == []

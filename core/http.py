@@ -93,16 +93,23 @@ async def request_json(
     replaying it would deliver the alert twice. Callers that know their POST is
     safe to replay (an LLM completion, for example) pass ``idempotent=True``.
 
-    ``limiter`` is the caller's per-host token bucket. It is not used to space this
-    request - the shared client acquires before calling - it is used so that a 429
-    *teaches the bucket*: the penalty is recorded once, on shared state, and every
-    other coroutine heading at the same host waits instead of discovering the closed
-    window for itself one request at a time.
+    ``limiter`` is the caller's per-host token bucket. The shared client acquires it
+    once before calling, and **every retry acquires it again** - a retry is another
+    request at the same vendor, so a bucket that only spaced the first attempt is not
+    a rate limit. A 429 additionally *teaches the bucket*: the penalty is recorded
+    once, on shared state, and every other coroutine heading at the same host waits
+    instead of discovering the closed window for itself one request at a time.
     """
     verb = method.upper()
     retry_allowed = idempotent if idempotent is not None else verb in {"GET", "HEAD", "OPTIONS"}
     last_error: Exception | None = None
     for attempt in range(retries + 1):
+        if attempt and limiter is not None:
+            # This was the missing half. Measured against GeckoTerminal: a bucket paced
+            # to 9 requests/minute delivered 2.00 HTTP attempts per logical request,
+            # i.e. 14/minute, because the retries went straight out the door. The
+            # residual rejections were ours, and nothing in the logs showed it.
+            await limiter.acquire()
         try:
             async with session.request(
                 method,

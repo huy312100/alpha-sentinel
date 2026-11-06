@@ -9,7 +9,7 @@ tested without a vendor. Only the pure half is testable offline; the network hal
 from __future__ import annotations
 
 from core.models import Layer, LayerSignal, SignalStatus
-from scripts.coverage_probe import STATUS_COLUMNS, _reasons, format_table, tally
+from scripts.coverage_probe import STATUS_COLUMNS, _reasons, denominator_note, format_table, tally
 
 
 def _signal(layer: Layer, status: SignalStatus, *, summary: str = "", error: str = "") -> LayerSignal:
@@ -72,3 +72,18 @@ def test_table_columns_lead_with_ok_and_count_rows():
     # "layers with usable data" counts layers with at least one ok, so technicals
     # (degraded + unavailable) and social (skipped) must not be reported as covered.
     assert "layers with any usable data: 1 of 3" in table
+
+
+def test_denominator_states_what_the_matrix_is_a_fraction_of():
+    # collect_many drops an instrument whose collection fails. The counts below stay
+    # true while describing a smaller batch than was asked for, so the shortfall has
+    # to be printed rather than inferred.
+    assert denominator_note(24, 24) == ["  instruments collected: 24 of 24"]
+    short = denominator_note(11, 24)
+    assert "11 of 24" in short[0]
+    assert "WARNING" in short[1] and "13" in short[1]
+
+
+def test_an_empty_batch_is_reported_as_a_failure_not_as_zero_coverage():
+    lines = denominator_note(0, 24)
+    assert any("failed run" in line for line in lines), lines
