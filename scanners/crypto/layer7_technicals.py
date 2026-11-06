@@ -27,7 +27,7 @@ from core.instruments import AssetClass
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, get_chain_profile
 from scanners.base import BaseScanner, ScanContext, log_scale
 from scanners.crypto.layer4_dex import fetch_pool_trades, load_market
-from scanners.shared.http_client import to_float
+from scanners.shared.http_client import PACED_HOST_TIMEOUT_SECONDS, to_float
 from scanners.shared.series import fetch_ohlcv
 from scanners.shared.technicals import (
     MIN_CANDLES,
@@ -76,6 +76,11 @@ class CryptoTechnicalsScanner(BaseScanner):
     layer = Layer.TECHNICALS
     weight = 1.0
     asset_classes = frozenset({AssetClass.CRYPTO})
+    #: Three GeckoTerminal reads per token behind one ~10 calls/minute host, shared
+    #: with layer 4 and with every other token collecting concurrently. The default
+    #: 20s layer budget cannot cover that queue, and the failure it reports ("layer
+    #: timed out") would blame the vendor for our own pacing.
+    min_timeout_seconds = PACED_HOST_TIMEOUT_SECONDS
 
     async def collect(self, token: TokenSnapshot, ctx: ScanContext) -> LayerSignal:  # noqa: C901
         market = await load_market(token, ctx)

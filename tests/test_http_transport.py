@@ -1,0 +1,198 @@
+"""Transport policy: what a retry costs, and what a 429 teaches.
+
+These are the two behaviours the scanner layers inherit and never implement
+themselves, so they are tested against the seam rather than against a vendor:
+
+* ``Retry-After`` is read in both of its standard forms and clamped;
+* a throttle response closes the *host* for every caller, while an ordinary 500 does
+  not - which is the difference between "we are over our quota" and "the server hiccuped".
+
+Nothing here touches the network, and no test sleeps for a real vendor window: the
+recorded ``asyncio.sleep`` delays are the assertion.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from typing import Any
+
+import pytest
+
+import core.http as http_module
+from core.http import (
+    DEFAULT_THROTTLE_WAIT_SECONDS,
+    MAX_THROTTLE_WAIT_SECONDS,
+    HttpError,
+    RateLimiter,
+    parse_retry_after,
+    request_json,
+)
+
+URL = "https://api.geckoterminal.com/api/v2/networks/eth/pools/0xdead/ohlcv/hour"
+
+
+class FakeResponse:
+    def __init__(self, status: int, *, headers: dict[str, str] | None = None) -> None:
+        self.status = status
+        self.headers = headers or {}
+
+    async def text(self) -> str:
+        return '{"errors":[{"title":"Rate limited"}]}'
+
+    async def json(self, content_type: Any = None) -> dict[str, Any]:
+        return {"data": {"attributes": {}}}
+
+    async def __aenter__(self) -> FakeResponse:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+class FakeSession:
+    """Serves a scripted sequence of statuses, one per request made."""
+
+    def __init__(self, outcomes: list[Any]) -> None:
+        self._outcomes = list(outcomes)
+        self.requests = 0
+
+    def request(self, method: str, url: str, **kwargs: Any) -> Any:
+        self.requests += 1
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return FakeResponse(outcome[0], headers=outcome[1])
+
+
+@pytest.fixture
+def sleeps(monkeypatch) -> list[float]:
+    """Record every backoff the transport asks for, without waiting for it."""
+    recorded: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        recorded.append(seconds)
+
+    monkeypatch.setattr(http_module.asyncio, "sleep", fake_sleep)
+    return recorded
+
+
+class TestParseRetryAfter:
+    def test_delta_seconds(self):
+        assert parse_retry_after("30") == 30.0
+
+    def test_zero_is_an_answer_not_a_missing_header(self):
+        # The parser's job is to report what the header said, distinguishing "0" from
+        # absent. What to *do* about a 0 is the retry policy's decision, and it is not
+        # "go now" - see TestThrottleAwareRetry below.
+        assert parse_retry_after("0") == 0.0
+        assert parse_retry_after(None) is None
+        assert parse_retry_after("") is None
+
+    def test_http_date_deadline(self):
+        future = (http_module.utcnow() + timedelta(seconds=45)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        assert 5.0 <= parse_retry_after(future) <= 46.0
+
+    def test_garbage_is_ignored_rather_than_trusted(self):
+        assert parse_retry_after("soon") is None
+        assert parse_retry_after("-12") == 0.0
+
+    def test_a_hostile_window_is_clamped(self):
+        assert parse_retry_after("86400") == MAX_THROTTLE_WAIT_SECONDS
+
+
+class TestRateLimiterPenalty:
+    def test_penalty_is_the_longest_wait_asked_for(self):
+        limiter = RateLimiter(1.0, burst=1)
+        limiter.penalize(5.0)
+        first = limiter.blocked_for
+        limiter.penalize(2.0)
+        assert limiter.blocked_for == pytest.approx(first, abs=0.5)
+        limiter.penalize(30.0)
+        assert limiter.blocked_for > first
+
+    def test_penalty_is_clamped_to_the_same_ceiling_as_the_header(self):
+        limiter = RateLimiter(1.0, burst=1)
+        limiter.penalize(3600.0)
+        assert limiter.blocked_for <= MAX_THROTTLE_WAIT_SECONDS
+
+    async def test_acquire_waits_out_the_window_before_taking_a_token(self, sleeps):
+        limiter = RateLimiter(1.0, burst=1)
+        limiter.penalize(12.0)
+        await limiter.acquire()
+        assert any(wait >= 11.0 for wait in sleeps), sleeps
+
+
+class TestThrottleAwareRetry:
+    async def test_retry_after_header_sizes_the_retry_and_closes_the_host(self, sleeps):
+        session = FakeSession([(429, {"Retry-After": "7"}), (200, {})])
+        limiter = RateLimiter(1.0, burst=1)
+
+        payload = await request_json(session, URL, retries=2, limiter=limiter)
+
+        assert payload == {"data": {"attributes": {}}}
+        assert session.requests == 2
+        # The header, not the exponential default (1.5**0 + jitter < 2), is what the
+        # retry waited for.
+        assert sleeps[0] >= 7.0
+        assert limiter.blocked_for > 0
+
+    async def test_a_429_without_a_header_uses_the_blind_window(self, sleeps):
+        session = FakeSession([(429, {}), (200, {})])
+        limiter = RateLimiter(1.0, burst=1)
+
+        await request_json(session, URL, retries=2, limiter=limiter)
+
+        assert sleeps[0] >= DEFAULT_THROTTLE_WAIT_SECONDS
+        assert limiter.blocked_for > 0
+
+    async def test_a_zero_retry_after_does_not_disable_the_throttle(self, sleeps):
+        """Measured, not hypothetical.
+
+        A burst of 40 requests at this host drew 19 rejections and *every one* of them
+        carried ``Retry-After: 0``. That is self-consistent for a vendor metering a
+        window: an individual request can be retriable immediately while the window is
+        still shut. Honouring the 0 literally would restart the storm the instant the
+        throttle is supposed to end it, so the header may only lengthen the wait.
+        """
+        session = FakeSession([(429, {"Retry-After": "0"}), (200, {})])
+        limiter = RateLimiter(1.0, burst=1)
+
+        await request_json(session, URL, retries=2, limiter=limiter)
+
+        assert sleeps[0] >= DEFAULT_THROTTLE_WAIT_SECONDS
+        assert limiter.blocked_for > 0
+
+    async def test_a_plain_500_is_not_treated_as_quota(self, sleeps):
+        """The distinction the whole design rests on.
+
+        A hiccup must not close a host for everyone: if 500s were throttled like 429s,
+        one transient server fault would serialize an entire cycle behind a penalty
+        nobody asked for.
+        """
+        session = FakeSession([(500, {}), (200, {})])
+        limiter = RateLimiter(1.0, burst=1)
+
+        await request_json(session, URL, retries=2, limiter=limiter)
+
+        assert sleeps[0] < 5.0
+        assert limiter.blocked_for == 0.0
+
+    async def test_exhausted_retries_surface_the_status_and_the_window(self, sleeps):
+        """The header survives all the way out, because a layer that reports the
+        failure should be able to say whether it was quota or a fault."""
+        session = FakeSession([(429, {"Retry-After": "3"}), (429, {"Retry-After": "3"}), (429, {"Retry-After": "3"})])
+
+        with pytest.raises(HttpError) as raised:
+            await request_json(session, URL, retries=2)
+
+        assert raised.value.status == 429
+        assert raised.value.retry_after == 3.0
+        assert len(sleeps) == 2, sleeps
+
+    async def test_no_limiter_means_no_shared_state_to_penalize(self, sleeps):
+        """Callers without a bucket still honour the header; they just cannot teach anyone."""
+        session = FakeSession([(429, {"Retry-After": "9"}), (200, {})])
+
+        await request_json(session, URL, retries=2, limiter=None)
+
+        assert sleeps[0] >= 9.0

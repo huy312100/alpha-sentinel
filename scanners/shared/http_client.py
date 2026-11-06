@@ -32,26 +32,53 @@ log = get_logger(__name__)
 #: they own a paid key, or lower it for the strictest vendor.
 DEFAULT_REQUESTS_PER_SECOND = 8.0
 
+#: Hosts whose published free-tier budget is far below that default, keyed by netloc.
+#: 8 req/s is a generous reading of "public API" and these are not 8/s APIs. In one
+#: full cycle every crypto token lost its technicals read (11 x "every technicals
+#: provider failed") while the identical call in isolation returned 200 candles, and a
+#: controlled burst at this host returned HTTP 429 for 21 of 30 requests even paced at
+#: 0.5 req/s. So the layer that tells the auditor about price structure disappears for
+#: every token, and the auditor is right to score the gap as unverified risk. The
+#: number below is a seed, not a promise: what the vendor really allows is learned from
+#: the 429 by :meth:`core.http.RateLimiter.penalize`.
+FREE_TIER_REQUESTS_PER_SECOND: dict[str, float] = {
+    # api.geckoterminal.com/docs: "limited to approximately 10 calls/minute".
+    "api.geckoterminal.com": 0.15,
+}
+
 #: Live token buckets, one per host. Module-level on purpose: the limiter must
 #: survive individual scans, otherwise every cycle gets a fresh burst.
 _LIMITERS: dict[str, RateLimiter] = {}
 #: The rate each live bucket was built with, so a stricter caller can replace it.
 _RATES: dict[str, float] = {}
 
+#: How long a layer may take when its reads go through a host on a free-tier budget.
+#: A token bucket is a queue, and a queue has depth: with ``token_concurrency`` (4)
+#: instruments collecting at once and each firing ~5 GeckoTerminal reads (pool, trade
+#: tape x2, M15, H1), the twentieth request in that group starts ~133s after it was
+#: asked for. The 20s default is therefore not a tight budget but a guaranteed
+#: failure, and it reports our own pacing as "layer timed out". 180s covers the queue
+#: with margin for one retry; a vendor that is genuinely down still costs a bounded
+#: amount of cycle time (38 min measured today, window 3h).
+PACED_HOST_TIMEOUT_SECONDS = 180.0
+
 
 def limiter_for(url: str, rate_per_second: float = DEFAULT_REQUESTS_PER_SECOND) -> RateLimiter:
     """Return (and lazily create) the token bucket for ``url``'s host.
 
-    One bucket per host, but the *strictest* caller wins: asking for a later,
-    lower ``rate_per_second`` replaces the cached bucket instead of being ignored,
-    otherwise the first caller's rate would silently govern every other one.
+    One bucket per host, but the *strictest* rate wins twice over: a host listed in
+    :data:`FREE_TIER_REQUESTS_PER_SECOND` is capped by that entry however generous the
+    caller is, and among callers a later, lower ``rate_per_second`` replaces the cached
+    bucket instead of being ignored, otherwise the first caller's rate would silently
+    govern every other one.
     """
     host = urlparse(url).netloc.lower() or "unknown"
+    capped = min(rate_per_second, FREE_TIER_REQUESTS_PER_SECOND.get(host, rate_per_second))
     limiter = _LIMITERS.get(host)
-    if limiter is None or rate_per_second < _RATES.get(host, rate_per_second):
-        limiter = RateLimiter(rate_per_second, burst=max(1, int(rate_per_second)))
+    if limiter is None or capped < _RATES.get(host, capped):
+        limiter = RateLimiter(capped, burst=max(1, int(capped)))
         _LIMITERS[host] = limiter
-        _RATES[host] = rate_per_second
+        _RATES[host] = capped
     return limiter
 
 
@@ -69,7 +96,8 @@ async def request_json(
     rate_per_second: float = DEFAULT_REQUESTS_PER_SECOND,
 ) -> Any:
     """Rate-limited JSON request. Signature-compatible with ``core.http``."""
-    await limiter_for(url, rate_per_second).acquire()
+    limiter = limiter_for(url, rate_per_second)
+    await limiter.acquire()
     return await _core_request_json(
         session,
         url,
@@ -80,6 +108,9 @@ async def request_json(
         retries=retries,
         backoff=backoff,
         idempotent=idempotent,
+        # Passing the bucket is what lets a 429 close the host for everyone else
+        # already aimed at it, instead of each caller discovering the window alone.
+        limiter=limiter,
     )
 
 
@@ -207,6 +238,8 @@ def first_row(payload: Any) -> list[Any]:
 
 __all__ = [
     "DEFAULT_REQUESTS_PER_SECOND",
+    "FREE_TIER_REQUESTS_PER_SECOND",
+    "PACED_HOST_TIMEOUT_SECONDS",
     "ProviderResult",
     "fetch_provider",
     "first_float",
