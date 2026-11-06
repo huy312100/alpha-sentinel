@@ -26,6 +26,7 @@ from core.http import (
     RateLimiter,
     parse_retry_after,
     request_json,
+    throttle_penalty,
 )
 
 URL = "https://api.geckoterminal.com/api/v2/networks/eth/pools/0xdead/ohlcv/hour"
@@ -122,6 +123,33 @@ class TestRateLimiterPenalty:
         assert any(wait >= 11.0 for wait in sleeps), sleeps
 
 
+class TestThrottlePenaltyPolicy:
+    """Which response closes the host, and for how long.
+
+    The bug this pins is the one a status check invites: treating every retryable
+    status as quota, so a single 500 from a busy vendor stalls every concurrent
+    caller of that host for a window nobody declared.
+    """
+
+    def test_429_always_costs_at_least_one_estimated_window(self):
+        assert throttle_penalty(429, None) == DEFAULT_THROTTLE_WAIT_SECONDS
+        assert throttle_penalty(429, 0.0) == DEFAULT_THROTTLE_WAIT_SECONDS
+        assert throttle_penalty(429, 45.0) == 45.0
+
+    def test_a_named_window_is_honoured_on_any_status(self):
+        assert throttle_penalty(503, 20.0) == 20.0
+        assert throttle_penalty(404, 5.0) == 5.0
+
+    def test_a_bare_server_fault_is_not_quota(self):
+        assert throttle_penalty(500, None) is None
+        assert throttle_penalty(503, None) is None
+        assert throttle_penalty(502, None) is None
+        assert throttle_penalty(None, None) is None
+
+    def test_a_named_window_is_still_clamped(self):
+        assert throttle_penalty(503, 3600.0) == MAX_THROTTLE_WAIT_SECONDS
+
+
 class TestThrottleAwareRetry:
     async def test_retry_after_header_sizes_the_retry_and_closes_the_host(self, sleeps):
         session = FakeSession([(429, {"Retry-After": "7"}), (200, {})])
@@ -196,3 +224,51 @@ class TestThrottleAwareRetry:
         await request_json(session, URL, retries=2, limiter=None)
 
         assert sleeps[0] >= 9.0
+
+    async def test_the_attempt_that_gives_up_still_closes_the_host(self, sleeps):
+        """Penalising inside the retry path only would be the interesting half-bug.
+
+        The request that exhausts its retries is the one holding the proof the window
+        is shut. If it teaches nothing, every later caller rediscovers it with its own
+        budget - which is the storm this change exists to stop, in a new costume.
+        """
+        session = FakeSession([(429, {"Retry-After": "20"}), (429, {"Retry-After": "20"}), (429, {"Retry-After": "20"})])
+        limiter = RateLimiter(1.0, burst=1)
+
+        with pytest.raises(HttpError):
+            await request_json(session, URL, retries=2, limiter=limiter)
+
+        assert limiter.blocked_for >= 19.0
+
+    async def test_a_retries_zero_throttle_is_recorded_too(self, sleeps):
+        session = FakeSession([(429, {})])
+        limiter = RateLimiter(1.0, burst=1)
+
+        with pytest.raises(HttpError):
+            await request_json(session, URL, retries=0, limiter=limiter)
+
+        assert limiter.blocked_for > 0
+        assert sleeps == [], sleeps
+
+    async def test_a_bare_503_does_not_close_the_host_for_everyone(self, sleeps):
+        """The distinction a status set alone gets wrong.
+
+        A 503 is "server hiccuped" unless it names a window. Letting it penalise the
+        shared bucket would let one transient fault serialize a whole cycle.
+        """
+        session = FakeSession([(503, {}), (200, {})])
+        limiter = RateLimiter(1.0, burst=1)
+
+        await request_json(session, URL, retries=2, limiter=limiter)
+
+        assert sleeps[0] < 5.0
+        assert limiter.blocked_for == 0.0
+
+    async def test_a_503_that_names_a_window_is_honoured(self, sleeps):
+        session = FakeSession([(503, {"Retry-After": "25"}), (200, {})])
+        limiter = RateLimiter(1.0, burst=1)
+
+        await request_json(session, URL, retries=2, limiter=limiter)
+
+        assert sleeps[0] >= 25.0
+        assert limiter.blocked_for >= 24.0

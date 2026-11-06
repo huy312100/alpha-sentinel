@@ -64,20 +64,24 @@ PACED_HOST_TIMEOUT_SECONDS = 180.0
 
 
 def limiter_for(url: str, rate_per_second: float = DEFAULT_REQUESTS_PER_SECOND) -> RateLimiter:
-    """Return (and lazily create) the token bucket for ``url``'s host.
+    """Return (and lazily create) the one token bucket for ``url``'s host.
 
-    One bucket per host, but the *strictest* rate wins twice over: a host listed in
+    One bucket per host, and the *strictest* rate wins twice over: a host listed in
     :data:`FREE_TIER_REQUESTS_PER_SECOND` is capped by that entry however generous the
-    caller is, and among callers a later, lower ``rate_per_second`` replaces the cached
-    bucket instead of being ignored, otherwise the first caller's rate would silently
-    govern every other one.
+    caller is, and among callers a later, lower ``rate_per_second`` tightens the
+    bucket in place. In place rather than replaced, because callers keep the object
+    they were handed: two buckets for one host would mean two rates and would throw
+    away the window the first 429 recorded.
     """
     host = urlparse(url).netloc.lower() or "unknown"
     capped = min(rate_per_second, FREE_TIER_REQUESTS_PER_SECOND.get(host, rate_per_second))
     limiter = _LIMITERS.get(host)
-    if limiter is None or capped < _RATES.get(host, capped):
+    if limiter is None:
         limiter = RateLimiter(capped, burst=max(1, int(capped)))
         _LIMITERS[host] = limiter
+        _RATES[host] = capped
+    elif capped < _RATES.get(host, capped):
+        limiter.reconfigure(capped)
         _RATES[host] = capped
     return limiter
 

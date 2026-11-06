@@ -107,16 +107,34 @@ class TestRateLimiting:
         assert first is second
         assert other is not first
 
-    def test_a_later_stricter_rate_replaces_the_cached_bucket(self):
-        url = "https://strict.example.com/v1/thing"
-        fast = limiter_for(url, rate_per_second=20.0)
-        assert limiter_for(url, rate_per_second=20.0) is fast
+    def test_a_later_stricter_rate_reconfigures_the_same_bucket(self):
+        """Tightened in place, not replaced.
 
-        slow = limiter_for(url, rate_per_second=1.0)
-        assert slow is not fast
-        assert slow._interval == pytest.approx(1.0)
+        Callers hold the limiter they were handed. Building a second bucket for the
+        host would mean two rates issuing at it concurrently, and the window the first
+        429 recorded would be discarded by whoever tightened it.
+        """
+        url = "https://strict.example.com/v1/thing"
+        first = limiter_for(url, rate_per_second=20.0)
+        assert limiter_for(url, rate_per_second=20.0) is first
+
+        tightened = limiter_for(url, rate_per_second=1.0)
+        assert tightened is first
+        assert tightened._interval == pytest.approx(1.0)
+        assert tightened._burst == 1
         # A later, faster request must not loosen the strictest caller's rate.
-        assert limiter_for(url, rate_per_second=20.0) is slow
+        assert limiter_for(url, rate_per_second=20.0) is first
+
+    def test_tightening_the_rate_keeps_the_recorded_window(self):
+        url = "https://windowed.example.com/v1/thing"
+        limiter = limiter_for(url, rate_per_second=5.0)
+        limiter.penalize(30.0)
+        held = limiter.blocked_for
+
+        limiter_for(url, rate_per_second=0.5)
+
+        assert limiter.blocked_for >= held - 0.5
+        assert limiter._interval == pytest.approx(2.0)
 
     async def test_request_json_goes_through_the_shared_transport(self, monkeypatch):
         calls: list[tuple[str, dict]] = []

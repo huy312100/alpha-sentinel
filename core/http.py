@@ -134,19 +134,19 @@ async def request_json(
         except (aiohttp.ClientError, asyncio.TimeoutError, HttpError, ValueError) as exc:
             last_error = exc
             retryable = not isinstance(exc, HttpError) or (exc.status in RETRYABLE_STATUS)
+            status = getattr(exc, "status", None)
+            penalty = throttle_penalty(status, getattr(exc, "retry_after", None))
+            # Record the window *before* deciding whether to try again. The attempt
+            # that gives up is the one holding the information everyone else needs:
+            # penalising only inside the retry path leaves a ``retries=0`` caller, or
+            # a final 429, teaching the host nothing while it is still shut.
+            if penalty is not None and limiter is not None:
+                limiter.penalize(penalty)
             if attempt >= retries or not retryable or not retry_allowed:
                 break
             delay = backoff ** attempt + random.uniform(0, 0.3)
-            status = getattr(exc, "status", None)
-            requested = getattr(exc, "retry_after", None)
-            penalty: float | None = None
-            if status in THROTTLE_STATUS or requested is not None:
-                # A per-minute window does not reopen in 1.5 seconds, and a
-                # ``Retry-After: 0`` does not mean it is open. Take the longer of the
-                # vendor's number and our own estimate of a metered window.
-                penalty = max(DEFAULT_THROTTLE_WAIT_SECONDS, requested or 0.0)
-                if limiter is not None:
-                    limiter.penalize(penalty)
+            if penalty is not None:
+                # A per-minute window does not reopen in 1.5 seconds.
                 delay = max(delay, penalty)
             log.warning(
                 "http_retry",
@@ -165,6 +165,30 @@ async def request_json(
             await asyncio.sleep(delay)
     assert last_error is not None
     raise last_error
+
+
+def throttle_penalty(status: int | None, requested: float | None) -> float | None:
+    """Seconds to close the host for, or ``None`` when nothing was throttled.
+
+    Three cases, and the middle one is the reason this is a function rather than a
+    status check:
+
+    * **429** - a metered window, always. Even when the header says
+      ``Retry-After: 0``: measured on GeckoTerminal, every one of 19 rejections in a
+      40-request burst said 0 while still refusing, because the request *is*
+      immediately retryable and the *window* is what says no. Honouring that literally
+      restarts the storm the throttle exists to end.
+    * **any response with a ``Retry-After``** - the server named a window; honour it.
+    * **a bare 500/503** - a hiccup, and deliberately *not* a penalty. Closing a host
+      for 15s because one request bounced would stall every concurrent caller of it
+      on a fault nobody declared, which is the failure this whole change is meant to
+      remove.
+    """
+    if status == 429:
+        return max(DEFAULT_THROTTLE_WAIT_SECONDS, requested or 0.0)
+    if requested is not None:
+        return min(requested, MAX_THROTTLE_WAIT_SECONDS)
+    return None
 
 
 def to_float(value: Any) -> float | None:
@@ -232,6 +256,25 @@ class RateLimiter:
         horizon = time.monotonic() + max(0.0, min(seconds, MAX_THROTTLE_WAIT_SECONDS))
         self._blocked_until = max(self._blocked_until, horizon)
 
+    def reconfigure(self, rate_per_second: float, burst: int | None = None) -> None:
+        """Change the pacing of *this* bucket, keeping the window it already holds.
+
+        A per-host limiter is handed out to callers that keep the reference, so
+        "replace it with a stricter one" would drop the penalty on the floor and let
+        the old and new buckets issue to the same vendor concurrently - two buckets is
+        not one rate limit. Mutating in place keeps one clock for the host.
+
+        Deliberately not lock-guarded: the fields are independent floats read under
+        the lock's own serialisation, a rate change happens at configuration time and
+        not per request, and the worst case is one request paced at the interval that
+        was current when it looked.
+        """
+        self._interval = 1.0 / max(rate_per_second, 0.001)
+        requested = burst if burst is not None else max(1, int(rate_per_second))
+        self._burst = max(requested, 1)
+        # Never let a loosened burst keep more credit than the new ceiling allows.
+        self._tokens = min(self._tokens, float(self._burst))
+
     @property
     def blocked_for(self) -> float:
         """Seconds this host is still closed for. Observability and tests, not logic."""
@@ -269,6 +312,7 @@ __all__ = [
     "build_session",
     "parse_retry_after",
     "request_json",
+    "throttle_penalty",
     "to_float",
     "to_int",
 ]

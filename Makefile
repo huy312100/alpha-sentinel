@@ -1,6 +1,6 @@
 .PHONY: help install lint test audit ci demo honeypot smoke status health once dry-run scanners bot dashboard \
         probe ml-export ml-train ml-report docker-build docker-up docker-down docker-logs clean \
-        wheels-arm64 image-arm64 backup backup-verify backup-push mac-install mac-uninstall
+        wheels-arm64 image-arm64 backup backup-verify backup-push mac-install mac-uninstall coverage
 
 PY ?= python3
 VENV := .venv
@@ -49,7 +49,7 @@ test: ## Hermetic pytest suite (no keys, no network)
 audit: lint test ## Lint + tests
 
 ci: audit ## Full local gate: lint, tests, byte-compile, smoke
-	$(BIN)/python -m compileall -q bot core config scanners storage ai_engine dashboard ml ops tests
+	$(BIN)/python -m compileall -q bot core config scanners storage ai_engine dashboard ml ops tests scripts
 	$(MAKE) smoke
 
 demo: ## Run the dual-agent flow offline (no API key needed)
@@ -90,6 +90,9 @@ dry-run: ## One cycle with no writes and no alerts
 
 scanners: ## Probe one crypto token through every scanner layer
 	$(BIN)/python -m scanners --token 0x0000000000000000000000000000000000000001
+
+coverage: ## Layer coverage over a real batch: what the auditor is actually told
+	$(BIN)/python -m scripts.coverage_probe
 
 probe: ## Probe one listed instrument (equity) through the applicable layers
 	DEMO_MODE=true $(BIN)/python -m scanners --symbol AAPL --asset-class equity
