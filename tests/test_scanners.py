@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
-from core.models import SignalStatus, TokenSnapshot
-from scanners.base import ScanContext
+from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot
+from scanners.base import BaseScanner, ScanContext
+from scanners.shared.http_client import PACED_HOST_TIMEOUT_SECONDS
 from scanners.crypto.layer1_onchain import concentration_from_holders
 from scanners.crypto.layer2_derivatives import CryptoDerivativesScanner, parse_hyperliquid_context
 from scanners.crypto.layer3_social import CryptoSocialScanner
@@ -326,3 +328,60 @@ def test_calendar_rows_without_a_symbol_belong_to_nobody():
 
     assert "next_unlock_days" not in metrics
     assert metrics["next_upgrade_days"] == pytest.approx(6.0)
+
+
+# --------------------------------------------------------------------------- #
+# Layer timeout: a paced host is not a hung host
+# --------------------------------------------------------------------------- #
+class _SlowButCorrectScanner(BaseScanner):
+    """A vendor that answers in 200ms - slower than the default budget, not failed."""
+
+    layer = Layer.TECHNICALS
+    weight = 1.0
+    min_timeout_seconds = 5.0
+
+    async def collect(self, token: TokenSnapshot, ctx: ScanContext):
+        await asyncio.sleep(0.2)
+        return LayerSignal(
+            layer=self.layer,
+            score=60.0,
+            confidence=0.5,
+            weight=self.weight,
+            status=SignalStatus.OK,
+            summary="answered after the configured budget",
+        )
+
+
+class _UnpacedScanner(_SlowButCorrectScanner):
+    min_timeout_seconds = 0.0
+
+
+async def test_a_paced_layer_is_given_its_floor_not_the_default_budget(settings, make_snapshot):
+    """``LAYER_TIMEOUT_SECONDS`` is sized for vendors that answer immediately. A layer
+    that queues behind a free-tier bucket needs the floor, or our own pacing is
+    reported to the operator - and to the risk auditor - as a vendor failure.
+    """
+    tight = replace(settings, scanners=replace(settings.scanners, layer_timeout_seconds=0.05))
+
+    signal = await _SlowButCorrectScanner(tight).run(make_snapshot(), ScanContext(None, tight))
+
+    assert signal.status is SignalStatus.OK
+
+
+async def test_without_the_floor_the_same_read_is_a_timeout(settings, make_snapshot):
+    """Control for the test above: the floor is the only reason it passed."""
+    tight = replace(settings, scanners=replace(settings.scanners, layer_timeout_seconds=0.05))
+
+    signal = await _UnpacedScanner(tight).run(make_snapshot(), ScanContext(None, tight))
+
+    assert signal.status is SignalStatus.UNAVAILABLE
+    assert "timed out" in (signal.error or "")
+
+
+def test_the_crypto_layers_that_queue_on_the_paced_host_declare_it():
+    """The two GeckoTerminal consumers must carry the floor the bucket actually needs."""
+    from scanners.crypto.layer4_dex import CryptoDexScanner
+    from scanners.crypto.layer7_technicals import CryptoTechnicalsScanner
+
+    for scanner in (CryptoDexScanner, CryptoTechnicalsScanner):
+        assert scanner.min_timeout_seconds == PACED_HOST_TIMEOUT_SECONDS

@@ -12,6 +12,9 @@ import pytest
 from core.logging import REDACTED, clear_secrets, register_secret, scrub_url_params
 from scanners.shared import http_client
 from scanners.shared.http_client import (
+    DEFAULT_REQUESTS_PER_SECOND,
+    FREE_TIER_REQUESTS_PER_SECOND,
+    PACED_HOST_TIMEOUT_SECONDS,
     ProviderResult,
     fetch_provider,
     first_float,
@@ -104,16 +107,34 @@ class TestRateLimiting:
         assert first is second
         assert other is not first
 
-    def test_a_later_stricter_rate_replaces_the_cached_bucket(self):
-        url = "https://strict.example.com/v1/thing"
-        fast = limiter_for(url, rate_per_second=20.0)
-        assert limiter_for(url, rate_per_second=20.0) is fast
+    def test_a_later_stricter_rate_reconfigures_the_same_bucket(self):
+        """Tightened in place, not replaced.
 
-        slow = limiter_for(url, rate_per_second=1.0)
-        assert slow is not fast
-        assert slow._interval == pytest.approx(1.0)
+        Callers hold the limiter they were handed. Building a second bucket for the
+        host would mean two rates issuing at it concurrently, and the window the first
+        429 recorded would be discarded by whoever tightened it.
+        """
+        url = "https://strict.example.com/v1/thing"
+        first = limiter_for(url, rate_per_second=20.0)
+        assert limiter_for(url, rate_per_second=20.0) is first
+
+        tightened = limiter_for(url, rate_per_second=1.0)
+        assert tightened is first
+        assert tightened._interval == pytest.approx(1.0)
+        assert tightened._burst == 1
         # A later, faster request must not loosen the strictest caller's rate.
-        assert limiter_for(url, rate_per_second=20.0) is slow
+        assert limiter_for(url, rate_per_second=20.0) is first
+
+    def test_tightening_the_rate_keeps_the_recorded_window(self):
+        url = "https://windowed.example.com/v1/thing"
+        limiter = limiter_for(url, rate_per_second=5.0)
+        limiter.penalize(30.0)
+        held = limiter.blocked_for
+
+        limiter_for(url, rate_per_second=0.5)
+
+        assert limiter.blocked_for >= held - 0.5
+        assert limiter._interval == pytest.approx(2.0)
 
     async def test_request_json_goes_through_the_shared_transport(self, monkeypatch):
         calls: list[tuple[str, dict]] = []
@@ -135,6 +156,42 @@ class TestRateLimiting:
         assert url == "https://api.example.com/v1/thing"
         assert kwargs["params"] == {"q": "1"}
         assert kwargs["method"] == "GET"
+        # The bucket travels with the call: without it a 429 cannot close the host for
+        # the other coroutines already aimed at it. Asked with the caller's own rate,
+        # because "strictest wins" means a default-rate probe here would legitimately
+        # rebuild the bucket and fail for the wrong reason.
+        assert kwargs["limiter"] is limiter_for(url, rate_per_second=1000.0)
+
+
+class TestFreeTierPacing:
+    """Some vendors are metered per minute, and 8 req/s silently loses a whole layer.
+
+    A cycle that stampedes a ~10 calls/minute host does not get 10 calls/minute of
+    data: it gets 429s for every crypto technicals read and an auditor told the data
+    is missing. These are the invariants that keep the pacing honest.
+    """
+
+    def test_a_listed_host_is_capped_however_generous_the_caller_is(self):
+        host, rate = next(iter(FREE_TIER_REQUESTS_PER_SECOND.items()))
+        limiter = limiter_for(f"https://{host}/api/v2/anything", rate_per_second=1000.0)
+        assert limiter._interval == pytest.approx(1.0 / rate)
+
+    def test_an_unlisted_host_keeps_the_default_rate(self):
+        limiter = limiter_for("https://api.unlisted.example/v1/thing")
+        assert limiter._interval == pytest.approx(1.0 / DEFAULT_REQUESTS_PER_SECOND)
+
+    def test_a_later_generous_caller_cannot_loosen_a_paced_host(self):
+        url = "https://api.geckoterminal.com/api/v2/networks/eth/pools/0xdead/ohlcv/hour"
+        paced = limiter_for(url)
+        assert limiter_for(url, rate_per_second=100.0) is paced
+
+    def test_the_table_only_holds_rates_the_floor_can_cover(self):
+        # PACED_HOST_TIMEOUT_SECONDS is the promise that a queued request still lands.
+        # A table entry slower than that floor would fail layers quietly.
+        assert FREE_TIER_REQUESTS_PER_SECOND
+        for host, rate in FREE_TIER_REQUESTS_PER_SECOND.items():
+            assert 0.0 < rate <= 1.0, host
+            assert PACED_HOST_TIMEOUT_SECONDS > 1.0 / rate, host
 
 
 class TestIndicatorMaths:

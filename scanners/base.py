@@ -50,6 +50,13 @@ class BaseScanner(abc.ABC):
     layer: Layer
     weight: float = 1.0
     timeout_seconds: float | None = None
+    #: Floor for the wall clock this layer may take. Layers whose reads queue behind
+    #: a free-tier host need it: the ``LAYER_TIMEOUT_SECONDS`` budget is sized for
+    #: vendors that answer immediately, and 20s against an API paced at ~10
+    #: calls/minute is not a tight budget, it is a guaranteed timeout that reports our
+    #: own pacing as a vendor failure. Applied as a maximum with the configured value,
+    #: so an operator raising the budget still wins.
+    min_timeout_seconds: float = 0.0
     #: Asset classes this layer can describe. ``None`` means all of them.
     #: A scanner returns ``SKIPPED`` (zero weight) for anything outside its set,
     #: so a layer that does not apply never drags the prior toward neutral.
@@ -76,7 +83,10 @@ class BaseScanner(abc.ABC):
         if not self.supports(token):
             return self.skipped(token, f"not applicable to {token.asset_class}")
         started = time.perf_counter()
-        timeout = self.timeout_seconds or self.settings.scanners.layer_timeout_seconds
+        timeout = max(
+            self.timeout_seconds or self.settings.scanners.layer_timeout_seconds,
+            self.min_timeout_seconds,
+        )
         try:
             signal = await asyncio.wait_for(self.collect(token, ctx), timeout=timeout)
         except asyncio.TimeoutError:

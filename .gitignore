@@ -51,3 +51,8 @@ gha-creds-*.json
 
 # Qoder workspace metadata
 .qoder/
+
+# Scratch: the ad-hoc probes that produce a measurement (vendor bursts, one-off
+# replays). They are evidence, not deliverables - flake8 must not gate on them and
+# `git add .` must not sweep them into a release.
+/tmp/

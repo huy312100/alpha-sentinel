@@ -33,7 +33,7 @@ from core.instruments import AssetClass
 from core.logging import get_logger
 from core.models import Layer, LayerSignal, SignalStatus, TokenSnapshot, WashTradingReport, get_chain_profile
 from scanners.base import BaseScanner, ScanContext, clamp, linear, log_scale, safe_div
-from scanners.shared.http_client import request_json, to_float, to_int
+from scanners.shared.http_client import PACED_HOST_TIMEOUT_SECONDS, request_json, to_float, to_int
 
 log = get_logger(__name__)
 
@@ -376,6 +376,10 @@ class CryptoDexScanner(BaseScanner):
     layer = Layer.DEX
     weight = 1.2
     asset_classes = frozenset({AssetClass.CRYPTO})
+    #: Pool resolution and the trade tape both come from the host paced to a
+    #: free-tier budget, so this layer queues with layer 7 rather than running inside
+    #: a 20s vendor timeout.
+    min_timeout_seconds = PACED_HOST_TIMEOUT_SECONDS
 
     async def collect(self, token: TokenSnapshot, ctx: ScanContext) -> LayerSignal:  # noqa: C901
         market = await load_market(token, ctx)
