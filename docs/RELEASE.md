@@ -163,15 +163,113 @@ path it resolved.
 - spend ceilings never bind silently: every exhaustion produces an explicit degraded
   verdict, not a missing one. **Not exercisable while `DEMO_MODE=true`** — there is no
   spend to ceiling, so a demo soak proves plumbing and nothing about budget behaviour.
+  Equally inert on a self-hosted endpoint, which has no prices: leave the ceilings
+  unset rather than setting one over zero prices, because `Settings.validate` rightly
+  refuses a ceiling nothing can measure. Budget behaviour needs a priced provider.
+
+These four are plumbing conditions. A soak can satisfy every one of them and still tell
+you nothing about whether the verdicts are worth reading — see the coverage condition
+below, added because a soak-shaped run on 2026-11-06 passed all four and returned VETO
+on 24 of 24 instruments.
+
+```bash
+make coverage        # per-layer matrix of what the agents were told
+sqlite3 data/hot/alpha_sentinel.db \
+  "SELECT status, COUNT(*) FROM verdicts WHERE decided_at > datetime('now','-1 day') GROUP BY status"
+```
+
+- **signal condition, measured rather than assumed:** coverage and verdict mix are
+  reported alongside the four above, never instead of them. "`errors=0` and health OK"
+  is not evidence the tool is working; it is evidence the loop is working. The first
+  live cycle this deployment ran was `completed`, 0 errors, 48/48 responses parsed, and
+  24/24 VETO.
+
+## Switching the agents on: what to measure first
+
+`DEMO_MODE=false` is one line, and it is not the whole change. Verified in this order:
+
+```bash
+brew install ollama && brew services start ollama          # or point at any hosted provider
+ollama pull hermes3:8b
+make dry-run                                               # one instrument, real agents, nothing persisted
+LOG_LEVEL=DEBUG make dry-run                               # llm_request logs latency_ms + tokens per call
+make coverage                                              # what the layers actually delivered
+make once                                                  # one persisting cycle
+```
+
+What each step is for:
+
+* **Timeout headroom, not just correctness.** The risk call is capped at
+  `LLM_MAX_TOKENS`/`RISK_MAX_TOKENS` (2048/4096) against `LLM_TIMEOUT_SECONDS=180`. On a
+  local 8B (~9.5 tok/s measured) a 300-token answer takes 30-50s and a 1500-token answer
+  does not fit at all. One call is not the distribution: read the `latency_ms` of the
+  *worst* verdict, `SELECT MAX(latency_ms) FROM verdicts`.
+* **`LLM_MAX_CONCURRENCY=1` on a single local model.** Measured with four identical
+  calls: 101.0s wall at parallel=1, 118.7s at 2, 114.3s at 4 — aggregate throughput flat
+  at 9.4-9.7 tok/s. Fanning out to one model moves work into a queue and lengthens
+  per-request latency, which is the quantity racing the timeout. The default of 4 is
+  sized for a hosted API with rate limits, not for one GPU.
+* **Cycle wall clock is now the interesting number.** A productive pass over 24
+  instruments took 38.5 min on the local endpoint before pacing and **56 min after**
+  (free-tier hosts are deliberately slowed). The health window is
+  `max(3 x SCAN_INTERVAL_SECONDS, 1800)` = 10800s at a 3600s interval, and the loop
+  sleeps the interval *after* a cycle finishes, so two things are bounded by it: a
+  running cycle (56 min, margin 124 min) and the gap between finished cycles
+  (56 + 60 = 116 min, margin 64 min). Both fit. If the watchlist grows or the model
+  slows, raise `SCAN_INTERVAL_SECONDS` — which moves the derived window with it — or
+  set `HEALTH_MAX_STALE_SECONDS` explicitly. Do not let the supervisor start
+  kickstarting a daemon that is merely working: a restart mid-cycle discards the
+  instruments that had not been reached.
+
+### Known limitation: an endpoint outage is indistinguishable from a finding
+
+Measured on 2026-11-06 by stopping Ollama and running one cycle with `--limit 2`:
+
+```
+run status=partial  written=2  errors=2   CLI exit=1
+WETH  VETO  risk=80.0  "Fail-closed: the risk auditor did not return a usable verdict"
+make health -> OK / cycle_fresh
+```
+
+Fail-closed is the designed policy and the right one for capital allocation: an
+auditor that cannot answer must not wave a trade through. But the artefact it writes is
+a CRITICAL veto with a *fabricated* finding, and the two surfaces that would tell you
+so disagree: the run row and the CLI exit say "failed", `--health` says OK because
+verdicts did land, and `ALERT_ON_VETO=true` would page each one as a discovery.
+
+**Until that is resolved deliberately, do not enable Telegram on a self-hosted
+endpoint.** An outage would not inform you, it would alarm you about 24 instruments.
+The three candidate fixes, in increasing cost:
+
+1. Suppress the *alert* (not the verdict) when `risk.model == "unavailable"` — cheapest,
+   and it leaves the persisted fail-closed verdict intact for the audit trail.
+2. A third health reason (`agents_degraded`) that is reported at WARNING and
+   deliberately does **not** trigger a restart — restarting the bot cannot fix a vendor,
+   and a restart it cannot complete would burn the watchdog's budget.
+3. A `runs.degraded_verdicts` column — honest, but it raises `SCHEMA_VERSION` from 3 and
+   voids the rollback guarantee in this file, which says an older build can still serve
+   the data the newer one wrote.
+
 
 ## What has to be true before this is live for real
 
-| gap | why it is not cosmetic |
-|---|---|
-| `DEMO_MODE=true` | both agent answers are scripted, so every verdict is plumbing evidence. A veto in demo mode is a fixture, and it pages you like a finding. |
-| no off-site copy | `R2_ENABLED=false` and no `rclone` — snapshots live on the same disk as the store they protect. Every rehearsal passes and a drive failure still takes both. |
-| Telegram unset | `alerts` has 0 rows. The bot has run for days with no way to reach anyone. |
-| host sleeps | launchd intervals do not fire during sleep. Measured drift: 70–77 min cycles against a 60 min interval. A soak on a napping machine is not seven days of evidence. |
+State as of 2026-11-06, after the agents were switched on. The two rows that were open
+because the agents were scripted are closed; what replaced them is a data question, not
+a plumbing one, and it is the reason "live" still needs a decision rather than a flag.
+
+| gap | status | why it is not cosmetic |
+|---|---|---|
+| `DEMO_MODE=true` | **closed** | Agents went live on 2026-11-06: local Ollama, `hermes3:8b`, both prompts, both parsers. Two full cycles = 48 instrument audits / 96 LLM calls, `errors=0`, not one response that `extract_json` or the parsers could not read. |
+| host sleeps | **closed** | `com.alphasentinel.hold-awake` loaded and asserted (`pmset -g assertions` reads "caffeinate asserting forever"). Measured drift before it: 70-77 min cycles against a configured 60. |
+| no off-site copy | **open - needs you** | `R2_ENABLED=false`, no `rclone`. Snapshots and the store they protect are on one disk. Every rehearsal passes and a drive failure still takes both. |
+| Telegram unset | **open - needs you, and read the section above first** | `alerts` has 0 rows. On the current endpoint a veto stream of 24/24 would page on every cycle, and an outage pages as if it were a discovery. |
+| **data coverage** | **open - needs you** | The largest gap and the least visible. The live cycles recorded **3 `ok` layers for every asset class** (read from `data/cold/layer_signals`, or reproduced per-layer by `make coverage` once #46 lands). `onchain`/`social` skip for want of Arkham/Nansen/Dune/CryptoPanic keys, `fundamentals` skips for want of `SEC_USER_AGENT`, `derivatives`/`tokenomics` arrive degraded. The auditor is instructed to treat missing data as unverified risk, so thin coverage is not a thin verdict - it is a refusal. |
+| **verdict usefulness** | **open - decision** | Across both live cycles: **24/24 VETO** each time, risk range 70-90, `alpha_score` taking three distinct values over 24 instruments. The auditor vetoed on its own judgement 10 and 9 times; the deterministic floor `risk >= MAX_RISK_SCORE (70)` decided 14 and 15. Nothing in the plumbing is broken; what is missing is either the data or an auditor whose scores can cross the threshold. |
+
+Fixing coverage is the cheap lever and it is measurable: add a vendor key, run
+`make coverage`, run `make once`, and read the veto mix. If risk scores still never
+fall below 70, the ceiling was never going to discriminate at that model size and the
+decision is the model, not the keys.
 
 Off-site, either path:
 
