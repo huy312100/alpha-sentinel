@@ -13,12 +13,12 @@ recorded ``asyncio.sleep`` delays are the assertion.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from typing import Any
 
 import pytest
 
-import core.http as http_module
 from core.http import (
     DEFAULT_THROTTLE_WAIT_SECONDS,
     MAX_THROTTLE_WAIT_SECONDS,
@@ -27,6 +27,7 @@ from core.http import (
     parse_retry_after,
     request_json,
     throttle_penalty,
+    utcnow,
 )
 
 URL = "https://api.geckoterminal.com/api/v2/networks/eth/pools/0xdead/ohlcv/hour"
@@ -87,7 +88,7 @@ def sleeps(monkeypatch) -> list[float]:
     async def fake_sleep(seconds: float) -> None:
         recorded.append(seconds)
 
-    monkeypatch.setattr(http_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
     return recorded
 
 
@@ -104,7 +105,7 @@ class TestParseRetryAfter:
         assert parse_retry_after("") is None
 
     def test_http_date_deadline(self):
-        future = (http_module.utcnow() + timedelta(seconds=45)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        future = (utcnow() + timedelta(seconds=45)).strftime("%a, %d %b %Y %H:%M:%S GMT")
         assert 5.0 <= parse_retry_after(future) <= 46.0
 
     def test_garbage_is_ignored_rather_than_trusted(self):
