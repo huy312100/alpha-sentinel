@@ -31,7 +31,7 @@ pyarrow==17.0.0              # Parquet engine (zstd + predicate pushdown)
 # `import httpx` anywhere.
 
 # --- Dashboard ---------------------------------------------------------------
-streamlit==1.66.1
+streamlit==1.67.0
 plotly==7.1.0
 
 # --- Config / cloud / utilities ---------------------------------------------
