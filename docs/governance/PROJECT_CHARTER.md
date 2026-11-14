@@ -636,7 +636,7 @@ Agreement is required only on the checks the providers share: flake8, byte-compi
 |---|---|---|---|
 | Bad image | Redeploy the previous tagged image; no schema downgrade | Data Eng | `--health` and `--status` healthy |
 | Hot store corruption | Stop the bot; restore the last verified backup; confirm schema version; resume | Data Eng | Restore verification queries pass |
-| Retention or compaction defect | Flip the tested enable switch (DLV-37) to stop retention and compaction; restore from backup; re-run dry-run. The switch is a precondition: before DLV-37 is proven, the only available action is restore from backup | Data Eng | Partition inventory and row accounting; switch re-enabled only after the defect is fixed |
+| Retention or compaction defect | Before DLV-37 is proven, retention and compaction run in dry-run only: stop the dry-run runs and restore from backup. After DLV-37 passes, flip the tested enable switch to stop retention and compaction, then restore from backup and re-run dry-run. | Data Eng | Partition inventory and row accounting; switch re-enabled only after the defect is fixed |
 | R2 duplication or spike | Stop uploads; reconcile inventory; resume with idempotent behavior | Data Eng | Partition count matches local |
 | AI behavior regression | Revert the prompt version or model configuration; keep deterministic veto; replay fixtures | AI Eng | Replay matches the approved baseline |
 | Budget ledger corruption | Pause cycles; restore the ledger from backup; re-enable ceilings before resuming | AI Eng | Spend reconciliation within tolerance |
