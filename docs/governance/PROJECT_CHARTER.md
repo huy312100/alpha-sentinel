@@ -587,7 +587,7 @@ No contract change merges in the last three business days of a sprint except a d
 
 | ID | Date | Class | Change | Consumers notified | Displacement | Approver | Evidence |
 |---|---|---|---|---|---|---|---|
-| CC-000 | 2026-10-29 | -- | Baseline publication of this charter | All roles | None | PM + QA | This artifact |
+| CC-000 | 2026-10-29 | -- | Baseline publication of this charter | All roles | None | PM | This artifact |
 
 ## 16. Quality Gates
 
