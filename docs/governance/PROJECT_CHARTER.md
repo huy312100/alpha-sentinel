@@ -148,7 +148,7 @@ Each deliverable names one accountable owner. A role shown after a semicolon or 
 | DLV-13 | Storage growth model and retention recommendation | Measured growth per day; proposed local and remote windows with rationale | Analysis and recommendation | Data Eng; Analyst collaborator | S2 |
 | DLV-37 | Retention and compaction enable switch | Explicit, tested control that independently disables retention and compaction; safe default; documented operator procedure; rollback depends on it | Switch test and operator procedure | Data Eng | S2 |
 | DLV-14 | Provider failure taxonomy and retry policy | Timeout, server-error, 429, auth, malformed payload, and not-found classified; bounded retry and budget interaction defined | Policy plus tests | AI Eng | S3 |
-| DLV-15 | Budget propagation evidence | Day and cycle ceilings enforced; exhaustion marked explicitly; no verdict fabricated; ledger reconciles | Test output and soak log | AI Eng; QA collaborator | S3 |
+| DLV-15 | Budget propagation evidence | Day and cycle ceilings enforced; exhaustion marked explicitly; no verdict fabricated; ledger reconciles | Test output (explicit-exhaustion results, ceiling breach records, ledger reconciliation) | AI Eng; QA collaborator | S3 |
 | DLV-16 | Prompt version registry | Current prompt version recorded; change rules, review, and rollback defined | Registry entry | AI Eng | S3 |
 | DLV-17 | Offline drift replay harness | Recorded fixtures replay deterministically; differences reported without live calls | Harness and replay report | AI Eng; QA collaborator | S3 |
 | DLV-18 | Spend observability in operator status | Today's spend, day cap, and cycle cap visible; a ledger read failure does not hide the rest of status | Status output | AI Eng | S3 |
