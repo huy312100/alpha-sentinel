@@ -37,11 +37,11 @@ plotly==7.1.0
 # --- Config / cloud / utilities ---------------------------------------------
 python-dotenv==1.2.4
 PyYAML==6.0.3
-boto3==1.43.127               # S3-compatible client for Cloudflare R2
-botocore==1.43.127
+boto3==1.44.2               # S3-compatible client for Cloudflare R2
+botocore==1.44.2
 requests==2.34.2             # required by streamlit (plotly and pytest list it only under extras)
 
 # --- Test & lint (installed in CI and locally) -------------------------------
 pytest==9.2.0
-pytest-asyncio==1.4.1.post1   # 1.x needs pytest>=8.4; keep the two in step
+pytest-asyncio==1.5.0   # 1.x needs pytest>=8.4; keep the two in step
 flake8==7.5.0
